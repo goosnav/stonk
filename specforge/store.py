@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS approvals(               -- human approval queue
   decided_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_cycle ON audit(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_orders_dup ON orders(symbol, side, created_at);
 CREATE INDEX IF NOT EXISTS idx_trades_analog ON trades(source, regime, score_bucket);
 CREATE INDEX IF NOT EXISTS idx_signals_cycle ON signals(cycle_id);
 """
@@ -204,13 +205,17 @@ class Store:
     def recent_order_exists(self, symbol: str, side: str, cooldown_min: int,
                             now_iso: str | None = None) -> bool:
         now = now_iso or datetime.now().astimezone().isoformat()
+        # coarse indexed prefilter on the raw string (ISO dates compare fine at
+        # day granularity), then exact datetime() check on the survivors —
+        # datetime() on both sides because created_at is ISO-with-tz while
+        # datetime() yields space-separated UTC (raw compare would misorder)
+        coarse = (datetime.fromisoformat(now) - timedelta(days=2)).date().isoformat()
         r = self.db.execute(
             "SELECT COUNT(*) c FROM orders WHERE symbol=? AND side=? "
+            "AND created_at >= ? "
             "AND status NOT IN ('rejected','expired','cancelled') "
-            # datetime() on BOTH sides: created_at is ISO-with-tz, datetime()
-            # yields space-separated UTC — raw string compare would misorder
             "AND datetime(created_at) >= datetime(?, ?)",
-            (symbol, side, now, f"-{cooldown_min} minutes")).fetchone()
+            (symbol, side, coarse, now, f"-{cooldown_min} minutes")).fetchone()
         return r["c"] > 0
 
     def record_fill(self, f) -> None:

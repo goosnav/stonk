@@ -22,7 +22,6 @@ import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
-from .config import load_config
 from .engine import run_cycle
 from .nodes.base import build_registry
 from .store import Store
@@ -50,13 +49,17 @@ def run_backtest(cfg, years: int = 10, tag: str = "default",
     bt_path = Path(f"data/backtest_{tag}.db")
     bt = _seed_backtest_db(src_db, bt_path)
 
-    # backtest config: approval queue off (no human in the loop), paper broker
-    bt_cfg = load_config("paper", overrides={
+    # backtest config: the caller's merged config (so `--mode aggressive
+    # backtest` tests that risk profile) with broker forced to paper and the
+    # approval queue off (no human in a simulation)
+    from .config import Config, _deep_merge
+    bt_cfg = Config(_deep_merge(cfg.data, {
         "db_path": str(bt_path),
+        "mode": "paper", "broker": "paper", "live_trading_enabled": False,
         "risk": {"approval_mode": "auto"},
         "paper": {"starting_cash": 10000.0},
-        "nodes": {k: v for k, v in cfg.get("nodes", default={}).items()},
-    })
+    }))
+    bt_cfg.validate()
 
     bench = bt_cfg.get("universe", "benchmark", default="SPY")
     all_dates = [r["d"] for r in bt.get_bars(bench, "9999-12-31", 20000)]

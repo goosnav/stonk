@@ -67,6 +67,30 @@ hours on our liquid-only universe — the "limit by default" rule applies to
 whole-share orders. Runtime tool discovery still runs because RH says the
 surface will evolve.
 
+## D14. AI parse failures disable AI, not trading (2026-07-06)
+AGENTS.md lists an "AI output parsing failure kill switch". Halting TRADING
+because an enrichment feed emits garbage is backwards for a deterministic-core
+system: 5 unparseable responses/day set kv `ai_disabled_until` (+24h) and the
+deterministic pipeline continues untouched. Tested in test_ai_attribution.py.
+
+## D15. Drawdown kill switch: cooldown + auto-resume (2026-07-06)
+Backtest v1 finding: the manual-reset drawdown switch tripped in the 2022 bear
+(-15.1% from peak) and froze entries for the remaining 3 YEARS of the
+simulation (OOS window = flat cash). Live, the same failure mode = system
+quietly dead until the human notices. New behavior: trips block entries for
+`drawdown_cooldown_days` (default 10 trading-ish days), then auto-clear;
+`null` restores manual-only. Exits always continue. GUI reset still available
+earlier. This is a risk-policy change, not backtest curve-fitting: the
+per-trade edge was positive before and after the halt.
+
+## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
+Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
+momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%
+because (a) the drawdown freeze (fixed, D15) and (b) conservative deployment
+(vol-targeted sizing uses a fraction of the account). earnings_drift traded 0×
+in backtest — yfinance has no deep earnings history; judge that node on
+paper/live only. Aggressiveness knob = sizing/deployment, not new signals.
+
 ## D13. Async fills reconciled at cycle start (2026-07-06)
 Live/bridge orders don't fill synchronously. Executor.reconcile() polls
 resting/relayed orders each cycle via broker.poll_order() and creates

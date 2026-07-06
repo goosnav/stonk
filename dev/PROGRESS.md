@@ -31,20 +31,43 @@
   there too); clear the kv key 'paper_account' instead.
 - Run tests: `.venv/bin/pytest tests/ -q` (offline, synthetic data).
 
-### Phase 2 remaining
-- [ ] Engine clock injection — wall-clock leaks that break backtests:
-      OrderIntent.created_at, duplicate-cooldown query, kill-switch date math,
-      approval expiry, position opened_at. Fix: thread an as_of-derived
-      timestamp through Governor (`.today`) and Executor (`.now_iso`).
-- [ ] backtest.py — walk-forward: copy bars into data/backtest_<tag>.db, run
-      run_cycle(as_of=d) over SPY trading days, force approval_mode=auto,
-      close remaining positions at end, report (CAGR/Sharpe/maxDD/regime split)
-      vs SPY buy-hold, 70/30 OOS split, write analog trades for forecast.py.
-- [ ] 10-year backtest run → go/no-go gate for default-enabled nodes/weights
-- [ ] Analog trades copied into live DB so live candidates get real error bars.
+### Phases 2–5 built (2026-07-06, afternoon)
+- [x] Clock injection (Governor.now_iso / Executor.now_iso) — backtests replay
+      the EXACT live code path at historical timestamps
+- [x] backtest.py walk-forward + report + analog-trade export; caches synced
+      back; --mode aggressive backtests that risk profile
+- [x] GUI: app.py (FastAPI, all endpoints verified 200 via curl; dangerous
+      config rejected with 400) + static/dashboard.html; scheduler with
+      post-close attribution job
+- [x] montecarlo.py (§25) wired to /api/montecarlo
+- [x] broker/robinhood_mcp.py — OAuth 2.1 MCP client; EXACT tool schemas
+      encoded from live session (D12): string params, ref_id idempotency,
+      fractional⇒market+regular_hours. OAuth flow UNTESTED against RH (needs
+      interactive login; may be allowlisted → bridge)
+- [x] broker/bridge.py + scripts/bridge_prompt.md — VERIFIED round-trip in tests
+- [x] Executor.reconcile() for async live fills (D13)
+- [x] attribution.py — scorecards, bounded Bayesian weight multipliers,
+      auto-disable, promotion proposals (human-gated)
+- [x] ai.py — OpenRouter client, reserve-then-commit, parse-failure → AI-off-
+      for-day (D14); news_sentiment, congress_trades (pub-date keyed),
+      insider (cluster buys), options_vol convexity overlay (§22-gated)
+- [x] 24 tests passing; README/TUTORIAL/run.sh|command|ps1 written
 
-### Then
-Phase 3 (GUI) → 4 (Robinhood live) → 5 (self-improvement/AI/options). See PLAN.md.
+### Backtest findings (D15/D16 — IMPORTANT context)
+- v1 (dev/reports/backtest_v1.json): per-trade edge REAL after costs
+  (PF 1.34, momentum +0.74%/trade × 988) but drawdown kill switch tripped in
+  the 2022 bear and froze entries for 3 years (manual-reset semantics).
+  → Fixed: drawdown_cooldown_days (default 10) auto-resume.
+- v2 rerun in progress (same defaults + fix). configs/aggressive.yaml added
+  as the sizing knob for outsized-return attempts — validate in paper.
+- earnings_drift never fires in backtest (no deep earnings history from
+  yfinance) — its scorecard only accumulates from paper/live.
+
+### Remaining
+- [ ] v2/aggressive backtest reports → set final default weights
+- [ ] Paper multi-cycle live-fire via scheduler (let it run days)
+- [ ] RH OAuth probe when user is ready (needs browser + funded agentic acct)
+- [ ] CLAUDE_RUN_SUMMARY.md at session end
 
 ## Environment notes
 - Run everything with `.venv/bin/python` / `.venv/bin/pytest` (no uv on machine).

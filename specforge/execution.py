@@ -42,9 +42,19 @@ class Executor:
                       data_age_days: int | None, cycle_id: str,
                       regime: str) -> str:
         """Returns final status string (for the cycle summary)."""
-        limit = self._limit_price(last_price, cand.side)
-        qty = round(target_notional / limit, 6)          # fractional shares (D11)
-        intent = OrderIntent.make(cand, qty=qty, limit_price=limit, now_iso=self.now_iso)
+        if cand.asset_type == "option":
+            # overlay computed whole contracts + premium; notional = premium×100
+            det = cand.option_details or {}
+            limit = det.get("premium", last_price)
+            qty = float(det.get("contracts", 0))
+            intent = OrderIntent.make(cand, qty=qty, limit_price=limit,
+                                      now_iso=self.now_iso)
+            intent.notional = round(qty * limit * 100, 2)
+        else:
+            limit = self._limit_price(last_price, cand.side)
+            qty = round(target_notional / limit, 6)      # fractional shares (D11)
+            intent = OrderIntent.make(cand, qty=qty, limit_price=limit,
+                                      now_iso=self.now_iso)
 
         decision = self.governor.review(intent, cand, account, cycle, data_age_days)
         self.store.audit("risk_decision", {"intent": intent.id, "symbol": cand.symbol,

@@ -1,0 +1,23 @@
+# Aggressive experiment overlay (paper first!). Bigger positions, more of them,
+# faster budget — same bounded-risk instruments and kill switches. This is the
+# "outsized returns" knob: it scales SIZE of a measured edge, it does not
+# invent new alpha. Expect roughly proportional drawdowns.
+mode: paper
+broker: paper
+paper:
+  starting_cash: 1000.0
+risk:
+  time_step_budget_pct: 0.20
+  max_single_equity_position: 0.12
+  max_account_deployment: 0.95
+  min_cash_reserve: 0.05
+  max_daily_new_positions: 5
+  max_open_positions: 15
+  max_daily_loss: 0.035
+  max_weekly_loss: 0.08
+  kill_switch_drawdown: 0.22
+  drawdown_cooldown_days: 7
+sizing:
+  vol_target_pct: 0.02
+ensemble:
+  min_final_score: 0.12

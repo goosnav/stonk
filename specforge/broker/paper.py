@@ -38,11 +38,14 @@ class PaperBroker:
 
     def get_account(self) -> AccountState:
         acct = self._acct()
-        positions = [Position(symbol=s, asset_type="equity", qty=p["qty"],
-                              avg_cost=p["avg_cost"], opened_at=p.get("opened_at", ""))
+        positions = [Position(symbol=s, asset_type=p.get("asset_type", "equity"),
+                              qty=p["qty"], avg_cost=p["avg_cost"],
+                              opened_at=p.get("opened_at", ""),
+                              option_symbol=s if p.get("asset_type") == "option" else None)
                      for s, p in acct["positions"].items() if p["qty"] > 0]
         equity = acct["cash"] + sum(
-            p.qty * self._quotes.get(p.symbol, p.avg_cost) for p in positions)
+            p.qty * self._quotes.get(p.symbol, p.avg_cost)
+            * (100 if p.asset_type == "option" else 1) for p in positions)
         return AccountState(equity=equity, cash=acct["cash"],
                             buying_power=acct["cash"], positions=positions,
                             as_of=datetime.now().astimezone().isoformat())
@@ -67,13 +70,17 @@ class PaperBroker:
                + self.cfg.get("execution", "slippage_bps", default=5)) / 10000.0
         px = intent.limit_price * (1 + bps if intent.side == "buy" else 1 - bps)
         acct = self._acct()
-        pos = acct["positions"].setdefault(intent.symbol, {"qty": 0.0, "avg_cost": 0.0})
+        # options are keyed by their OCC symbol and carry the ×100 multiplier
+        key = intent.option_symbol or intent.symbol
+        mult = 100.0 if intent.asset_type == "option" else 1.0
+        pos = acct["positions"].setdefault(key, {"qty": 0.0, "avg_cost": 0.0,
+                                                 "asset_type": intent.asset_type})
         if intent.side == "buy":
-            cost = intent.qty * px
+            cost = intent.qty * px * mult
             if cost > acct["cash"] + 1e-9:
                 return None
             new_qty = pos["qty"] + intent.qty
-            pos["avg_cost"] = (pos["qty"] * pos["avg_cost"] + cost) / new_qty
+            pos["avg_cost"] = (pos["qty"] * pos["avg_cost"] + intent.qty * px) / new_qty
             pos["qty"] = new_qty
             pos.setdefault("opened_at", intent.created_at)
             acct["cash"] -= cost
@@ -82,9 +89,9 @@ class PaperBroker:
             if sell_qty <= 0:
                 return None
             pos["qty"] -= sell_qty
-            acct["cash"] += sell_qty * px
+            acct["cash"] += sell_qty * px * mult
             if pos["qty"] <= 1e-9:
-                acct["positions"].pop(intent.symbol, None)
+                acct["positions"].pop(key, None)
         self._save(acct)
         return Fill(order_id=intent.id, symbol=intent.symbol, side=intent.side,
                     qty=intent.qty, price=round(px, 4),

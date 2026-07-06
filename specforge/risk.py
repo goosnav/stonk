@@ -95,8 +95,12 @@ class Governor:
             self.trip("weekly_loss", f"equity {eq:.2f} breaches weekly loss vs {w_eq:.2f}",
                       auto_clear_days=7)
         if peak > 0 and eq < peak * (1 - self.r.get("kill_switch_drawdown", 0.15)):
+            # cooldown then auto-resume (D15): a permanent halt turned the 2022
+            # bear into 3 years of dead cash in backtest v1. null = manual-only.
+            cooldown = self.r.get("drawdown_cooldown_days", 10)
             self.trip("drawdown", f"equity {eq:.2f} is "
-                                  f"{(1 - eq/peak):.1%} below peak {peak:.2f}")  # manual reset
+                                  f"{(1 - eq/peak):.1%} below peak {peak:.2f}",
+                      auto_clear_days=cooldown)
         rejected_today = len([o for o in self.store.orders_today(day=self.today)
                               if o["status"] == "rejected"])
         if rejected_today > self.r.get("max_rejected_orders_per_day", 5):
@@ -190,9 +194,9 @@ class Governor:
             notional = cycle.budget_left
             reasons.append(f"reduced to fit time-step budget (${cycle.budget_left:.2f} left)")
 
-        # single-position cap
+        # single-position cap (cost_basis handles the option ×100 multiplier)
         pos_cap = account.equity * self.r.get("max_single_equity_position", 0.08)
-        held = sum(p.qty * p.avg_cost for p in account.positions if p.symbol == intent.symbol)
+        held = sum(p.cost_basis for p in account.positions if p.symbol == intent.symbol)
         if held + notional > pos_cap:
             room = pos_cap - held
             if room < MIN_ORDER_NOTIONAL:
@@ -201,7 +205,7 @@ class Governor:
             reasons.append(f"reduced to single-position cap room ${room:.2f}")
 
         # total deployment / cash reserve
-        deployed = sum(p.qty * p.avg_cost for p in account.positions)
+        deployed = sum(p.cost_basis for p in account.positions)
         max_deploy = account.equity * self.r.get("max_account_deployment", 0.70)
         if deployed + notional > max_deploy:
             room = max_deploy - deployed

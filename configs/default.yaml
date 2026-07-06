@@ -43,6 +43,7 @@ risk:
   max_daily_loss: 0.02
   max_weekly_loss: 0.05
   kill_switch_drawdown: 0.15
+  drawdown_cooldown_days: 10       # auto-resume after N days; null = manual reset only
   max_rejected_orders_per_day: 5
   stale_data_max_age_days: 4       # refuse to trade on bars older than this
   duplicate_order_cooldown_min: 60 # same symbol+side within window = duplicate

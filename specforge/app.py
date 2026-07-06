@@ -268,6 +268,22 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             store.audit("scheduler_error", {"error": str(e)})
             print(f"[scheduler] scan FAILED: {e}")
 
+    def post_close_job():
+        """Mark-to-market + attribution: the self-improvement heartbeat."""
+        from .attribution import propose_promotions, update_weights
+        from .engine import run_cycle
+        cfg = current_config(store, mode)
+        try:
+            run_cycle(cfg, store)              # final scan marks equity + exits
+            update_weights(cfg, store)
+            proposals = propose_promotions(cfg, store)
+            if proposals:
+                store.audit("promotion_proposals", proposals)
+                store.kv_set("promotion_proposals", proposals)
+        except Exception as e:                  # noqa: BLE001
+            store.audit("scheduler_error", {"job": "post_close", "error": str(e)})
+            print(f"[scheduler] post-close FAILED: {e}")
+
     cfg = current_config(store, mode)
     tz = cfg.get("schedule", "timezone", default="America/New_York")
     sched = BackgroundScheduler(timezone=tz)
@@ -277,7 +293,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                                             minute=int(m), timezone=tz))
     pc = cfg.get("schedule", "post_close", default="16:30")
     h, m = pc.split(":")
-    sched.add_job(scan_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
-                                        minute=int(m), timezone=tz))
+    sched.add_job(post_close_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
+                                              minute=int(m), timezone=tz))
     sched.start()
     app.state.scheduler = sched

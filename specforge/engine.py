@@ -60,8 +60,11 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # 5. human-approved intents from the queue
     approvals = executor.process_approval_queue(account, ctx, cycle_id, reg.regime)
 
-    # 6. signals
-    registry = registry if registry is not None else build_registry(cfg)
+    # 6. signals (AI client injected for ai-flagged nodes; they degrade to
+    #    silence when it's disabled/over budget)
+    if registry is None:
+        from .ai import AIClient
+        registry = build_registry(cfg, ai_client=AIClient(cfg, store))
     events = []
     filters = []
     for node in registry.values():
@@ -86,6 +89,12 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     account = broker.get_account()             # refresh after exits
     targets = portfolio_mod.construct(candidates, account, ctx, cfg)
+
+    # 7.5 convexity overlay: maybe swap the top equity target for a bounded-
+    #     premium long call (no-op unless options_vol enabled AND account
+    #     unlocked AND §22 conditions pass; never runs in backtests)
+    from .nodes.options_vol import convexity_overlay
+    targets = convexity_overlay(targets, ctx, account, cfg, governor, store, log=log)
 
     # 8. risk-gated execution under the time-step budget
     cycle = CycleState(governor.cycle_budget(account, reg.deployment_multiplier))
@@ -127,17 +136,49 @@ def _check_exits(ctx: MarketContext, store: Store, executor: Executor,
     results = {}
     as_of_dt = datetime.strptime(ctx.as_of, "%Y-%m-%d")
     for pos in store.open_positions():
-        price = ctx.close(pos["symbol"])
+        is_option = pos["asset_type"] == "option"
+        price = _option_mark(ctx, pos) if is_option else ctx.close(pos["symbol"])
         if price is None:
             continue
         reason = None
-        if pos["stop_price"] and price <= pos["stop_price"]:
+        # options exit on time only: premium isn't reliably markable, and max
+        # loss is already bounded at the premium paid (nodes/options_vol.py)
+        if not is_option and pos["stop_price"] and price <= pos["stop_price"]:
             reason = f"stop_loss ({price:.2f} <= {pos['stop_price']:.2f})"
         else:
             opened = datetime.strptime(pos["opened_at"][:10], "%Y-%m-%d")
-            if as_of_dt - opened >= timedelta(days=int(pos["horizon_days"] * 1.5)):
+            grace = 1.0 if is_option else 1.5
+            if as_of_dt - opened >= timedelta(days=int(pos["horizon_days"] * grace)):
                 reason = f"time_stop ({(as_of_dt - opened).days}d held)"
         if reason:
-            results[pos["symbol"]] = executor.execute_exit(
+            results[pos["option_symbol"] or pos["symbol"]] = executor.execute_exit(
                 pos, price, reason, account, cycle_id, regime)
     return results
+
+
+def _option_mark(ctx: MarketContext, pos: dict) -> float | None:
+    """Exit premium for a long option: live chain bid if reachable, else
+    intrinsic value from the underlying close (conservative for a long)."""
+    occ = pos["option_symbol"] or ""
+    try:
+        # OCC: SYMBOL + YYMMDD + C/P + strike*1000 (8 digits)
+        body = occ[len(pos["symbol"]):]
+        expiry = f"20{body[0:2]}-{body[2:4]}-{body[4:6]}"
+        is_call = body[6] == "C"
+        strike = int(body[7:15]) / 1000.0
+    except (IndexError, ValueError):
+        return None
+    if not ctx.offline:
+        try:
+            import yfinance as yf
+            chain = yf.Ticker(pos["symbol"]).option_chain(expiry)
+            side = chain.calls if is_call else chain.puts
+            row = side[side["strike"] == strike]
+            if len(row) and float(row.iloc[0]["bid"] or 0) > 0:
+                return float(row.iloc[0]["bid"])
+        except Exception:                      # noqa: BLE001 — fall to intrinsic
+            pass
+    spot = ctx.close(pos["symbol"])
+    if spot is None:
+        return None
+    return round(max(0.01, (spot - strike) if is_call else (strike - spot)), 2)
