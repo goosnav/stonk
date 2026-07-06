@@ -55,3 +55,19 @@ scarce. No naked point estimates in the GUI.
 ## D11. Paper account starts at $1k to mirror real funding (2026-07-06)
 Fractional shares assumed (Robinhood supports; paper broker allows) — at <$1k,
 whole-share-only would make position sizing impossible.
+
+## D12. RH MCP tool schemas captured from a live session (2026-07-06)
+The exact schemas of the connected Robinhood MCP were inspected during
+development and encoded in broker/robinhood_mcp.py: all numeric params are
+STRINGS; `ref_id` (UUID) is the idempotency key; fractional shares require
+type=market + regular_hours (limit orders need whole shares); accounts must be
+agentic_allowed=true; get_portfolio (not get_accounts) is authoritative for
+buying power. Consequence: fractional entries go as market orders in regular
+hours on our liquid-only universe — the "limit by default" rule applies to
+whole-share orders. Runtime tool discovery still runs because RH says the
+surface will evolve.
+
+## D13. Async fills reconciled at cycle start (2026-07-06)
+Live/bridge orders don't fill synchronously. Executor.reconcile() polls
+resting/relayed orders each cycle via broker.poll_order() and creates
+positions/trades through the same bookkeeping path as immediate fills.

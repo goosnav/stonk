@@ -85,9 +85,12 @@ class OrderIntent:
     option_symbol: Optional[str] = None
 
     @staticmethod
-    def make(candidate: TradeCandidate, qty: float, limit_price: float) -> "OrderIntent":
-        now = datetime.now().astimezone().isoformat()
-        key = f"{candidate.symbol}-{candidate.side}-{date.today().isoformat()}-{candidate.id}"
+    def make(candidate: TradeCandidate, qty: float, limit_price: float,
+             now_iso: str | None = None) -> "OrderIntent":
+        # now_iso lets the backtester run this exact code path at historical
+        # timestamps (dev/PROGRESS.md "clock injection"); live passes None.
+        now = now_iso or datetime.now().astimezone().isoformat()
+        key = f"{candidate.symbol}-{candidate.side}-{now[:10]}-{candidate.id}"
         return OrderIntent(
             id=new_id(), candidate_id=candidate.id, symbol=candidate.symbol,
             asset_type=candidate.asset_type, side=candidate.side, qty=qty,

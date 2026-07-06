@@ -193,18 +193,24 @@ class Store:
                         (*fields.values(), _now(), order_id))
         self.db.commit()
 
-    def orders_today(self, side: str | None = None) -> list[dict]:
-        q = "SELECT * FROM orders WHERE date(created_at)=date('now','localtime')"
+    def orders_today(self, side: str | None = None, day: str | None = None) -> list[dict]:
+        """day: ISO date; defaults to the real today (backtester passes as_of)."""
+        day = day or date.today().isoformat()
+        q, args = "SELECT * FROM orders WHERE date(created_at)=?", [day]
         if side:
-            q += f" AND side='{side}'"
-        return [dict(r) for r in self.db.execute(q)]
+            q += " AND side=?"; args.append(side)
+        return [dict(r) for r in self.db.execute(q, args)]
 
-    def recent_order_exists(self, symbol: str, side: str, cooldown_min: int) -> bool:
+    def recent_order_exists(self, symbol: str, side: str, cooldown_min: int,
+                            now_iso: str | None = None) -> bool:
+        now = now_iso or datetime.now().astimezone().isoformat()
         r = self.db.execute(
             "SELECT COUNT(*) c FROM orders WHERE symbol=? AND side=? "
             "AND status NOT IN ('rejected','expired','cancelled') "
-            "AND created_at >= datetime('now','localtime', ?)",
-            (symbol, side, f"-{cooldown_min} minutes")).fetchone()
+            # datetime() on BOTH sides: created_at is ISO-with-tz, datetime()
+            # yields space-separated UTC — raw string compare would misorder
+            "AND datetime(created_at) >= datetime(?, ?)",
+            (symbol, side, now, f"-{cooldown_min} minutes")).fetchone()
         return r["c"] > 0
 
     def record_fill(self, f) -> None:

@@ -19,6 +19,14 @@ MIN_ANALOGS = 25
 BOOTSTRAP_ITERS = 500
 
 
+def _apr(horizon_ret: float, periods: float) -> float:
+    """Annualize a horizon return. Base clamped positive: a modeled horizon
+    return ≤ -100% (possible from the wide-prior branch on a fat expected
+    return) would otherwise produce a complex number under a fractional
+    exponent. -100%/yr is the honest floor for a long-only book."""
+    return round(max(1e-4, 1 + horizon_ret) ** periods - 1, 4)
+
+
 def _bootstrap_ci(returns: list[float], iters: int = BOOTSTRAP_ITERS,
                   lo_pct: float = 10, hi_pct: float = 90,
                   rng: random.Random | None = None) -> tuple[float, float, float]:
@@ -50,7 +58,8 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
             # wide prior: ±2× horizon volatility around a haircut estimate
             sigma = max(0.02, abs(c.expected_return) * 3)
             c.expected_return = round(c.expected_return * 0.5, 5)  # decay haircut
-            c.ci_low = round(c.expected_return - 2 * sigma, 5)
+            # floor: a long position cannot lose more than 100%
+            c.ci_low = round(max(-0.95, c.expected_return - 2 * sigma), 5)
             c.ci_high = round(c.expected_return + 2 * sigma, 5)
             # normal approx for P(>0)
             z = c.expected_return / sigma
@@ -59,9 +68,9 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
 
         # annualized view — secondary by design (AGENTS.md §13)
         periods = max(1.0, 252.0 / max(1, c.horizon_days))
-        c.expected_apr = round((1 + c.expected_return) ** periods - 1, 4)
-        c.apr_ci_low = round(max(-0.99, (1 + c.ci_low) ** periods - 1), 4)
-        c.apr_ci_high = round((1 + c.ci_high) ** periods - 1, 4)
+        c.expected_apr = _apr(c.expected_return, periods)
+        c.apr_ci_low = max(-0.99, _apr(c.ci_low, periods))
+        c.apr_ci_high = _apr(c.ci_high, periods)
 
 
 def portfolio_projection(store: Store, source: str) -> dict:
@@ -80,9 +89,9 @@ def portfolio_projection(store: Store, source: str) -> dict:
         basis[t["source"]] = basis.get(t["source"], 0) + 1
     n = len(rets)
     return {
-        "apr": round((1 + mean) ** periods - 1, 4),
-        "apr_ci_low": round(max(-0.99, (1 + lo) ** periods - 1), 4),
-        "apr_ci_high": round((1 + hi) ** periods - 1, 4),
+        "apr": _apr(mean, periods),
+        "apr_ci_low": max(-0.99, _apr(lo, periods)),
+        "apr_ci_high": _apr(hi, periods),
         "prob_positive_trade": round(sum(1 for r in rets if r > 0) / n, 3),
         "n_trades": n, "basis": basis,
         "confidence": "high" if basis.get("live", 0) >= 50 else

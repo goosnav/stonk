@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from .config import load_config
 from .store import Store
@@ -92,6 +93,18 @@ def cmd_reject(args, cfg, store):
     print(f"rejected {args.intent_id}")
 
 
+def cmd_bridge_dump(args, cfg, store):
+    from .broker.bridge import bridge_dump
+    print(json.dumps(bridge_dump(store, cfg), indent=2, default=str))
+
+
+def cmd_bridge_report(args, cfg, store):
+    from .broker.bridge import bridge_report
+    payload = json.loads(Path(args.file).read_text() if args.file != "-"
+                         else sys.stdin.read())
+    print(json.dumps(bridge_report(store, payload)))
+
+
 def cmd_reset_kill(args, cfg, store):
     from .risk import Governor
     Governor(cfg, store).reset(args.name)
@@ -116,6 +129,9 @@ def main(argv=None):
     s = sub.add_parser("approve"); s.add_argument("intent_id")
     s = sub.add_parser("reject"); s.add_argument("intent_id")
     s = sub.add_parser("reset-kill"); s.add_argument("name")
+    sub.add_parser("bridge-dump")
+    s = sub.add_parser("bridge-report")
+    s.add_argument("--file", default="-", help="results JSON path, or - for stdin")
 
     args = p.parse_args(argv)
     cfg = load_config(args.mode)

@@ -33,7 +33,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     aux = [cfg.get("universe", "vix_symbol", default="^VIX")]
     if refresh_data:
         data_mod.refresh(store, symbols + aux, log=log)
-    ctx = MarketContext(store, cfg, as_of)
+    ctx = MarketContext(store, cfg, as_of, offline=not refresh_data)
 
     # 2. account + broker
     broker = broker or make_broker(cfg, store)
@@ -41,8 +41,10 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         broker.set_quotes(ctx.prices())
     account = broker.get_account()
 
-    # 3. safety rails up front
-    governor = Governor(cfg, store)
+    # 3. safety rails up front. Logical clock = as_of date + real time-of-day:
+    # identical to wall clock for live scans, historical for backtests.
+    now_iso = f"{ctx.as_of}T{datetime.now().astimezone().isoformat()[11:]}"
+    governor = Governor(cfg, store, now_iso=now_iso)
     switches = governor.check_kill_switches(account, source)
     reg = regime_mod.classify(ctx, cfg)
     store.audit("regime", {"regime": reg.regime, "mult": reg.deployment_multiplier,
@@ -50,7 +52,9 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     executor = Executor(cfg, store, broker, governor)
 
-    # 4. exits first — freeing risk budget before spending it
+    # 4. settle async fills from prior cycles, then exits (free budget before
+    #    spending it)
+    reconciled = executor.reconcile(cycle_id)
     exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime)
 
     # 5. human-approved intents from the queue
@@ -107,7 +111,8 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         "cycle_id": cycle_id, "as_of": ctx.as_of, "regime": reg.regime,
         "kill_switches": sorted(switches), "signals": len(events),
         "candidates": len(candidates), "entries": entry_results,
-        "exits": exits, "approvals_processed": len(approvals),
+        "exits": exits, "reconciled": reconciled,
+        "approvals_processed": len(approvals),
         "budget": round(cycle.budget, 2), "budget_used": round(cycle.budget_used, 2),
         "equity": round(account.equity, 2), "cash": round(account.cash, 2),
     }

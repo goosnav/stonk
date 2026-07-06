@@ -28,6 +28,8 @@ class Node(SignalNode):
         """[{date, surprise_pct}] from cache or yfinance. [] on failure."""
         key = f"earnings_{sym}"
         cached = ctx.store.kv_get(key)
+        if ctx.offline:                                   # backtest: cache only
+            return cached["rows"] if cached else []
         if cached and cached.get("fetched_at", "") >= \
                 (datetime.now() - timedelta(days=CACHE_DAYS)).isoformat():
             return cached["rows"]
@@ -46,7 +48,12 @@ class Node(SignalNode):
             return rows
         except Exception as e:                            # noqa: BLE001
             self.degraded_reason = f"earnings fetch failed: {e}"
-            return cached["rows"] if cached else []
+            # cache the failure too — otherwise a rate-limited endpoint gets
+            # hammered once per symbol per cycle (found via profiling)
+            rows = cached["rows"] if cached else []
+            ctx.store.kv_set(key, {"fetched_at": datetime.now().isoformat(),
+                                   "rows": rows, "failed": str(e)})
+            return rows
 
     def compute(self, ctx: MarketContext) -> list[SignalEvent]:
         as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")

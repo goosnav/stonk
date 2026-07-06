@@ -28,6 +28,8 @@ class Node(SignalNode):
     def _fundamentals(self, ctx: MarketContext, sym: str) -> dict | None:
         key = f"fundamentals_{sym}"
         cached = ctx.store.kv_get(key)
+        if ctx.offline:                                   # backtest: cache only
+            return cached["data"] if cached else None
         if cached and cached.get("fetched_at", "") >= \
                 (datetime.now() - timedelta(days=CACHE_DAYS)).isoformat():
             return cached["data"]
@@ -41,7 +43,10 @@ class Node(SignalNode):
             return data
         except Exception as e:                  # noqa: BLE001
             self.degraded_reason = f"fundamentals fetch failed: {e}"
-            return cached["data"] if cached else None
+            data = cached["data"] if cached else None
+            ctx.store.kv_set(key, {"fetched_at": datetime.now().isoformat(),
+                                   "data": data, "failed": str(e)})   # cache failure
+            return data
 
     def passes(self, ctx: MarketContext, symbol: str) -> bool:
         if symbol in ETFISH or symbol.startswith("^"):

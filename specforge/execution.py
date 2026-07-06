@@ -24,11 +24,14 @@ def score_bucket(score: float) -> str:
 
 
 class Executor:
-    def __init__(self, cfg, store: Store, broker, governor: Governor):
+    def __init__(self, cfg, store: Store, broker, governor: Governor,
+                 now_iso: str | None = None):
         self.cfg = cfg
         self.store = store
         self.broker = broker
         self.governor = governor
+        # logical clock (matches governor's) — see dev/PROGRESS.md clock injection
+        self.now_iso = now_iso or governor.now_iso
 
     def _limit_price(self, last_price: float, side: str) -> float:
         off = self.cfg.get("execution", "limit_offset_pct", default=0.001)
@@ -41,7 +44,7 @@ class Executor:
         """Returns final status string (for the cycle summary)."""
         limit = self._limit_price(last_price, cand.side)
         qty = round(target_notional / limit, 6)          # fractional shares (D11)
-        intent = OrderIntent.make(cand, qty=qty, limit_price=limit)
+        intent = OrderIntent.make(cand, qty=qty, limit_price=limit, now_iso=self.now_iso)
 
         decision = self.governor.review(intent, cand, account, cycle, data_age_days)
         self.store.audit("risk_decision", {"intent": intent.id, "symbol": cand.symbol,
@@ -61,7 +64,7 @@ class Executor:
             intent.status = "pending_approval"
             if not self.store.record_order(intent):
                 return "duplicate"
-            expires = (datetime.now().astimezone() + timedelta(
+            expires = (datetime.fromisoformat(self.now_iso) + timedelta(
                 hours=self.cfg.get("risk", "approval_timeout_hours", default=24))).isoformat()
             self.store.queue_approval(intent.id, expires)
             self.store.audit("approval_queued", {"intent": intent.id,
@@ -104,7 +107,7 @@ class Executor:
             stop = round(fill.price * (1 - stop_mult * (atr_frac or 0.02)), 4)
             self.store.save_position(new_id(), {
                 "symbol": intent.symbol, "asset_type": intent.asset_type,
-                "qty": fill.qty, "avg_cost": fill.price, "opened_at": fill.filled_at,
+                "qty": fill.qty, "avg_cost": fill.price, "opened_at": self.now_iso,
                 "horizon_days": cand.horizon_days, "stop_price": stop,
                 "candidate_id": cand.id, "nodes": cand.contributing_nodes,
                 "option_symbol": intent.option_symbol, "status": "open"})
@@ -121,7 +124,8 @@ class Executor:
             ci_high=0, probability_positive=0, expected_apr=0, apr_ci_low=0,
             apr_ci_high=0, horizon_days=0, max_loss=0, contributing_nodes=[],
             option_symbol=position.get("option_symbol"))
-        intent = OrderIntent.make(cand, qty=position["qty"], limit_price=limit)
+        intent = OrderIntent.make(cand, qty=position["qty"], limit_price=limit,
+                                  now_iso=self.now_iso)
         if not self.store.record_order(intent):
             return "duplicate"
         status = self._review_and_place(intent, None, None, cycle_id, regime)
@@ -129,27 +133,77 @@ class Executor:
             entry_px, exit_px = position["avg_cost"], limit
             pnl = (exit_px - entry_px) * position["qty"]
             self.store.close_position(position["id"])
-            # link the round-trip back to the entry candidate for attribution
+            # link the round-trip back to the entry candidate: its score/bucket
+            # defines the analog cell this outcome feeds (forecast error bars)
+            entry_cand = self._load_candidate(position.get("candidate_id", ""))
+            entry_score = entry_cand.final_score if entry_cand else 0.0
             import json as _json
             self.store.record_trade({
+                "score": entry_score, "score_bucket": score_bucket(entry_score),
                 "symbol": position["symbol"], "asset_type": position["asset_type"],
                 "entry_date": position["opened_at"][:10],
-                "exit_date": datetime.now().date().isoformat(),
+                "exit_date": self.now_iso[:10],
                 "entry_price": entry_px, "exit_price": exit_px, "qty": position["qty"],
                 "pnl": round(pnl, 4), "ret": round(exit_px / entry_px - 1, 6),
                 "horizon_days": position["horizon_days"],
                 "nodes": _json.loads(position["nodes"] or "[]"),
                 "source": self.cfg.mode if self.cfg.mode == "live" else "paper",
-                "exit_reason": reason, "regime": regime,
+                "exit_reason": reason,
+                # analog cell keys on ENTRY regime (that's the state the signal
+                # fired in); exit regime is only context
+                "regime": entry_cand.regime if entry_cand else regime,
             })
             self.store.audit("position_closed", {"symbol": position["symbol"],
                                                  "reason": reason, "pnl": pnl}, cycle_id)
         return status
 
+    def reconcile(self, cycle_id: str) -> dict:
+        """Settle resting/relayed orders from prior cycles (live brokers fill
+        asynchronously; paper never rests). Fills create positions/trades via
+        the same bookkeeping as immediate fills."""
+        if not hasattr(self.broker, "poll_order"):
+            return {}
+        results = {}
+        rows = [dict(r) for r in self.store.db.execute(
+            "SELECT * FROM orders WHERE status IN ('placed','pending_relay','relayed')")]
+        for o in rows:
+            intent = OrderIntent(
+                id=o["id"], candidate_id=o["candidate_id"], symbol=o["symbol"],
+                asset_type=o["asset_type"], side=o["side"], qty=o["qty"],
+                limit_price=o["limit_price"], notional=o["notional"],
+                idempotency_key=o["idempotency_key"], created_at=o["created_at"],
+                option_symbol=o["option_symbol"])
+            res = self.broker.poll_order(o["broker_order_id"], intent)
+            if res is None:
+                continue
+            if res == "dead":
+                self.store.update_order(o["id"], status="cancelled")
+                self.store.audit("order_dead", {"intent": o["id"]}, cycle_id)
+                results[o["symbol"]] = "dead"
+                continue
+            fill = res
+            self.store.record_fill(fill)
+            self.store.update_order(o["id"], status="filled")
+            self.store.audit("order_filled_reconciled",
+                             {"intent": o["id"], "price": fill.price}, cycle_id)
+            if o["side"] == "buy":
+                cand = self._load_candidate(o["candidate_id"])
+                stop_mult = self.cfg.get("sizing", "atr_stop_multiple", default=1.8)
+                self.store.save_position(new_id(), {
+                    "symbol": o["symbol"], "asset_type": o["asset_type"],
+                    "qty": fill.qty, "avg_cost": fill.price, "opened_at": self.now_iso,
+                    "horizon_days": cand.horizon_days if cand else 20,
+                    "stop_price": round(fill.price * (1 - stop_mult * 0.02), 4),
+                    "candidate_id": o["candidate_id"],
+                    "nodes": cand.contributing_nodes if cand else [],
+                    "option_symbol": o["option_symbol"], "status": "open"})
+            results[o["symbol"]] = "filled"
+        return results
+
     def process_approval_queue(self, account, ctx, cycle_id: str, regime: str) -> list[str]:
         """Place human-approved intents; expire stale ones. Called each cycle."""
         results = []
-        now = datetime.now().astimezone().isoformat()
+        now = self.now_iso
         for row in self.store.pending_approvals():
             if row["expires_at"] < now:
                 self.store.decide_approval(row["intent_id"], "expired")

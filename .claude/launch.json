@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "specforge-gui",
+      "runtimeExecutable": ".venv/bin/specforge",
+      "runtimeArgs": ["serve", "--port", "8420"],
+      "port": 8420
+    }
+  ]
+}

@@ -38,15 +38,24 @@ class CycleState:
 
 
 class Governor:
-    def __init__(self, cfg, store: Store):
+    def __init__(self, cfg, store: Store, now_iso: str | None = None):
         self.cfg = cfg
         self.store = store
         self.r = cfg.get("risk", default={})
+        # logical clock: backtester injects historical timestamps; live = real now
+        self.now_iso = now_iso or datetime.now().astimezone().isoformat()
+
+    @property
+    def today(self) -> str:
+        return self.now_iso[:10]
+
+    def _today_dt(self) -> date:
+        return date.fromisoformat(self.today)
 
     # ---------------- kill switches ----------------
     def active_switches(self) -> dict:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
-        today = date.today().isoformat()
+        today = self.today
         # auto-clear daily/weekly switches when their window rolls over
         cleared = {k: v for k, v in switches.items()
                    if not (v.get("auto_clear") and v.get("clear_on", "") <= today)}
@@ -56,10 +65,10 @@ class Governor:
 
     def trip(self, name: str, reason: str, auto_clear_days: int | None = None) -> None:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
-        entry = {"reason": reason, "tripped_at": datetime.now().astimezone().isoformat()}
+        entry = {"reason": reason, "tripped_at": self.now_iso}
         if auto_clear_days is not None:
             entry["auto_clear"] = True
-            entry["clear_on"] = (date.today() + timedelta(days=auto_clear_days)).isoformat()
+            entry["clear_on"] = (self._today_dt() + timedelta(days=auto_clear_days)).isoformat()
         switches[name] = entry
         self.store.kv_set(KILL_KEY, switches)
         self.store.audit("kill_switch_tripped", {"name": name, **entry})
@@ -74,7 +83,7 @@ class Governor:
         """Run at cycle start. Evaluates loss/drawdown limits against the equity
         curve and trips switches. Returns the active set."""
         eq = account.equity
-        today = date.today()
+        today = self._today_dt()
         y_eq = self.store.equity_on(source, (today - timedelta(days=1)).isoformat())
         w_eq = self.store.equity_on(source, (today - timedelta(days=7)).isoformat())
         peak = max(self.store.peak_equity(source), eq)
@@ -88,7 +97,7 @@ class Governor:
         if peak > 0 and eq < peak * (1 - self.r.get("kill_switch_drawdown", 0.15)):
             self.trip("drawdown", f"equity {eq:.2f} is "
                                   f"{(1 - eq/peak):.1%} below peak {peak:.2f}")  # manual reset
-        rejected_today = len([o for o in self.store.orders_today()
+        rejected_today = len([o for o in self.store.orders_today(day=self.today)
                               if o["status"] == "rejected"])
         if rejected_today > self.r.get("max_rejected_orders_per_day", 5):
             self.trip("rejected_orders", f"{rejected_today} rejected orders today")
@@ -145,7 +154,7 @@ class Governor:
             return rj(f"stale data: age={data_age_days} days")
         if self.store.recent_order_exists(
                 intent.symbol, intent.side,
-                self.r.get("duplicate_order_cooldown_min", 60)):
+                self.r.get("duplicate_order_cooldown_min", 60), now_iso=self.now_iso):
             return rj("duplicate: same symbol+side within cooldown")
         if intent.asset_type == "option":
             if not self.options_unlocked(account):
@@ -164,8 +173,13 @@ class Governor:
         # --- entry caps, with size-reduction where sensible ---
         reasons, notional = [], intent.notional
 
-        if cycle.new_positions + 1 > self.r.get("max_daily_new_positions", 3):
-            return rj("max_daily_new_positions reached this cycle/day")
+        # per-DAY cap, not per-cycle (live mode runs 3 scan cycles a day).
+        # This cycle's earlier fills are already recorded in orders, so the
+        # DB count alone is the complete number — don't add cycle.new_positions.
+        buys_today = len([o for o in self.store.orders_today("buy", day=self.today)
+                          if o["status"] in ("filled", "placed", "reviewed")])
+        if buys_today + 1 > self.r.get("max_daily_new_positions", 3):
+            return rj(f"max_daily_new_positions reached ({buys_today} placed today)")
         if len([p for p in account.positions if p.qty > 0]) >= self.r.get("max_open_positions", 12):
             return rj("max_open_positions reached")
 
