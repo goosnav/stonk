@@ -158,3 +158,24 @@ def test_live_triple_gate(monkeypatch):
     monkeypatch.setenv("RH_ACCOUNT_WHITELIST", "acct123")
     ok, _ = cfg.live_trading_allowed()
     assert ok
+
+
+def test_drawdown_trip_clears_and_baseline_resets(cfg, store):
+    """D17: after the cooldown, the switch clears, the HWM resets to current
+    equity, and the same depressed equity does NOT re-trip the switch."""
+    from datetime import date, timedelta
+    from specforge.risk import Governor
+    today = date.today()
+    store.record_equity(1000, 1000, "paper", d=(today - timedelta(days=30)).isoformat())
+    g1 = Governor(cfg, store)
+    g1.check_kill_switches(acct(equity=800), "paper")        # -20% from peak
+    assert "drawdown" in g1.active_switches()
+    # 11 days later (cooldown 10): switch auto-clears + baseline resets
+    future = (today + timedelta(days=11)).isoformat() + "T10:00:00"
+    g2 = Governor(cfg, store, now_iso=future)
+    assert "drawdown" not in g2.active_switches()
+    assert store.kv_get("dd_peak_reset_d") == future[:10]
+    # same equity level must not re-trip against the OLD peak
+    store.record_equity(800, 800, "paper", d=future[:10])
+    g2.check_kill_switches(acct(equity=800), "paper")
+    assert "drawdown" not in g2.active_switches()

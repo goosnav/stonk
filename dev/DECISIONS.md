@@ -83,6 +83,15 @@ quietly dead until the human notices. New behavior: trips block entries for
 earlier. This is a risk-policy change, not backtest curve-fitting: the
 per-trade edge was positive before and after the halt.
 
+## D17. Drawdown high-water mark resets when the switch clears (2026-07-06)
+v2 backtest stayed frozen even WITH the D15 cooldown: the trip condition is
+level-based (equity < peak×0.85), so an all-cash account below the old peak
+re-trips the moment the cooldown clears — a trip/clear/re-trip livelock. Fix:
+clearing the drawdown switch (auto or manual) stamps kv `dd_peak_reset_d`; the
+HWM is computed only from equity since that date. Semantics: each drawdown
+episode absorbs one kill_switch_drawdown tranche, then the book restarts flat
+with a fresh baseline. Test: test_drawdown_trip_clears_and_baseline_resets.
+
 ## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
 Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
 momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%

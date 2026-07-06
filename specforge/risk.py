@@ -56,12 +56,21 @@ class Governor:
     def active_switches(self) -> dict:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
         today = self.today
-        # auto-clear daily/weekly switches when their window rolls over
+        # auto-clear switches whose window rolled over
         cleared = {k: v for k, v in switches.items()
                    if not (v.get("auto_clear") and v.get("clear_on", "") <= today)}
         if cleared != switches:
+            if "drawdown" in switches and "drawdown" not in cleared:
+                self._reset_drawdown_baseline("auto_clear")
             self.store.kv_set(KILL_KEY, cleared)
         return cleared
+
+    def _reset_drawdown_baseline(self, via: str) -> None:
+        """D17: when a drawdown trip clears, the high-water mark restarts at
+        the clear date. Without this, an all-cash account sitting 15% below an
+        old peak re-trips forever (backtest v2 finding: 3 years frozen)."""
+        self.store.kv_set("dd_peak_reset_d", self.today)
+        self.store.audit("drawdown_baseline_reset", {"date": self.today, "via": via})
 
     def trip(self, name: str, reason: str, auto_clear_days: int | None = None) -> None:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
@@ -78,6 +87,8 @@ class Governor:
         if switches.pop(name, None):
             self.store.kv_set(KILL_KEY, switches)
             self.store.audit("kill_switch_reset", {"name": name})
+            if name == "drawdown":
+                self._reset_drawdown_baseline("manual_reset")
 
     def check_kill_switches(self, account: AccountState, source: str) -> dict:
         """Run at cycle start. Evaluates loss/drawdown limits against the equity
@@ -86,7 +97,9 @@ class Governor:
         today = self._today_dt()
         y_eq = self.store.equity_on(source, (today - timedelta(days=1)).isoformat())
         w_eq = self.store.equity_on(source, (today - timedelta(days=7)).isoformat())
-        peak = max(self.store.peak_equity(source), eq)
+        # high-water mark since the last drawdown-baseline reset (D17)
+        reset_d = self.store.kv_get("dd_peak_reset_d", "") or ""
+        peak = max(self.store.peak_equity(source, since_d=reset_d), eq)
 
         if y_eq and eq < y_eq * (1 - self.r.get("max_daily_loss", 0.02)):
             self.trip("daily_loss", f"equity {eq:.2f} < {1-self.r['max_daily_loss']:.0%} "

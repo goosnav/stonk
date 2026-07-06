@@ -281,9 +281,11 @@ class Store:
             "SELECT * FROM equity_curve WHERE source=? ORDER BY d ASC LIMIT ?",
             (source, limit))]
 
-    def peak_equity(self, source: str) -> float:
-        r = self.db.execute("SELECT MAX(equity) m FROM equity_curve WHERE source=?",
-                            (source,)).fetchone()
+    def peak_equity(self, source: str, since_d: str = "") -> float:
+        """High-water mark, optionally only since a reset date (drawdown
+        kill-switch baseline resets on clear — see risk.py D17)."""
+        r = self.db.execute("SELECT MAX(equity) m FROM equity_curve "
+                            "WHERE source=? AND d>=?", (source, since_d)).fetchone()
         return r["m"] or 0.0
 
     def equity_on(self, source: str, d: str) -> Optional[float]:

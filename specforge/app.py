@@ -59,7 +59,10 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         reg = regime_mod.classify(ctx, c)
         prices = ctx.prices()
         curve = store.equity_curve(c.mode if c.mode == "live" else "paper")
-        peak = max([r["equity"] for r in curve], default=acct.equity)
+        # drawdown vs the governor's HWM baseline (resets on drawdown clears, D17)
+        reset_d = store.kv_get("dd_peak_reset_d", "") or ""
+        peak = max([r["equity"] for r in curve if r["d"] >= reset_d],
+                   default=acct.equity)
         day_pnl = None
         if len(curve) >= 2:
             day_pnl = round(acct.equity - curve[-2]["equity"], 2)
