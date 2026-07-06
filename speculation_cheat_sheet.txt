@@ -1,0 +1,2297 @@
+STOCK TRADER SPECULATION CHEAT SHEET
+Goal: identify statistically repeatable edge net of slippage, spread, taxes, borrow, and commissions.
+Core rule: no indicator predicts by itself; edge = signal + regime + sizing + execution + risk control.
+
+================================================================================
+0) MASTER VARIABLE DEFINITIONS
+================================================================================
+
+t = current time index.
+i = stock/security index.
+N = lookback window length.
+k = forecast horizon.
+P_t = price at time t.
+O_t = open price.
+H_t = high price.
+L_t = low price.
+C_t = close price.
+V_t = volume.
+AdjClose_t = split/dividend-adjusted close.
+r_t = simple return = P_t/P_{t-1} - 1.
+l_t = log return = ln(P_t/P_{t-1}).
+R_f = risk-free return/rate.
+R_m = market return.
+ER_t = excess return = r_t - R_f.
+mu = expected/mean return.
+sigma = standard deviation of returns.
+var = variance.
+cov(x,y) = covariance of x and y.
+corr(x,y) = correlation of x and y.
+beta_i = covariance of stock i with market / market variance.
+alpha_i = return unexplained by benchmark/factor model.
+epsilon_t = residual/error term.
+z_t = z-score.
+S_t = trading signal value.
+w_i = portfolio weight in asset i.
+Q = order quantity/shares.
+q_bid = quantity posted at best bid.
+q_ask = quantity posted at best ask.
+B = best bid price.
+A = best ask price.
+M = midprice = (A+B)/2.
+Spread = A - B.
+ATR = average true range.
+IV = implied volatility.
+HV/RV = historical/realized volatility.
+DTE = days to expiration.
+OI = open interest.
+ADV = average daily volume.
+AUM = assets under management.
+EPS = earnings per share.
+EBITDA = earnings before interest, taxes, depreciation, and amortization.
+FCF = free cash flow.
+EV = enterprise value.
+MCap = market capitalization.
+BV = book value.
+NI = net income.
+Revenue = sales.
+ROE = return on equity.
+ROIC = return on invested capital.
+CAGR = compound annual growth rate.
+DD = drawdown.
+MDD = maximum drawdown.
+TC = transaction costs.
+TO = turnover.
+bps = basis points; 1 bp = 0.01%.
+
+================================================================================
+1) CORE RETURN, RISK, AND EDGE EQUATIONS
+================================================================================
+
+Simple Return: r_t = P_t/P_{t-1} - 1; basic percentage return from one period to next.
+
+Log Return: l_t = ln(P_t/P_{t-1}); additive return used in quantitative modeling.
+
+Cumulative Return: CR = product(1+r_t) - 1; total compounded return across periods.
+
+Annualized Return: AR = (1+CR)^(PeriodsPerYear/N) - 1; scales return to yearly basis.
+
+Annualized Volatility: sigma_ann = std(r_t) * sqrt(PeriodsPerYear); standard annual risk measure.
+
+Expected Value: EV = p_win*avg_win - p_loss*avg_loss; expected profit per trade before/after costs.
+
+Profit Factor: PF = gross_profit / gross_loss; values above 1 mean gross wins exceed gross losses.
+
+Win Rate: WR = winning_trades / total_trades; useful only with payoff ratio.
+
+Payoff Ratio: PR = avg_win / avg_loss; determines whether win rate is sufficient.
+
+Breakeven Win Rate: BE_WR = avg_loss / (avg_win + avg_loss); minimum win rate needed before costs.
+
+Sharpe Ratio: Sharpe = mean(r_t - R_f) / std(r_t - R_f); return per unit total volatility.
+
+Sortino Ratio: Sortino = mean(r_t - R_f) / downside_deviation; return per unit downside volatility.
+
+Information Ratio: IR = mean(r_p - r_b) / tracking_error; active return per unit benchmark-relative risk.
+
+Treynor Ratio: Treynor = mean(r_p - R_f) / beta_p; return per unit market beta.
+
+Calmar Ratio: Calmar = annual_return / max_drawdown; return relative to worst peak-to-trough loss.
+
+Omega Ratio: Omega = gains_above_threshold / losses_below_threshold; distribution-aware risk/reward.
+
+Skewness: skew = E[(r-mu)^3]/sigma^3; measures asymmetric return tails.
+
+Kurtosis: kurt = E[(r-mu)^4]/sigma^4; measures fat-tailed return behavior.
+
+Maximum Drawdown: MDD = min((Equity_t - Peak_t)/Peak_t); largest historical equity decline.
+
+Value at Risk: VaR_alpha = percentile_loss at confidence alpha; estimates threshold loss.
+
+Conditional VaR: CVaR = average loss beyond VaR; expected tail loss.
+
+Beta: beta_i = cov(r_i,r_m)/var(r_m); sensitivity to market movement.
+
+Alpha: alpha_i = r_i - [R_f + beta_i*(R_m-R_f)]; benchmark-adjusted excess return.
+
+Jensen Alpha: alpha = R_p - [R_f + beta_p*(R_m-R_f)]; portfolio excess return over Capital Asset Pricing Model.
+
+Tracking Error: TE = std(r_p - r_b); volatility of active returns versus benchmark.
+
+Turnover: TO = sum(abs(w_t - w_{t-1})); trading intensity that drives costs/taxes.
+
+Capacity: Capacity ~= alpha_decay / market_impact; rough maximum capital before edge degrades.
+
+Slippage: Slippage = execution_price - decision_price; realized execution drag.
+
+Implementation Shortfall: IS = paper_return - actual_return; total cost of execution delay/slippage/fees.
+
+Kelly Fraction: f* = (bp - q)/b; b=win/loss payoff ratio, p=win probability, q=1-p.
+
+Fractional Kelly: f = c*f*, 0<c<1; reduced Kelly sizing to lower drawdown risk.
+
+Optimal f: position fraction maximizing geometric growth; aggressive and usually unstable.
+
+Geometric Mean Return: G = product(1+r_t)^(1/N)-1; compounded average return.
+
+Arithmetic Mean Return: A = mean(r_t); simple average return, often overstates long-run compounding.
+
+Risk of Ruin: RoR approximates probability of capital falling below survival threshold; used for sizing.
+
+Expected Log Growth: G = E[ln(1+f*r)]; core Kelly/objective function.
+
+================================================================================
+2) PRICE, MOMENTUM, AND TREND INDICATORS
+================================================================================
+
+SMA: SMA_N = mean(C_t...C_{t-N+1}); simple moving average trend filter.
+
+EMA: EMA_t = alpha*C_t + (1-alpha)*EMA_{t-1}, alpha=2/(N+1); faster moving average.
+
+WMA: WMA = sum(weight_i*C_i)/sum(weight_i); gives recent prices more weight.
+
+HMA: Hull Moving Average reduces lag using weighted moving averages; used for smoother trend turns.
+
+KAMA: Kaufman Adaptive Moving Average changes sensitivity based on noise/trend efficiency.
+
+VWMA: VWMA_N = sum(C_t*V_t)/sum(V_t); volume-weighted moving average.
+
+Price Above MA: Signal = C_t > MA_N; basic trend-following regime filter.
+
+Golden Cross: SMA_50 crosses above SMA_200; long-term bullish trend signal.
+
+Death Cross: SMA_50 crosses below SMA_200; long-term bearish trend signal.
+
+MA Slope: Slope = MA_t - MA_{t-N}; trend direction/strength.
+
+Rate of Change: ROC_N = C_t/C_{t-N} - 1; simple momentum over N periods.
+
+Momentum: MOM_N = C_t - C_{t-N}; absolute price change over lookback.
+
+Time-Series Momentum: Signal = sign(C_t/C_{t-N}-1); buy positive own-trend, sell/avoid negative.
+
+Cross-Sectional Momentum: rank stocks by past return; buy winners/short losers.
+
+Relative Strength: RS = stock return / benchmark return; identifies leadership versus market.
+
+RSI: RSI = 100 - 100/(1+RS), RS=avg_gain/avg_loss; overbought/oversold momentum oscillator.
+
+Stochastic %K: %K = 100*(C-L_N)/(H_N-L_N); close location within recent range.
+
+Stochastic %D: %D = SMA(%K); smoothed stochastic signal line.
+
+MACD: MACD = EMA_12 - EMA_26; trend/momentum spread.
+
+MACD Signal: Signal = EMA_9(MACD); crossover trigger.
+
+MACD Histogram: Hist = MACD - Signal; momentum acceleration proxy.
+
+ADX: Average Directional Index measures trend strength independent of direction.
+
+DMI +DI/-DI: Directional Movement Index compares positive and negative directional movement.
+
+Aroon Up: 100*(N-periods_since_N_high)/N; measures recent high proximity.
+
+Aroon Down: 100*(N-periods_since_N_low)/N; measures recent low proximity.
+
+TRIX: triple-smoothed EMA rate of change; filters noisy momentum.
+
+TSI: True Strength Index uses double-smoothed momentum; trend/momentum oscillator.
+
+CCI: CCI = (TypicalPrice - SMA(TP))/(0.015*MeanDeviation); detects deviations from average price.
+
+Williams %R: %R = -100*(H_N-C)/(H_N-L_N); overbought/oversold range oscillator.
+
+Ultimate Oscillator: combines short/intermediate/long buying pressure; reduces timeframe bias.
+
+Chande Momentum Oscillator: CMO = 100*(sum_gains-sum_losses)/(sum_gains+sum_losses); RSI-like oscillator.
+
+Detrended Price Oscillator: DPO = C_t - SMA shifted; identifies cycle deviations.
+
+Know Sure Thing: KST combines multiple rate-of-change periods; long-term momentum indicator.
+
+Ichimoku Tenkan-sen: (9-period high + 9-period low)/2; short trend equilibrium.
+
+Ichimoku Kijun-sen: (26-period high + 26-period low)/2; medium trend equilibrium.
+
+Ichimoku Senkou Span A: (Tenkan + Kijun)/2 projected forward; cloud boundary.
+
+Ichimoku Senkou Span B: (52-period high + 52-period low)/2 projected forward; cloud boundary.
+
+Ichimoku Cloud: price above cloud = bullish regime, below cloud = bearish regime.
+
+Parabolic SAR: trailing stop that accelerates with trend; trend-following exit/flip indicator.
+
+Supertrend: ATR-based trend line; bullish when price closes above band.
+
+Donchian Channel: upper=max(H,N), lower=min(L,N); breakout system channel.
+
+Turtle Breakout: buy N-day high, sell/short N-day low; classic trend-following rule.
+
+Keltner Channel: EMA +/- multiplier*ATR; trend/volatility envelope.
+
+Bollinger Bands: SMA_N +/- k*std(C,N); volatility envelope around price.
+
+Bollinger %B: %B = (C-LowerBand)/(UpperBand-LowerBand); price location inside bands.
+
+Bollinger Bandwidth: BW = (Upper-Lower)/Middle; volatility compression/expansion gauge.
+
+Moving Average Envelope: MA +/- fixed percentage; simple overextension band.
+
+Z-Score Price: z = (C - mean(C,N))/std(C,N); normalized deviation from recent mean.
+
+Linear Regression Slope: slope of C over N bars; trend strength and direction.
+
+R-Squared Trend: R^2 of linear regression; measures trend fit quality.
+
+Price Channel Breakout: enter when C exceeds prior N high/low; captures volatility expansions.
+
+Gap Momentum: gap = O_t/C_{t-1}-1; overnight information shock measure.
+
+52-Week High Signal: C near max(C,252); persistent momentum/attention effect.
+
+52-Week Low Signal: C near min(C,252); distress/reversal or continuation signal.
+
+Relative Moving Average Spread: (SMA_short/SMA_long)-1; normalized trend state.
+
+Distance From VWAP: (P_t - VWAP_t)/VWAP_t; intraday overextension or trend signal.
+
+Distance From High: C_t/max(C,N)-1; pullback depth from recent peak.
+
+Distance From Low: C_t/min(C,N)-1; rebound strength from recent trough.
+
+================================================================================
+3) MEAN REVERSION INDICATORS
+================================================================================
+
+Z-Score Mean Reversion: z=(P-mean(P,N))/std(P,N); fade extreme deviations if regime is range-bound.
+
+Bollinger Reversion: short/fade upper band or buy lower band; works best in low-trend regimes.
+
+RSI Reversion: RSI<30 buy, RSI>70 sell/avoid; crude oversold/overbought rule.
+
+Stochastic Reversion: %K below 20 or above 80; range-bound turning signal.
+
+Pairs Spread: spread = y - beta*x; relative mispricing between cointegrated assets.
+
+Spread Z-Score: z = (spread - mean(spread,N))/std(spread,N); entry/exit measure for pairs.
+
+Half-Life of Mean Reversion: h = -ln(2)/ln(phi), phi=AR(1) coefficient; expected decay speed.
+
+Ornstein-Uhlenbeck Model: dX = theta*(mu-X)dt + sigma*dW; continuous mean-reversion model.
+
+Residual Reversion: residual = stock_return - factor_model_return; trade extreme idiosyncratic deviations.
+
+Intraday VWAP Reversion: fade large deviations from VWAP; common in liquid large caps.
+
+Open-to-Close Reversion: fade excessive opening gap if no follow-through; intraday stat-arb setup.
+
+Close-to-Open Reversion: buy weak close/sell strong close for overnight reversal effects.
+
+Short-Term Reversal: prior 1-5 day losers rebound and winners cool; common equity microstructure anomaly.
+
+Overreaction Reversal: extreme single-day move partially reverses; requires liquidity/news filters.
+
+Earnings Drift Reversal Filter: avoid fading post-earnings drift too early; event momentum can dominate.
+
+Volume-Climax Reversal: extreme volume plus price exhaustion; possible capitulation/short squeeze turn.
+
+Capitulation Signal: large down move + huge volume + high put/call + high volatility; possible reversal.
+
+Breadth Washout: market-wide oversold breadth; index/sector mean reversion trigger.
+
+================================================================================
+4) VOLATILITY, RANGE, AND RISK INDICATORS
+================================================================================
+
+True Range: TR = max(H-L, abs(H-C_{t-1}), abs(L-C_{t-1})); captures gap-adjusted range.
+
+ATR: ATR_N = average(TR,N); average absolute price range.
+
+ATR Percent: ATRP = ATR/C; normalized volatility.
+
+Realized Volatility: RV = std(l_t,N)*sqrt(PeriodsPerYear); historical volatility.
+
+Parkinson Volatility: sigma^2 = [1/(4N ln2)]*sum(ln(H/L)^2); high-low volatility estimator.
+
+Garman-Klass Volatility: uses O,H,L,C to estimate volatility more efficiently than close-close.
+
+Rogers-Satchell Volatility: OHLC volatility estimator robust to drift.
+
+Yang-Zhang Volatility: combines overnight and intraday volatility; useful for equities.
+
+Volatility Regime: current RV percentile versus history; determines trend/reversion suitability.
+
+Volatility Breakout: enter when price exceeds range by ATR multiple; captures expansion.
+
+Volatility Compression: low Bollinger Bandwidth/ATR percentile; setup for future expansion.
+
+ATR Stop: stop = entry - k*ATR for longs; volatility-adjusted exit.
+
+Chandelier Exit: stop = highest_high_N - k*ATR; trend-following trailing stop.
+
+Donchian Exit: exit on N-day low/high; classic trend system risk control.
+
+HV-IV Spread: HV - IV; compares realized volatility to option-implied volatility.
+
+IV Rank: IVR = (current_IV - IV_low_1y)/(IV_high_1y - IV_low_1y); option volatility richness.
+
+IV Percentile: percent of days IV was below current IV; volatility regime rank.
+
+VIX: S&P 500 implied volatility index; broad equity fear/risk gauge.
+
+VVIX: volatility of VIX options; meta-volatility/fear convexity gauge.
+
+MOVE Index: Treasury implied volatility; rates volatility stress indicator.
+
+Vol-of-Vol: std(volatility changes); instability gauge.
+
+GARCH(1,1): sigma_t^2 = omega + alpha*epsilon_{t-1}^2 + beta*sigma_{t-1}^2; volatility clustering model.
+
+EGARCH: log variance model capturing leverage/asymmetry effects.
+
+GJR-GARCH: GARCH with asymmetric response to negative shocks.
+
+Stochastic Volatility Model: volatility follows latent random process; used in options/quant models.
+
+Realized Beta: rolling beta estimated from intraday/daily returns; dynamic market exposure.
+
+Realized Correlation: rolling correlation among assets; increases in crises.
+
+Average Correlation: mean pairwise stock correlation; high values indicate macro/risk-off regime.
+
+================================================================================
+5) VOLUME, FLOW, AND LIQUIDITY INDICATORS
+================================================================================
+
+Volume SMA: average(V,N); baseline activity.
+
+Relative Volume: RVOL = V_t / average(V,N); unusual trading activity indicator.
+
+Dollar Volume: DollarVol = P_t*V_t; liquidity/capacity measure.
+
+ADV: average daily volume; tradability/capacity filter.
+
+Volume Spike: V_t > k*avg(V,N); attention/information shock marker.
+
+On-Balance Volume: OBV_t = OBV_{t-1} +/- V_t; cumulative volume pressure.
+
+Volume Price Trend: VPT_t = VPT_{t-1}+V_t*(C_t-C_{t-1})/C_{t-1}; volume-weighted price move.
+
+Accumulation/Distribution Line: ADL uses close location in range times volume; buying/selling pressure.
+
+Chaikin Money Flow: CMF = sum(MoneyFlowVolume,N)/sum(V,N); volume-weighted accumulation.
+
+Money Flow Index: MFI = volume-weighted RSI using typical price; overbought/oversold with volume.
+
+Ease of Movement: relates price change to volume; detects low-resistance price movement.
+
+Force Index: FI = V_t*(C_t-C_{t-1}); volume-weighted momentum.
+
+Negative Volume Index: NVI tracks price change on lower-volume days; smart-money folklore indicator.
+
+Positive Volume Index: PVI tracks price change on higher-volume days; crowd participation indicator.
+
+VWAP: VWAP = sum(P_t*V_t)/sum(V_t); institutional benchmark and intraday anchor.
+
+Anchored VWAP: VWAP from a selected event/date; identifies post-event cost basis.
+
+Volume Profile: volume traded at each price level; detects high-volume nodes/support/resistance.
+
+Market Profile: time spent at each price level; auction-market structure tool.
+
+POC: Point of Control = price with highest volume/time; key acceptance price.
+
+Value Area: price range containing ~70% of volume/time; auction equilibrium zone.
+
+Cumulative Volume Delta: CVD = cumulative aggressive buy volume - aggressive sell volume; order-flow pressure.
+
+Delta Divergence: price makes new high while CVD fails; possible exhaustion.
+
+Block Trade Detection: unusually large prints; institutional activity clue.
+
+Dark Pool Prints: off-exchange block activity; possible accumulation/distribution signal.
+
+ETF Flow: net creations/redemptions; fund-level demand/supply pressure.
+
+Fund Flow: net money into mutual funds/ETFs; medium-term demand indicator.
+
+================================================================================
+6) BREADTH AND MARKET INTERNALS
+================================================================================
+
+Advance-Decline Line: cumulative advancing stocks - declining stocks; market participation gauge.
+
+Advance/Decline Ratio: advancing issues / declining issues; daily breadth strength.
+
+New Highs-New Lows: count of 52-week highs minus lows; market health indicator.
+
+McClellan Oscillator: EMA_19(adv-dec) - EMA_39(adv-dec); breadth momentum.
+
+McClellan Summation Index: cumulative McClellan Oscillator; intermediate breadth trend.
+
+Percent Above 50DMA: stocks above 50-day moving average; breadth regime indicator.
+
+Percent Above 200DMA: stocks above 200-day moving average; long-term market health.
+
+Arms Index/TRIN: (Adv/Decl)/(AdvVol/DeclVol); panic/overbought breadth-volume indicator.
+
+Up/Down Volume Ratio: up-volume / down-volume; conviction of market move.
+
+Breadth Thrust: sudden surge in advancing stocks; rare strong bullish regime signal.
+
+Hindenburg Omen: simultaneous new highs/lows under specific conditions; crash-risk folklore indicator.
+
+Sector Breadth: percent of sector stocks in uptrends; sector rotation confirmation.
+
+Equal-Weight vs Cap-Weight Ratio: RSP/SPY or equal-weight index / cap-weight index; market concentration gauge.
+
+Small-Cap/Large-Cap Ratio: IWM/SPY; risk appetite/market breadth proxy.
+
+Cyclical/Defensive Ratio: cyclicals divided by defensives; economic risk-on/off gauge.
+
+High Beta/Low Vol Ratio: SPHB/SPLV; speculative appetite proxy.
+
+Semiconductor/Market Ratio: SMH/SPY; tech-cycle leadership indicator.
+
+Credit/Equity Confirmation: HYG/SPY or LQD/SPY; credit confirming/risk warning.
+
+================================================================================
+7) SUPPORT, RESISTANCE, STRUCTURE, AND CHART TOOLS
+================================================================================
+
+Horizontal Support: prior price zone where demand appeared; stop/entry reference.
+
+Horizontal Resistance: prior price zone where supply appeared; breakout/fade reference.
+
+Trendline: line connecting swing highs/lows; discretionary trend structure.
+
+Pivot High: local high above neighboring highs; swing structure point.
+
+Pivot Low: local low below neighboring lows; swing structure point.
+
+Higher Highs/Higher Lows: bullish market structure; trend confirmation.
+
+Lower Highs/Lower Lows: bearish market structure; downtrend confirmation.
+
+Break of Structure: price violates prior swing high/low; trend change signal.
+
+Market Structure Shift: failure of prior trend sequence; reversal clue.
+
+Liquidity Sweep: price briefly breaks prior high/low then reverses; stop-run pattern.
+
+False Breakout: breakout fails and returns into range; reversal setup.
+
+Breakout Retest: price breaks level, returns to test it, then continues; trend-entry setup.
+
+Measured Move: target = breakout point + prior range height; chart projection.
+
+Fibonacci Retracement: levels 23.6/38.2/50/61.8/78.6%; common discretionary pullback zones.
+
+Fibonacci Extension: 127.2/161.8/261.8%; discretionary target zones.
+
+Pivot Points: PP=(H+L+C)/3; intraday support/resistance framework.
+
+Classic Pivot R1: R1=2*PP-L; first resistance.
+
+Classic Pivot S1: S1=2*PP-H; first support.
+
+Classic Pivot R2: R2=PP+(H-L); second resistance.
+
+Classic Pivot S2: S2=PP-(H-L); second support.
+
+Opening Range Breakout: trade break above/below first X-minute range; intraday momentum setup.
+
+Initial Balance: first hour range; futures/market-profile structure.
+
+Gap Fill: price returns to prior close after opening gap; common intraday target concept.
+
+Unfilled Gap: gap remains open; possible momentum/imbalance signal.
+
+Supply Zone: prior sharp decline area; discretionary resistance.
+
+Demand Zone: prior sharp rally area; discretionary support.
+
+Wyckoff Accumulation: range structure suggesting institutional accumulation.
+
+Wyckoff Distribution: range structure suggesting institutional selling.
+
+Spring: false breakdown in Wyckoff range; reversal trigger.
+
+Upthrust: false breakout in Wyckoff range; bearish reversal trigger.
+
+================================================================================
+8) CANDLESTICK AND PRICE ACTION PATTERNS
+================================================================================
+
+Doji: open and close nearly equal; indecision, useful only at key levels.
+
+Hammer: small body with long lower wick; possible rejection of lows.
+
+Shooting Star: small body with long upper wick; possible rejection of highs.
+
+Engulfing Bullish: green candle body engulfs prior red body; short-term reversal signal.
+
+Engulfing Bearish: red candle body engulfs prior green body; short-term reversal signal.
+
+Morning Star: three-candle bullish reversal pattern; better after downtrend.
+
+Evening Star: three-candle bearish reversal pattern; better after uptrend.
+
+Harami: small candle inside prior body; volatility contraction/indecision.
+
+Inside Bar: full bar range inside prior bar; compression setup.
+
+Outside Bar: bar exceeds prior high and low; volatility expansion signal.
+
+Marubozu: large body with tiny wicks; strong directional conviction.
+
+Pin Bar: long wick rejecting level; discretionary reversal signal.
+
+Three White Soldiers: three strong up candles; momentum continuation.
+
+Three Black Crows: three strong down candles; bearish continuation/reversal.
+
+Exhaustion Candle: huge candle after extended move; possible terminal move.
+
+Narrow Range 7: current range narrowest of last 7 bars; volatility compression.
+
+Wide Range Bar: range much larger than average; possible information shock.
+
+================================================================================
+9) STATISTICAL ARBITRAGE AND RELATIVE-VALUE METHODS
+================================================================================
+
+Pairs Trading: long undervalued asset and short overvalued paired asset; relies on spread mean reversion.
+
+Cointegration: stationary linear combination of non-stationary prices; validates long-run pair relation.
+
+Engle-Granger Test: regression residual stationarity test for cointegration.
+
+Johansen Test: multivariate cointegration test for baskets.
+
+Spread Regression: y_t = alpha + beta*x_t + epsilon_t; beta hedge ratio estimated by regression.
+
+Hedge Ratio: beta = cov(y,x)/var(x); amount of x used to hedge y.
+
+ADF Test: tests whether time series has unit root; used for stationarity.
+
+KPSS Test: tests stationarity directly; complements ADF.
+
+Hurst Exponent: H<0.5 mean-reverting, H=0.5 random walk, H>0.5 trending.
+
+Variance Ratio Test: tests random walk vs mean reversion/momentum.
+
+Z-Score Entry: enter when spread z exceeds +/-threshold; standard stat-arb trigger.
+
+Z-Score Exit: exit when spread z returns near 0; mean-reversion profit capture.
+
+Basket Trading: trade one asset against weighted basket; broader relative-value structure.
+
+PCA Residual Trading: use principal components to model common factors; trade residual dislocations.
+
+Cluster Pairs: pair stocks with similar factor/industry behavior; improves economic validity.
+
+Sector Neutral Long/Short: long top-ranked names and short bottom-ranked names within sector.
+
+Market Neutral Long/Short: beta-adjusted book with near-zero market exposure.
+
+Dollar Neutral Portfolio: long dollars equal short dollars; controls gross market direction less precisely than beta neutrality.
+
+Beta Neutral Portfolio: sum(w_i*beta_i)=0; removes market beta exposure.
+
+Factor Neutral Portfolio: constrain exposures to value/momentum/size/etc.; isolate target alpha.
+
+Residual Momentum: momentum of stock after removing factor/industry returns; cleaner alpha signal.
+
+Residual Reversal: mean reversion in idiosyncratic residual returns; common stat-arb signal.
+
+Lead-Lag Trading: use faster-moving related asset to predict slower asset; common in ETFs/futures/stocks.
+
+ETF Constituents Arb: trade ETF versus underlying basket dislocations; institutional/HFT domain.
+
+Dual-Listed Arb: trade pricing differences across listings; mostly HFT/institutional.
+
+Index Arb: futures/ETF/index basket mispricing; execution-speed dependent.
+
+ADR Arb: American Depositary Receipt versus local shares; currency/liquidity-adjusted relative value.
+
+================================================================================
+10) FACTOR MODELS AND EQUITY FACTORS
+================================================================================
+
+CAPM: R_i-R_f = alpha + beta*(R_m-R_f) + epsilon; market-beta return model.
+
+Fama-French 3-Factor: R_i-R_f = alpha + beta_m*MKT + beta_s*SMB + beta_v*HML + epsilon; market/size/value model.
+
+Carhart 4-Factor: adds MOM momentum factor to Fama-French; common performance attribution model.
+
+Fama-French 5-Factor: adds profitability RMW and investment CMA; broader equity factor model.
+
+q-Factor Model: market, size, investment, profitability; alternative factor framework.
+
+AQR Style Factors: value, momentum, quality, defensive/low-risk; practical quant framework.
+
+Barra Risk Model: commercial multi-factor model for portfolio risk/exposure.
+
+Size Factor: small caps historically earn premium but are cyclical/liquidity-sensitive.
+
+Value Factor: cheap stocks outperform expensive stocks over long horizons but suffer long drawdowns.
+
+Momentum Factor: recent winners continue outperforming; one of the strongest empirical factors.
+
+Quality Factor: profitable, stable, low-leverage firms outperform junk over cycles.
+
+Low Volatility Factor: lower-vol stocks can outperform risk-adjusted; crowding-sensitive.
+
+Profitability Factor: high operating profitability predicts stronger returns.
+
+Investment Factor: low asset growth/conservative investment tends to outperform.
+
+Accruals Factor: low accruals outperform high accruals; earnings quality anomaly.
+
+Net Issuance Factor: firms issuing shares underperform repurchasers.
+
+Buyback Yield: repurchases / market cap; shareholder return signal.
+
+Shareholder Yield: dividends + buybacks - issuance; broader capital return signal.
+
+Earnings Yield: EPS / Price; inverse P/E valuation signal.
+
+Book-to-Market: BV / MCap; classic value signal.
+
+Sales-to-Price: Revenue / MCap; value metric less sensitive to accounting profits.
+
+Cash-Flow-to-Price: Operating Cash Flow / MCap; value/quality hybrid.
+
+FCF Yield: FCF / MCap or FCF / EV; free cash flow valuation signal.
+
+EV/EBITDA: enterprise value divided by EBITDA; capital-structure-neutral valuation multiple.
+
+EV/Sales: enterprise value divided by revenue; common for unprofitable growth firms.
+
+PEG Ratio: P/E divided by EPS growth; growth-adjusted valuation metric.
+
+Gross Profitability: gross profit / total assets; strong quality factor.
+
+ROE: NI / equity; profitability metric.
+
+ROA: NI / assets; asset efficiency/profitability metric.
+
+ROIC: NOPAT / invested capital; capital efficiency metric.
+
+Debt/Equity: total debt / equity; leverage risk metric.
+
+Net Debt/EBITDA: net debt / EBITDA; solvency/leverage metric.
+
+Interest Coverage: EBIT / interest expense; ability to service debt.
+
+Piotroski F-Score: 0-9 accounting quality/value score; screens improving cheap companies.
+
+Altman Z-Score: bankruptcy risk formula; distress filter.
+
+Beneish M-Score: earnings manipulation risk model; accounting red-flag filter.
+
+Sloan Accruals: accruals / assets; high accruals imply lower earnings quality.
+
+Earnings Revision Factor: upward analyst EPS revisions; strong medium-term predictor.
+
+Estimate Dispersion: std(analyst estimates)/mean estimate; uncertainty/disagreement signal.
+
+Short Interest Factor: shares short / float; bearish sentiment and squeeze-risk input.
+
+Analyst Upgrade/Downgrade: sell-side rating change; event/flow signal.
+
+Target Price Revision: change in analyst price target; sentiment/revision signal.
+
+Institutional Ownership Change: change in institutional holdings; slow flow signal.
+
+Insider Buying: executives/directors buying shares; generally stronger than insider selling.
+
+================================================================================
+11) FUNDAMENTAL, QUALITY, AND VALUATION TOOLS
+================================================================================
+
+Discounted Cash Flow: Value = sum(FCF_t/(1+r)^t) + TerminalValue/(1+r)^T; intrinsic value model.
+
+Dividend Discount Model: Value = D_1/(r-g); values dividend stream with growth g.
+
+Residual Income Model: Value = BV + PV(future residual income); accounting-based valuation.
+
+Economic Profit: EP = NOPAT - WACC*InvestedCapital; value creation metric.
+
+WACC: weighted average cost of capital; blended required return for debt/equity financing.
+
+ROIC-WACC Spread: ROIC - WACC; measures economic value creation.
+
+Revenue Growth: Revenue_t/Revenue_{t-1}-1; top-line growth signal.
+
+EPS Growth: EPS_t/EPS_{t-1}-1; earnings growth signal.
+
+FCF Growth: FCF_t/FCF_{t-1}-1; cash-generation growth signal.
+
+Gross Margin: GrossProfit/Revenue; pricing power/cost structure metric.
+
+Operating Margin: OperatingIncome/Revenue; operating profitability.
+
+Net Margin: NI/Revenue; bottom-line profitability.
+
+FCF Margin: FCF/Revenue; cash conversion quality.
+
+Asset Turnover: Revenue/Assets; efficiency metric.
+
+Inventory Turnover: COGS/AverageInventory; demand/supply-chain efficiency.
+
+Receivables Days: AccountsReceivable/Revenue*365; collection quality.
+
+Deferred Revenue Growth: growth in prepaid customer revenue; SaaS/demand quality signal.
+
+Rule of 40: revenue growth % + FCF margin %; SaaS growth/profitability balance.
+
+Net Revenue Retention: retained customer revenue including expansion; SaaS quality metric.
+
+Customer Acquisition Cost: CAC = sales/marketing spend per new customer; growth efficiency.
+
+LTV/CAC: customer lifetime value divided by acquisition cost; unit economics signal.
+
+Capex Intensity: Capex/Revenue; reinvestment burden.
+
+R&D Intensity: R&D/Revenue; innovation/growth spend.
+
+SG&A Leverage: SG&A/Revenue trend; operating leverage indicator.
+
+Operating Leverage: EBIT growth / revenue growth; profit sensitivity to sales.
+
+Cash Conversion Cycle: DIO + DSO - DPO; working-capital efficiency.
+
+Beneish Days Sales Receivable Index: detects receivables-driven earnings risk.
+
+Goodwill/Assets: acquisition accounting exposure; impairment risk.
+
+Debt Maturity Wall: upcoming debt maturities; refinancing risk signal.
+
+Credit Rating Changes: agency upgrade/downgrade; solvency/repricing catalyst.
+
+Covenant Risk: proximity to debt covenant violation; distress trigger.
+
+================================================================================
+12) EARNINGS AND EVENT-DRIVEN SIGNALS
+================================================================================
+
+Earnings Surprise: actual EPS - consensus EPS; immediate information shock.
+
+Standardized Unexpected Earnings: SUE = (actual EPS - expected EPS)/std_surprises; normalized surprise.
+
+Post-Earnings Announcement Drift: stocks drift in direction of earnings surprise; robust anomaly.
+
+Revenue Surprise: actual revenue - consensus revenue; top-line information shock.
+
+Guidance Raise/Cut: company changes forward outlook; often more important than reported quarter.
+
+Beat and Raise: earnings beat plus guidance raise; strong bullish event pattern.
+
+Miss and Lower: earnings miss plus guidance cut; strong bearish event pattern.
+
+Whisper Number Surprise: actual EPS versus informal expectation; explains moves despite consensus beat.
+
+Earnings Call NLP: sentiment/tone of management language; textual alpha source.
+
+Q&A Sentiment: analyst/management tone during questions; stress/confidence signal.
+
+Management Tone Change: change in positive/negative wording versus prior calls; signal over absolute tone.
+
+Transcript Similarity: boilerplate increase or unusual phrasing; uncertainty/red-flag signal.
+
+10-Q/10-K NLP: risk factor changes, litigation language, going concern language; filing-based signal.
+
+8-K Event Signal: material corporate event; catalyst screen.
+
+Form 4 Insider Trade: insider buying/selling disclosure; event-based signal.
+
+13F Holdings: institutional quarterly holdings; slow, delayed smart-money signal.
+
+13D/13G Filing: activist/large holder disclosure; catalyst signal.
+
+Short Seller Report: published bear thesis; high-volatility event.
+
+Activist Campaign: investor pushes strategic change; event-driven catalyst.
+
+M&A Spread: deal_price/current_price - 1; merger-arb return before deal risk.
+
+Merger Break Probability: market-implied deal failure risk; event risk estimate.
+
+Tender Offer Arb: spread between tender price and market price; event-driven setup.
+
+Spin-Off Event: parent distributes subsidiary; can create forced-selling inefficiency.
+
+Index Inclusion: stock added to index; passive buying flow catalyst.
+
+Index Deletion: stock removed from index; passive selling flow catalyst.
+
+IPO Lockup Expiration: insider shares become saleable; supply overhang catalyst.
+
+Secondary Offering: new share issuance; dilution/supply shock.
+
+Buyback Authorization: company announces repurchase capacity; demand/support catalyst.
+
+Dividend Initiation: new dividend; capital-return regime signal.
+
+Dividend Cut: payout reduction; distress signal.
+
+Special Dividend: one-time payout; event and tax effect.
+
+FDA Approval: biotech binary catalyst.
+
+Clinical Trial Readout: biotech data catalyst.
+
+Patent Ruling: legal monopoly/competition catalyst.
+
+Antitrust Ruling: regulatory catalyst.
+
+Product Launch: revenue/market-share catalyst.
+
+CEO/CFO Change: leadership catalyst; context-dependent.
+
+Accounting Restatement: credibility/earnings quality shock.
+
+Auditor Resignation: severe governance red flag.
+
+Going Concern Warning: solvency distress signal.
+
+================================================================================
+13) OPTIONS-BASED INDICATORS AND DERIVATIVES TOOLS
+================================================================================
+
+Call/Put Volume Ratio: call volume / put volume; bullish speculative demand gauge.
+
+Put/Call Ratio: put volume / call volume; fear/hedging/sentiment gauge.
+
+Equity Put/Call Ratio: single-stock put/call; retail/institutional sentiment input.
+
+Index Put/Call Ratio: index option put/call; macro hedging/fear input.
+
+Open Interest: number of outstanding option contracts; positioning/liquidity measure.
+
+OI Change: change in open interest; new positioning clue.
+
+Unusual Options Activity: option volume far above baseline; possible informed/speculative flow.
+
+Sweep Orders: aggressive multi-exchange option orders; urgency signal, noisy.
+
+Block Options Trade: large negotiated option print; institutional positioning clue.
+
+Premium Traded: option price * contracts * 100; dollar magnitude of options bet.
+
+Delta: dOption/dUnderlying; approximate option directional exposure.
+
+Gamma: dDelta/dUnderlying; convexity/hedging sensitivity.
+
+Theta: dOption/dTime; time decay.
+
+Vega: dOption/dIV; sensitivity to implied volatility.
+
+Rho: dOption/dRates; sensitivity to interest rates.
+
+Charm: dDelta/dTime; delta decay over time.
+
+Vanna: dDelta/dIV or dVega/dUnderlying; cross-sensitivity relevant to dealer hedging.
+
+Vomma/Volga: dVega/dIV; convexity to volatility.
+
+Implied Volatility: volatility implied by option price; market-implied expected movement.
+
+Historical Volatility: realized past volatility; comparison base for IV.
+
+IV Rank: current IV location within 1-year range; option richness gauge.
+
+IV Percentile: percent of past IV observations below current; regime gauge.
+
+IV Skew: IV_put - IV_call or IV_OTM - IV_ATM; crash/lottery demand.
+
+Term Structure: IV_near - IV_far; event risk and volatility regime measure.
+
+Contango: longer-dated IV/futures above near-dated; normal calm vol structure.
+
+Backwardation: near-dated IV/futures above far-dated; stress/event regime.
+
+Expected Move: EM ≈ ATM straddle price; option-implied event range.
+
+Straddle Price: call_ATM + put_ATM; market price of volatility around event.
+
+Breakeven Move: straddle_price / stock_price; required move for long straddle.
+
+Variance Risk Premium: IV^2 - expected RV^2; option sellers harvest if IV overpriced.
+
+Gamma Exposure: GEX estimates dealer gamma positioning; affects intraday pinning/volatility.
+
+Delta Exposure: DEX estimates dealer directional hedging pressure.
+
+Max Pain: option strike where buyers lose most at expiration; popular but weak/noisy positioning idea.
+
+Pin Risk: price gravitates near large OI strike near expiration; dealer/hedging microstructure effect.
+
+Zero-DTE Flow: same-day option volume/order flow; affects intraday index dynamics.
+
+Skew Steepening: puts become richer than calls; rising downside fear.
+
+Call Skew: upside calls richer; squeeze/speculative upside demand.
+
+Implied Correlation: index IV versus component IV; market systemic-risk expectation.
+
+Realized-Implied Spread: RV - IV; long/short volatility signal.
+
+Volatility Crush: IV drops after event; key earnings-options dynamic.
+
+================================================================================
+14) MARKET MICROSTRUCTURE AND HIGH-FREQUENCY SIGNALS
+================================================================================
+
+Bid-Ask Spread: Spread = A-B; transaction cost/liquidity measure.
+
+Relative Spread: (A-B)/M; normalized spread.
+
+Midprice: M=(A+B)/2; fair instantaneous quote midpoint.
+
+Microprice: MP=(A*q_bid + B*q_ask)/(q_bid+q_ask); order-book imbalance-adjusted fair price.
+
+Order Book Imbalance: OBI=(q_bid-q_ask)/(q_bid+q_ask); short-term pressure signal.
+
+Depth Imbalance: imbalance across multiple book levels; richer liquidity-pressure signal.
+
+Order Flow Imbalance: OFI = net bid/ask size changes; predicts short-horizon price changes.
+
+Trade Imbalance: aggressive buy volume - aggressive sell volume; short-term directional pressure.
+
+Quote Imbalance: bid quote additions/cancellations minus ask additions/cancellations; liquidity pressure.
+
+Queue Position: order rank at price level; fill probability determinant.
+
+Fill Probability: probability passive order executes; core market-making model.
+
+Adverse Selection: loss from being filled before unfavorable price move; market-maker risk.
+
+Effective Spread: 2*abs(execution_price - midprice); realized cost paid by liquidity taker.
+
+Realized Spread: 2*side*(execution_price - mid_after_delay); market-maker revenue after adverse selection.
+
+Price Impact: price change caused by trade/order; execution cost/alpha decay.
+
+Kyle Lambda: price impact per unit signed volume; market illiquidity measure.
+
+Amihud Illiquidity: abs(return)/dollar_volume; low-frequency price impact proxy.
+
+VPIN: volume-synchronized probability of informed trading; order-flow toxicity metric.
+
+Order Arrival Rate: orders per unit time; market activity intensity.
+
+Cancellation Rate: canceled orders / submitted orders; HFT liquidity behavior measure.
+
+Trade Sign Classification: buy/sell initiated trade label; needed for order-flow signals.
+
+Lee-Ready Algorithm: classifies trades using quote midpoints/tick rule; old trade-sign method.
+
+Tick Rule: uptick = buyer initiated, downtick = seller initiated; simple trade classification.
+
+Quote Stuffing: rapid quote submission/cancellation; noise/manipulation/latency stress.
+
+Latency Arbitrage: exploit stale quotes before updates; HFT-only domain.
+
+Statistical Market Making: quote bid/ask around fair value with inventory/risk constraints.
+
+Inventory Skew: adjust quotes based on current inventory; market-making risk control.
+
+Maker-Taker Economics: rebates/fees affect routing and profitability.
+
+Smart Order Routing: choose venues to optimize fill/cost/rebate.
+
+Hidden Liquidity: non-displayed order liquidity; affects execution quality.
+
+Iceberg Detection: repeated replenishment at level; hidden institutional order clue.
+
+Spoofing Detection: large displayed orders canceled before execution; manipulation warning.
+
+Liquidity Vacuum: depth disappears during stress; crash/slippage risk.
+
+Opening Auction Imbalance: exchange imbalance before open; short-term opening pressure signal.
+
+Closing Auction Imbalance: imbalance before close; end-of-day flow signal.
+
+Limit Order Book Slope: depth distribution around mid; liquidity fragility measure.
+
+Spread Mean Reversion: spreads widen/narrow intraday predictably; execution timing input.
+
+Intraday Seasonality: volume/volatility U-shape; execution and signal normalization input.
+
+================================================================================
+15) SENTIMENT, NEWS, AND TEXTUAL SIGNALS
+================================================================================
+
+News Sentiment Score: NLP polarity of company news; event-driven alpha input.
+
+News Volume Spike: count of articles above baseline; attention/information shock.
+
+Headline Sentiment: sentiment from headlines only; fast but noisy signal.
+
+Full-Text Sentiment: sentiment from full article; slower but richer signal.
+
+Entity Recognition: links news to tickers/entities; required for scalable news trading.
+
+Novelty Score: whether news is new versus repeated; avoids stale headline chasing.
+
+Relevance Score: degree news actually concerns ticker; reduces false positives.
+
+Tone Change: current tone minus historical tone; more useful than raw tone.
+
+Social Sentiment: bullish/bearish tone from X/Reddit/Stocktwits/etc.; retail attention signal.
+
+Social Volume: number of posts/mentions; attention/mania signal.
+
+Social Velocity: rate of change in mentions; early attention acceleration signal.
+
+Reddit WallStreetBets Mentions: retail speculation gauge; squeeze/meme-stock input.
+
+Google Trends: search-interest index; consumer/investor attention proxy.
+
+Wikipedia Page Views: public attention proxy.
+
+App Store Ranking: mobile-app traction signal for consumer/software companies.
+
+Web Traffic: visits to company website; demand proxy.
+
+Job Postings: hiring growth/decline; company expansion/contraction signal.
+
+Glassdoor Sentiment: employee sentiment; slow organizational health proxy.
+
+Credit Card Data: consumer spend estimate; revenue nowcasting.
+
+Email Receipt Data: transaction-level consumer demand proxy.
+
+Satellite Parking Lots: store/factory traffic proxy.
+
+Shipping/AIS Data: vessel movement/import-export proxy.
+
+Web Scraped Prices: product pricing/inflation/margin signal.
+
+Product Review Volume: demand/customer satisfaction proxy.
+
+Patent Filings: innovation pipeline proxy.
+
+GitHub Activity: developer adoption/product traction proxy for software/crypto.
+
+Insider Transaction Sentiment: aggregate insider buy/sell signal.
+
+Short Report Sentiment: published short-seller claims; catalyst/risk input.
+
+Analyst Report NLP: sentiment and estimate changes from sell-side notes.
+
+Earnings Transcript NLP: management confidence/uncertainty/complexity signal.
+
+SEC Filing Change Detection: textual differences in filings; risk/catalyst detection.
+
+Risk Factor Expansion: increased risk factor language; caution signal.
+
+Litigation Language: legal-risk text increase; red flag.
+
+Going Concern Language: severe solvency red flag.
+
+================================================================================
+16) SHORT INTEREST, BORROW, AND SQUEEZE INDICATORS
+================================================================================
+
+Short Interest: shares sold short; bearish positioning.
+
+Short Interest Ratio: short_interest / average_daily_volume; days-to-cover squeeze risk.
+
+Short Percent of Float: short_interest / float; crowding/squeeze indicator.
+
+Borrow Fee: annualized cost to borrow shares; shorting pressure/scarcity signal.
+
+Utilization: borrowed shares / lendable shares; borrow-market tightness.
+
+Shares Available to Borrow: remaining borrow inventory; squeeze/shortability input.
+
+Fails to Deliver: unsettled short/long delivery failures; stress/squeeze clue.
+
+Threshold Securities List: persistent fails-to-deliver list; squeeze-risk input.
+
+Cost-to-Borrow Trend: rising borrow cost indicates short demand or scarcity.
+
+Recall Risk: lender may demand shares back; short squeeze operational risk.
+
+Crowded Short Score: high short interest + high borrow + positive catalyst risk; squeeze setup.
+
+Short Squeeze Setup: high short interest + low float + bullish catalyst + price strength + call buying.
+
+Gamma Squeeze Setup: heavy call buying raises dealer hedging demand; can amplify upside.
+
+Float: shares available to trade; lower float increases squeeze potential.
+
+Free Float: float excluding strategic locked holders; better tradable supply measure.
+
+Insider Lockup: restricted shares not yet tradable; future supply risk.
+
+================================================================================
+17) MACRO, CROSS-ASSET, AND LIQUIDITY INDICATORS
+================================================================================
+
+Fed Funds Rate: central bank policy rate; discount-rate and liquidity anchor.
+
+Fed Funds Futures: market-implied future rate path; rates-expectations input.
+
+SOFR: secured overnight financing rate; key USD funding rate.
+
+Treasury Yield: government bond yield; discount-rate input.
+
+2-Year Yield: sensitive to Fed expectations; growth-stock valuation pressure input.
+
+10-Year Yield: long-term discount-rate/growth/inflation input.
+
+Yield Curve 10Y-2Y: 10-year minus 2-year yield; recession/inversion signal.
+
+Yield Curve 10Y-3M: 10-year minus 3-month yield; recession-risk gauge.
+
+Real Yield: nominal yield - inflation expectation; strong valuation pressure driver.
+
+Breakeven Inflation: nominal Treasury yield - TIPS yield; market inflation expectation.
+
+Dollar Index DXY: USD strength; global liquidity and multinational earnings input.
+
+Oil Price: energy/inflation/geopolitical input.
+
+Copper/Gold Ratio: growth versus safety proxy.
+
+Gold Price: real-rate/fear/currency debasement proxy.
+
+Bitcoin Risk Proxy: speculative liquidity/risk appetite proxy.
+
+Credit Spread: corporate yield - Treasury yield; default/risk appetite signal.
+
+High-Yield Spread: junk bond spread; major equity risk indicator.
+
+Investment-Grade Spread: safer credit stress indicator.
+
+TED Spread: bank funding stress proxy.
+
+Financial Conditions Index: composite liquidity/credit/rates stress measure.
+
+M2 Money Supply: broad money/liquidity input.
+
+Reverse Repo Balance: liquidity plumbing indicator.
+
+Treasury General Account: Treasury cash balance; liquidity drain/addition input.
+
+Bank Reserves: banking-system liquidity base.
+
+QT/QE Pace: central bank balance-sheet contraction/expansion; liquidity regime input.
+
+PMI: purchasing managers index; business cycle nowcast.
+
+ISM Manufacturing: US manufacturing cycle indicator.
+
+ISM Services: US services cycle indicator.
+
+CPI: consumer inflation; rate-policy catalyst.
+
+PCE Inflation: Fed-preferred inflation measure.
+
+Payrolls/NFP: labor market strength; macro/rates catalyst.
+
+Unemployment Rate: labor market cycle indicator.
+
+Initial Jobless Claims: high-frequency labor weakening signal.
+
+Retail Sales: consumer demand input.
+
+Industrial Production: manufacturing activity input.
+
+Housing Starts: housing cycle input.
+
+Building Permits: forward housing activity.
+
+Consumer Confidence: sentiment/demand input.
+
+Michigan Inflation Expectations: consumer inflation expectation.
+
+GDPNow: real-time GDP nowcast.
+
+Earnings Revisions Breadth: aggregate analyst revisions; equity-cycle input.
+
+Global Liquidity: central bank balance sheets + money supply; risk-asset regime input.
+
+VIX Term Structure: front VIX futures vs back futures; stress/risk-on gauge.
+
+Contango in VIX Futures: calm carry regime.
+
+Backwardation in VIX Futures: crisis/fear regime.
+
+JPY Carry Proxy: USDJPY/rates differential; global carry/risk sentiment.
+
+Cross-Asset Confirmation: equities up + credit strong + vol down = risk-on confirmation.
+
+================================================================================
+18) SECTOR ROTATION AND RELATIVE STRENGTH TOOLS
+================================================================================
+
+Sector Relative Strength: sector ETF / SPY ratio; leadership identification.
+
+Sector Momentum Rank: rank sectors by 1/3/6/12-month return; rotation strategy.
+
+Defensive Leadership: utilities/staples/healthcare outperform; risk-off signal.
+
+Cyclical Leadership: industrials/materials/financials outperform; growth/reflation signal.
+
+Growth/Value Ratio: growth ETF / value ETF; style regime indicator.
+
+Small/Large Ratio: small-cap ETF / large-cap ETF; risk appetite/economic breadth.
+
+Equal/Cap Ratio: equal-weight index / cap-weight index; concentration/breadth gauge.
+
+Semiconductor Leadership: SOXX or SMH / QQQ; AI/tech-cycle health proxy.
+
+Banks Relative Strength: KBE or KRE / SPY; credit/economic confidence proxy.
+
+Homebuilders Relative Strength: XHB / SPY; rates-sensitive housing signal.
+
+Transports Relative Strength: IYT / SPY; old Dow Theory economic confirmation.
+
+Discretionary/Staples Ratio: XLY/XLP; consumer risk appetite.
+
+High Beta/Low Vol Ratio: SPHB/SPLV; speculative appetite.
+
+Momentum/Minimum Vol Ratio: MTUM/USMV; trend/risk regime.
+
+Sector Breadth: percent of stocks in sector above 50/200DMA; internal sector strength.
+
+Sector Earnings Revisions: analyst revision breadth by sector; fundamental momentum.
+
+================================================================================
+19) REGIME DETECTION METHODS
+================================================================================
+
+Trend Regime: price above long MA and MA rising; favor momentum/trend systems.
+
+Range Regime: low trend strength and bounded price; favor mean reversion.
+
+High Volatility Regime: RV/ATR percentile high; reduce size/widen stops.
+
+Low Volatility Regime: RV/ATR percentile low; prepare for breakout/compression trades.
+
+Risk-On Regime: equities/credit up, VIX down, breadth strong; favor cyclicals/beta.
+
+Risk-Off Regime: equities down, credit spreads up, VIX up; favor defense/cash/hedges.
+
+Inflation Regime: CPI/breakevens/commodities rising; affects sector/factor leadership.
+
+Disinflation Regime: inflation expectations falling; supports duration/growth if recession absent.
+
+Recession Regime: earnings revisions down, credit spreads up, curve behavior deteriorates; reduce cyclical risk.
+
+Liquidity Expansion Regime: central bank/money/liquidity supportive; favors speculative assets.
+
+Liquidity Contraction Regime: rates/QT/dollar/real yields restrictive; hurts long-duration risk assets.
+
+Markov Regime Switching: probabilistic model assigning hidden market states.
+
+Hidden Markov Model: latent state model for returns/volatility regimes.
+
+Kalman Filter: dynamically estimates latent trend/beta/hedge ratio.
+
+Bayesian Change Point Detection: identifies structural breaks in time series.
+
+Rolling Correlation Break: sudden correlation shift; regime-change warning.
+
+Volatility Percentile Regime: rank current volatility versus history; simple state classifier.
+
+Breadth Regime: breadth thrust/washout/internal deterioration; participation state.
+
+Macro Regime Grid: growth up/down and inflation up/down; asset allocation framework.
+
+================================================================================
+20) TIME-SERIES MODELS
+================================================================================
+
+AR Model: X_t = c + sum(phi_i*X_{t-i}) + epsilon_t; autoregressive forecasting.
+
+MA Model: X_t = c + epsilon_t + sum(theta_i*epsilon_{t-i}); moving-average error model.
+
+ARMA: combines autoregressive and moving-average terms; stationary time-series model.
+
+ARIMA: ARMA plus differencing; nonstationary time-series forecasting.
+
+SARIMA: seasonal ARIMA; captures calendar seasonality.
+
+ARIMAX: ARIMA with external regressors; includes macro/fundamental predictors.
+
+VAR: vector autoregression; models multiple time series jointly.
+
+VECM: vector error correction model; cointegration-aware VAR.
+
+State-Space Model: latent-state time-series model; flexible dynamic forecasting.
+
+Kalman Smoother: estimates latent historical states after observing full data.
+
+Exponential Smoothing: forecast using decaying weights on history.
+
+Holt-Winters: exponential smoothing with trend/seasonality.
+
+Prophet: decomposable trend/seasonality model; more common in business forecasting than trading.
+
+GARCH: volatility forecasting with clustering.
+
+HAR-RV: heterogeneous autoregressive realized volatility model; strong RV forecasting baseline.
+
+MIDAS Regression: mixed-frequency data regression; combines daily/weekly/monthly predictors.
+
+Dynamic Linear Model: Bayesian time-varying regression.
+
+Rolling Regression: estimates relationship over moving window; adapts to changing regimes.
+
+Expanding Regression: uses all data up to current date; more stable, less adaptive.
+
+Recursive Least Squares: online updating regression coefficients.
+
+================================================================================
+21) MACHINE LEARNING METHODS USED IN TRADING
+================================================================================
+
+Linear Regression: predicts continuous return from features; baseline alpha model.
+
+Ridge Regression: linear regression with L2 penalty; controls overfitting.
+
+Lasso Regression: linear regression with L1 penalty; feature selection.
+
+Elastic Net: combines L1 and L2 penalties; robust sparse regression.
+
+Logistic Regression: predicts probability of up/down move; classification baseline.
+
+Naive Bayes: probabilistic classifier with independence assumption; simple text/sentiment use.
+
+k-Nearest Neighbors: predicts from similar historical feature states; sensitive to scaling.
+
+Decision Tree: nonlinear rule splits; interpretable but overfits.
+
+Random Forest: ensemble of decision trees; robust nonlinear model.
+
+Gradient Boosting: sequential trees correcting errors; strong tabular-data method.
+
+XGBoost/LightGBM/CatBoost: industrial gradient-boosted tree implementations; common quant ML workhorses.
+
+Support Vector Machine: margin-based classifier/regressor; useful but less scalable.
+
+Neural Network: nonlinear function approximator; needs strong regularization/data.
+
+Convolutional Neural Network: detects local patterns; sometimes used on order books/charts.
+
+Recurrent Neural Network: sequence model; older approach for time series.
+
+LSTM: gated recurrent model; used for sequential price/order-flow data.
+
+GRU: simpler gated recurrent model; sequence forecasting.
+
+Transformer: attention-based sequence model; used for text, order books, multi-asset features.
+
+Temporal Fusion Transformer: deep forecasting model with covariates; complex and data-hungry.
+
+Autoencoder: compresses features; anomaly detection/factor extraction.
+
+Variational Autoencoder: probabilistic representation learning; synthetic/latent-factor modeling.
+
+Graph Neural Network: models relationships among stocks/supply chains/ownership networks.
+
+Reinforcement Learning: learns trading policy from reward; hard to make robust live.
+
+Contextual Bandit: chooses action based on current state; simpler RL for allocation/execution.
+
+Bayesian Regression: regression with uncertainty estimates; useful for noisy markets.
+
+Gaussian Process: nonlinear Bayesian model; uncertainty-aware but poor scalability.
+
+Online Learning: updates model continuously as data arrives; handles drift.
+
+Ensemble Model: combines multiple predictors; often more robust than one model.
+
+Stacking: meta-model combines base model outputs; improves forecasts if not overfit.
+
+Blending: weighted average of model forecasts; simple ensemble method.
+
+Feature Importance: ranks predictive variables; interpretation/debugging.
+
+SHAP Values: local/global feature attribution for ML models.
+
+Permutation Importance: measures performance loss when feature is shuffled.
+
+Regularization: penalizes complexity; essential to avoid false alpha.
+
+Dropout: neural net regularization by random unit removal.
+
+Early Stopping: stop training before validation performance degrades.
+
+Walk-Forward Validation: train on past, test on future rolling windows; required for trading realism.
+
+Purged Cross-Validation: removes leakage around overlapping labels; used in financial ML.
+
+Embargo: time gap between train/test samples; reduces leakage.
+
+Combinatorial Purged CV: robust cross-validation for overlapping financial labels.
+
+Triple-Barrier Labeling: labels trades by profit target, stop loss, or time limit.
+
+Meta-Labeling: model predicts whether primary signal should be acted on; improves precision.
+
+Probability Calibration: aligns predicted probabilities with realized frequencies.
+
+Conformal Prediction: prediction intervals with statistical coverage guarantees.
+
+Concept Drift Detection: detects changing data-generating process.
+
+Adversarial Validation: tests whether train and test distributions differ.
+
+================================================================================
+22) FEATURE ENGINEERING FOR TRADING MODELS
+================================================================================
+
+Lagged Returns: prior returns over multiple horizons; baseline momentum/reversal features.
+
+Rolling Volatility: std of returns over N; risk/regime feature.
+
+Rolling Skew/Kurtosis: distribution shape features.
+
+Volume Change: V_t/avg(V,N)-1; abnormal activity.
+
+Price Distance to MA: C/MA_N-1; trend/mean-reversion feature.
+
+MA Cross Feature: MA_short/MA_long-1; normalized trend feature.
+
+Rolling Beta: dynamic market sensitivity feature.
+
+Rolling Correlation: dynamic relationship with benchmark/sector.
+
+Sector Relative Return: stock return minus sector return; idiosyncratic momentum.
+
+Market Residual Return: stock return minus beta-adjusted market return.
+
+Overnight Return: O_t/C_{t-1}-1; after-hours information feature.
+
+Intraday Return: C_t/O_t-1; regular-session behavior.
+
+Gap Feature: O_t/C_{t-1}-1; overnight shock.
+
+Range Feature: (H-L)/C; intraday volatility.
+
+Close Location Value: CLV = ((C-L)-(H-C))/(H-L); close position in range.
+
+Volume-Weighted Return: return times volume percentile; conviction feature.
+
+Calendar Features: day-of-week, month, turn-of-month, options expiration; seasonality.
+
+Earnings Proximity: days to/from earnings; event-risk feature.
+
+Analyst Revision Change: recent estimate revisions; fundamental momentum.
+
+Short Interest Change: change in short interest; positioning feature.
+
+Borrow Fee Change: change in borrow cost; squeeze-risk feature.
+
+Options Skew Change: change in put/call IV skew; sentiment/hedging feature.
+
+News Sentiment Change: sentiment delta; information flow feature.
+
+Macro Surprise: actual macro release minus consensus; macro shock feature.
+
+Cross-Asset Return: related futures/ETF return; lead-lag feature.
+
+Sector ETF Return: sector movement as predictor; common factor feature.
+
+Market Breadth Feature: percent stocks rising; regime feature.
+
+Volatility Percentile: current vol rank; model interaction feature.
+
+Liquidity Feature: spread, ADV, Amihud; tradability/impact feature.
+
+================================================================================
+23) BACKTESTING, STATISTICAL VALIDATION, AND RESEARCH TOOLS
+================================================================================
+
+Out-of-Sample Test: evaluate strategy on unseen future data; minimum credibility requirement.
+
+Walk-Forward Backtest: rolling retrain/retest; simulates live adaptation.
+
+Paper Trading: live simulated execution; checks operational assumptions.
+
+Live Shadow Mode: generate signals without trading; validates data/execution pipeline.
+
+Transaction Cost Model: spread + slippage + commissions + borrow + fees; prevents fake alpha.
+
+Survivorship-Bias-Free Data: includes delisted stocks; required for equity backtests.
+
+Point-in-Time Data: data as known at the time; avoids lookahead bias.
+
+Corporate Actions Adjustment: splits/dividends adjusted correctly; prevents false signals.
+
+Lookahead Bias Check: ensure future data not used in past decisions.
+
+Data Snooping Check: controls for testing many ideas until one works by chance.
+
+Multiple Hypothesis Correction: adjusts significance for many tests.
+
+White Reality Check: tests best strategy after data snooping.
+
+Deflated Sharpe Ratio: adjusts Sharpe for non-normality and multiple trials.
+
+Probabilistic Sharpe Ratio: probability true Sharpe exceeds benchmark Sharpe.
+
+Minimum Track Record Length: time needed to statistically trust observed Sharpe.
+
+t-Statistic: t = mean_return / standard_error; significance of mean return.
+
+p-Value: probability result occurs under null hypothesis; often misused in trading.
+
+Confidence Interval: uncertainty range around metric estimate.
+
+Bootstrap: resample returns/trades to estimate uncertainty.
+
+Block Bootstrap: resample blocks to preserve autocorrelation.
+
+Monte Carlo Simulation: simulate many equity paths; estimates drawdown/risk distribution.
+
+Parameter Sensitivity: strategy robust across parameter ranges; avoids curve fitting.
+
+Ablation Study: remove features/rules to test contribution.
+
+Stress Test: run strategy under crisis/slippage/volatility assumptions.
+
+Regime Split Test: evaluate performance in bull/bear/high-vol/low-vol regimes.
+
+Subperiod Test: test across different decades/market cycles.
+
+Universe Robustness: test across stock universes; avoids single-sample alpha.
+
+Capacity Test: estimate edge decay with larger capital/order size.
+
+Turnover Test: high turnover must survive cost assumptions.
+
+Delay Test: execute signals with delay; checks if alpha is fragile.
+
+Randomized Entry Test: compare strategy entries to random entries with same exits; validates signal.
+
+Reality Gap: difference between backtest and live trading; primary failure zone.
+
+================================================================================
+24) POSITION SIZING AND TRADE MANAGEMENT
+================================================================================
+
+Fixed Fractional Sizing: risk fixed percent of equity per trade; simple compounding control.
+
+Fixed Dollar Sizing: same dollar per trade; simple but ignores volatility.
+
+Volatility Targeting: position size inversely proportional to volatility; stabilizes risk.
+
+ATR Sizing: shares = dollar_risk / (ATR*k); volatility-based trade sizing.
+
+Kelly Sizing: maximize expected log growth; mathematically optimal but often too aggressive.
+
+Fractional Kelly: use 1/4 or 1/2 Kelly; more realistic drawdown control.
+
+Equal Weighting: same weight per position; robust baseline.
+
+Risk Parity: allocate equal risk contribution; portfolio construction tool.
+
+Beta Targeting: adjust exposure to desired beta; controls market sensitivity.
+
+Gross Exposure: sum(abs(long)+abs(short)); total market deployed.
+
+Net Exposure: long exposure - short exposure; directional market exposure.
+
+Leverage Constraint: max gross exposure; protects against liquidation.
+
+Stop Loss: exit at predefined adverse price; loss containment.
+
+Volatility Stop: stop distance based on ATR/RV; adapts to noise.
+
+Time Stop: exit after N periods if thesis fails; reduces capital stagnation.
+
+Trailing Stop: stop follows favorable price movement; locks trend gains.
+
+Profit Target: predefined favorable exit level; useful in mean-reversion systems.
+
+Scale-In: add to position as thesis confirms or price improves; increases complexity/risk.
+
+Scale-Out: reduce position as target approaches; lowers reversal risk.
+
+Pyramiding: add to winners; trend-following tactic.
+
+Averaging Down: add to losers; dangerous unless statistically validated.
+
+Rebalancing: reset weights periodically; harvests drift and controls risk.
+
+Risk Budget: maximum portfolio/trade risk allocation.
+
+Drawdown Kill Switch: stop trading after loss threshold; protects from regime/model failure.
+
+Daily Loss Limit: max loss per day; prevents emotional/operational blowups.
+
+Exposure Cap by Sector: prevents concentration in correlated names.
+
+Correlation Cap: limits positions that move together.
+
+Liquidity Cap: position no more than x% of ADV; reduces market impact.
+
+================================================================================
+25) EXECUTION ALGORITHMS AND ORDER TOOLS
+================================================================================
+
+Market Order: immediate execution; high certainty, high slippage risk.
+
+Limit Order: max buy/min sell price; price control, fill uncertainty.
+
+Stop Order: becomes market order after trigger; risk exit/momentum entry.
+
+Stop-Limit Order: stop trigger creates limit order; avoids bad fills but may not execute.
+
+Market-on-Open: execute at opening auction; useful for open-price signals.
+
+Market-on-Close: execute at closing auction; useful for close-price signals.
+
+Limit-on-Close: close auction with price limit; benchmark-aware execution.
+
+TWAP: time-weighted average price execution; splits order evenly over time.
+
+VWAP Algo: targets volume-weighted average price; standard institutional benchmark.
+
+POV Algo: participation-of-volume; trades fixed percentage of market volume.
+
+Implementation Shortfall Algo: minimizes slippage versus decision price.
+
+Iceberg Order: shows small quantity while hiding full size; reduces information leakage.
+
+Pegged Order: price pegged to bid/ask/mid; adaptive passive execution.
+
+Midpoint Peg: hidden midpoint execution; saves spread if filled.
+
+Dark Pool Routing: seeks hidden liquidity off-exchange; reduces displayed impact.
+
+Smart Routing: chooses venue/order type dynamically; execution optimization.
+
+Liquidity-Seeking Algo: aggressively searches for available liquidity.
+
+Arrival Price Benchmark: decision-time price benchmark; used for execution quality.
+
+Close Price Benchmark: closing price benchmark; common for index/portfolio trades.
+
+Participation Rate: order size / market volume; controls impact.
+
+Market Impact Model: estimated price movement caused by own trade.
+
+Almgren-Chriss Model: optimal execution balancing impact and risk.
+
+Square-Root Impact Law: impact roughly proportional to sigma*sqrt(Q/ADV); empirical execution model.
+
+================================================================================
+26) COMMON STRATEGY ARCHETYPES BY REGIME/TIMEFRAME
+================================================================================
+
+Intraday Scalping: tiny moves, high turnover, spread/order-flow dependent.
+
+Market Making: earn spread/rebates while managing inventory/adverse selection.
+
+Opening Range Breakout: trade break of first minutes’ range; momentum/day-trading setup.
+
+VWAP Reversion: fade deviations from intraday VWAP; mean-reversion/liquidity setup.
+
+VWAP Trend Day: stay with price persistently above/below VWAP; intraday trend setup.
+
+Gap-and-Go: buy strong gap with volume/follow-through; momentum setup.
+
+Gap-Fill Fade: fade unsupported gap back to prior close; mean-reversion setup.
+
+News Momentum: trade direction of material news shock; speed and interpretation matter.
+
+Earnings Momentum: trade post-earnings drift after surprise/guidance.
+
+Earnings Volatility Selling: sell overpriced IV before earnings; high gap risk.
+
+Long Straddle Event Trade: buy volatility when expected move underprices event risk.
+
+Short Straddle Event Trade: sell volatility when expected move overprices event risk.
+
+Trend Following: buy rising trends and cut losers; works in persistent regimes.
+
+Breakout Trading: enter after range/high breakout; captures volatility expansion.
+
+Pullback in Trend: buy dips in uptrends/sell rallies in downtrends; trend-continuation setup.
+
+Mean Reversion: fade extremes toward average; works in range/liquidity-rich regimes.
+
+Pairs Trading: trade relative deviations between related securities.
+
+Sector Rotation: move capital into leading sectors; medium-term momentum.
+
+Factor Rotation: tilt among value/growth/momentum/quality/low-vol factors.
+
+Long/Short Equity: rank stocks, long top basket, short bottom basket.
+
+Market Neutral Stat-Arb: exploit residual mispricings with hedged exposure.
+
+Event-Driven Trading: exploit catalysts like earnings, M&A, FDA, spinoffs.
+
+Merger Arbitrage: capture deal spread; main risk is deal failure.
+
+Distressed Equity Trading: trade firms near bankruptcy/restructuring; high legal/fundamental complexity.
+
+Special Situations: spinoffs, rights offerings, index changes, tender offers; structural inefficiency trades.
+
+Volatility Risk Premium Harvesting: sell options when IV persistently exceeds RV; crash risk.
+
+Tail Hedging: buy convex protection; usually negative carry but crisis payoff.
+
+Dispersion Trading: long single-name vol, short index vol or opposite; correlation/vol trade.
+
+Pairs Momentum: long stronger peer, short weaker peer; relative trend approach.
+
+Pairs Reversion: long cheaper peer, short richer peer; relative mean reversion.
+
+Low-Float Momentum: trade supply-constrained stocks with catalysts; high manipulation/slippage risk.
+
+Short Squeeze Trading: long high-short-interest names with bullish catalyst/price confirmation.
+
+Insider Buying Strategy: buy clusters of meaningful insider purchases; medium-term signal.
+
+Analyst Revision Strategy: buy upward revisions, short downward revisions; fundamental momentum.
+
+Quality Value Strategy: buy cheap high-quality firms; slower swing/position strategy.
+
+CAN SLIM: growth/momentum breakout method using earnings, sales, leadership, institutional sponsorship.
+
+================================================================================
+27) HORIZON-SPECIFIC TOOLSETS
+================================================================================
+
+High-Frequency Trading: order book imbalance, queue position, latency, spread, microprice, OFI.
+
+Intraday Trading: VWAP, opening range, volume profile, RVOL, news, CVD, auction imbalance.
+
+Swing Trading: moving averages, RSI, ATR, earnings catalysts, sector strength, support/resistance.
+
+Position Trading: trend, macro regime, fundamentals, factor exposure, earnings revisions.
+
+Long/Short Quant: cross-sectional ranks, factor models, residuals, risk constraints, transaction costs.
+
+Options Trading: IV rank, skew, term structure, Greeks, expected move, realized-implied spread.
+
+Event Trading: earnings surprise, guidance, M&A spread, regulatory catalysts, short interest.
+
+Macro-Aware Equity Trading: rates, credit spreads, dollar, inflation, liquidity, sector rotation.
+
+================================================================================
+28) DATA SOURCES TRADERS USE
+================================================================================
+
+Price Data: OHLCV bars; base input for technical/statistical systems.
+
+Tick Data: every trade/quote update; required for HFT/order-flow research.
+
+Level 1 Quotes: best bid/ask and sizes; basic microstructure data.
+
+Level 2 Order Book: depth by price level; order-flow/liquidity analysis.
+
+Full Depth / MBO Data: market-by-order data; queue and HFT modeling.
+
+Consolidated Tape: reported trades across venues; execution/order-flow source.
+
+Exchange Auction Imbalances: opening/closing imbalance feeds; auction-flow signal.
+
+Corporate Actions Data: splits, dividends, spinoffs; backtest correctness.
+
+Fundamental Statements: income statement, balance sheet, cash flow statement.
+
+Analyst Estimates: consensus EPS/revenue/target revisions; earnings-expectation signal.
+
+Earnings Calendar: upcoming reports; catalyst/risk calendar.
+
+Earnings Transcripts: management language/sentiment.
+
+SEC Filings: 10-K, 10-Q, 8-K, S-1, Form 4, 13F, 13D/G; primary fundamental/event data.
+
+Insider Transactions: Form 4 buying/selling; management/director activity.
+
+Institutional Holdings: 13F data; delayed fund positioning.
+
+Short Interest Data: exchange-reported short positioning.
+
+Securities Lending Data: borrow fees/utilization; short pressure/squeeze risk.
+
+Options Chain Data: strikes, expirations, bid/ask, IV, Greeks, OI.
+
+Options Flow Data: trade-level options prints; speculative/institutional positioning.
+
+Volatility Surface Data: IV across strikes/expiries; skew/term structure.
+
+ETF Holdings Data: fund constituents/weights; ETF flow and look-through analysis.
+
+ETF Creation/Redemption Data: primary-market ETF flows.
+
+Mutual Fund Flow Data: slower investor allocation flows.
+
+News Feeds: Dow Jones, Bloomberg, Reuters, Benzinga, Fly, MT Newswires; event/news trading.
+
+Social Media Data: Reddit, X, Stocktwits, Discord/Telegram where available; retail attention.
+
+Search Trends: Google Trends; attention/demand proxy.
+
+Web Traffic Data: Similarweb-style traffic estimates; demand proxy.
+
+App Download/Ranking Data: app traction signal.
+
+Credit/Debit Card Data: consumer spending nowcast.
+
+Email Receipt Data: transaction receipts; sales nowcast.
+
+Satellite/Aerial Data: parking lots, storage tanks, shipping; physical activity proxy.
+
+Shipping/AIS Data: vessel location/cargo flow; commodity/supply-chain signal.
+
+Job Listings Data: hiring trends; growth/cost proxy.
+
+Patent Data: innovation/intellectual property signal.
+
+Supply Chain Data: imports, bills of lading, supplier/customer links.
+
+Macro Data: FRED, BLS, BEA, Census, Treasury, Federal Reserve, ISM; economic inputs.
+
+Rates Data: Treasury yields, SOFR, Fed funds futures, OIS; discount-rate inputs.
+
+Credit Data: spreads, CDS, bond prices; solvency/risk appetite.
+
+Commodity Data: oil, copper, gold, agricultural inputs; inflation/sector drivers.
+
+FX Data: dollar, yen, yuan, euro; global liquidity/earnings input.
+
+Crypto Data: BTC/ETH, stablecoin supply, funding rates; speculative liquidity proxy.
+
+Prediction Markets: event probability data; catalyst expectations.
+
+Brokerage Positioning: retail/institutional positioning where available.
+
+CFTC Commitment of Traders: futures positioning by trader category.
+
+================================================================================
+29) SPECIFIC EQUATIONS USED IN QUANT/TRADING RESEARCH
+================================================================================
+
+OLS Regression: y = Xb + e; estimates linear relation between features X and target y.
+
+OLS Coefficients: b = (X'X)^(-1)X'y; closed-form least-squares estimate.
+
+Correlation: rho_xy = cov(x,y)/(sigma_x*sigma_y); linear co-movement.
+
+Covariance Matrix: Sigma_ij = cov(r_i,r_j); required for portfolio risk.
+
+Portfolio Return: R_p = sum(w_i*r_i); weighted asset return.
+
+Portfolio Variance: sigma_p^2 = w' Sigma w; portfolio risk from weights/covariances.
+
+Marginal Risk Contribution: MRC_i = (Sigma w)_i / sigma_p; asset contribution to portfolio risk.
+
+Risk Contribution: RC_i = w_i*(Sigma w)_i / sigma_p; total risk share by asset.
+
+Mean-Variance Objective: maximize w'mu - lambda*w'Sigma*w; return-risk portfolio optimization.
+
+Minimum Variance Portfolio: minimize w'Sigma*w subject to constraints; lowest-vol allocation.
+
+Tangency Portfolio: w proportional to Sigma^(-1)*(mu-R_f); max-Sharpe unconstrained portfolio.
+
+Black-Litterman: combines market-implied returns with investor views; stabilized allocation model.
+
+CAPM Expected Return: E[R_i]=R_f+beta_i*(E[R_m]-R_f); benchmark expected-return model.
+
+Logistic Function: p=1/(1+e^(-z)); maps score to probability.
+
+Z-Score: z=(x-mu)/sigma; normalized deviation.
+
+t-Stat: t=mean(x)/(std(x)/sqrt(N)); mean significance estimate.
+
+Information Coefficient: IC = corr(predicted_return, realized_return); forecast quality measure.
+
+ICIR: mean(IC)/std(IC); stability of predictive rank signal.
+
+Rank IC: Spearman correlation between predicted and realized ranks; common quant metric.
+
+Hit Rate: fraction(sign(prediction)=sign(return)); directional accuracy.
+
+Mean Absolute Error: MAE=mean(abs(y-yhat)); forecast error metric.
+
+Root Mean Squared Error: RMSE=sqrt(mean((y-yhat)^2)); penalizes large errors.
+
+Cross Entropy: -mean[y ln(p)+(1-y)ln(1-p)]; classification loss.
+
+Hedge Ratio: h = cov(S,F)/var(F); futures/ETF hedge ratio.
+
+Beta Hedge Shares: shares_hedge = beta*position_value/hedge_price; market hedge sizing.
+
+Delta Hedge Shares: shares = -option_delta*contracts*100; neutralizes option delta.
+
+Expected Shortfall: ES_alpha=E[Loss | Loss > VaR_alpha]; tail loss average.
+
+Bayes Rule: P(A|B)=P(B|A)P(A)/P(B); updates probabilities with evidence.
+
+Entropy: H=-sum(p_i ln p_i); uncertainty/concentration measure.
+
+Mutual Information: MI(X,Y)=sum p(x,y)ln[p(x,y)/(p(x)p(y))]; nonlinear dependence measure.
+
+Sharpe t-Stat Approx: t ≈ Sharpe*sqrt(years); rough significance for independent returns.
+
+Autocorrelation: rho_k = corr(r_t,r_{t-k}); momentum/reversal detection.
+
+AR(1): X_t = c + phi*X_{t-1}+epsilon_t; persistence/mean-reversion model.
+
+Half-Life: h=-ln(2)/ln(phi); decay time for AR(1) mean reversion.
+
+Cointegration Spread: s_t = y_t - beta*x_t; stationary relative-value residual.
+
+================================================================================
+30) SEASONALITY AND CALENDAR EFFECTS
+================================================================================
+
+Day-of-Week Effect: returns differ by weekday; small/noisy after costs.
+
+Turn-of-Month Effect: strength around month-end/start; fund-flow/paycheck/rebalance effect.
+
+January Effect: small-cap/value seasonal strength; historically known, unstable.
+
+Santa Claus Rally: late December/early January strength tendency; seasonal effect.
+
+Pre-Holiday Effect: positive drift before market holidays; behavioral/liquidity effect.
+
+Options Expiration Week: dealer positioning/rebalancing can affect price action.
+
+Triple Witching: stock/index options/futures expiration; volume/volatility event.
+
+FOMC Drift: equity drift around Federal Reserve announcements; macro event effect.
+
+Earnings Seasonality: firms/industries show recurring earnings timing effects.
+
+Tax-Loss Selling: weak losers may sell off into year-end and rebound after.
+
+Quarter-End Rebalancing: institutional portfolio adjustments near quarter end.
+
+Index Rebalance Dates: forced passive flows around index changes.
+
+Ex-Dividend Date Effect: price adjusts for dividend; tax/clientele effects.
+
+================================================================================
+31) BEHAVIORAL AND POSITIONING SIGNALS
+================================================================================
+
+Herding: investors crowd into same trade; creates momentum then crash risk.
+
+Crowding Score: combined ownership/short interest/factor exposure; unwind risk metric.
+
+Disposition Effect: investors sell winners too early and hold losers; behavioral flow effect.
+
+Attention Effect: stocks with extreme attention attract retail buying; short-term pressure.
+
+Lottery Demand: preference for cheap/high-skew stocks/options; overpricing risk.
+
+Anchoring: traders fixate on prior highs/lows/round numbers; support/resistance behavior.
+
+Round Number Effect: prices react near psychologically salient levels.
+
+Underreaction: prices slowly incorporate information; basis for momentum/drift.
+
+Overreaction: prices overshoot news; basis for reversal.
+
+Panic Selling: forced/emotional selling creates rebound opportunities.
+
+FOMO Buying: momentum/mania inflows; profitable until exhaustion.
+
+Reflexivity: price moves alter fundamentals/financing/sentiment; trend amplification.
+
+Forced Deleveraging: margin/vol-control/risk-parity selling; crash acceleration.
+
+Vol-Control Flows: volatility-targeting funds reduce exposure as volatility rises.
+
+CTA Trend Flows: systematic trend followers buy/sell based on price trends.
+
+Dealer Hedging Flows: options market makers hedge delta/gamma; can amplify or dampen moves.
+
+================================================================================
+32) RISK, FAILURE, AND RED-FLAG METRICS
+================================================================================
+
+Liquidity Risk: inability to exit without large impact; measured by spread/ADV/depth.
+
+Gap Risk: stop loss fails due to overnight/event gap; critical for single stocks/options.
+
+Model Decay: alpha weakens after discovery/crowding/regime change.
+
+Crowding Risk: many participants own same trade; exit door too small.
+
+Correlation Spike Risk: diversification fails during crisis.
+
+Leverage Risk: borrowed exposure magnifies losses and liquidation probability.
+
+Margin Call Risk: broker forced liquidation after equity falls.
+
+Borrow Recall Risk: short position forced closed.
+
+Short Squeeze Risk: short position rapidly loses as price rises.
+
+Volatility Crush Risk: long options lose as IV collapses after event.
+
+Theta Bleed: options lose value with time decay.
+
+Slippage Risk: actual fills worse than assumed.
+
+Lookahead Bias: accidental use of future data.
+
+Survivorship Bias: excluding delisted losers inflates backtest.
+
+Selection Bias: picking universe after knowing winners.
+
+Overfitting: model fits noise, not signal.
+
+Data Mining Bias: too many tested strategies create false positives.
+
+Regime Dependence: strategy only works in certain market states.
+
+Tail Risk: rare extreme losses dominate long-run outcome.
+
+Negative Skew: frequent small wins with rare large losses.
+
+================================================================================
+33) TOOLS BY “WHAT ACTUALLY MOVES THE NEEDLE”
+================================================================================
+
+Price Momentum: persistent winner/loser effects; one of the strongest liquid-market signals.
+
+Earnings Revisions: analyst estimate changes; strong fundamental momentum input.
+
+Earnings Surprise/Drift: post-earnings drift remains a major anomaly.
+
+Quality + Value: cheap high-quality stocks outperform better than cheap junk.
+
+Trend + Volatility Filter: trend systems improve when avoiding choppy/high-noise regimes.
+
+Sector Relative Strength: leadership rotation often persists for weeks/months.
+
+Breadth Confirmation: broad participation makes index trends more durable.
+
+Credit Spreads: equity drawdowns often coincide with credit stress.
+
+Real Yields: rising real yields pressure long-duration growth stocks.
+
+Liquidity Conditions: broad liquidity expansion/contraction drives speculative assets.
+
+Options-Implied Volatility: IV versus RV determines option edge.
+
+Skew/Term Structure: reveals crash demand/event risk/positioning.
+
+Short Interest + Borrow + Catalyst: necessary squeeze ingredients.
+
+Volume/RVOL: confirms attention and institutional participation.
+
+Order Flow Imbalance: useful at very short horizons.
+
+VWAP/Execution Quality: saves real money even without alpha improvement.
+
+Transaction Cost Modeling: separates real edge from fake backtest edge.
+
+Position Sizing: converts edge into survivable compounding.
+
+Regime Detection: prevents using the right signal in the wrong environment.
+
+================================================================================
+34) QUICK STRATEGY-MATCHING MAP
+================================================================================
+
+Strong Uptrend + Broad Breadth: use trend following, pullback buys, breakout continuation.
+
+Strong Uptrend + Narrow Breadth: reduce confidence; watch mega-cap concentration and reversal risk.
+
+Sideways Low Volatility: use mean reversion, pairs, range trading, premium selling.
+
+Sideways High Volatility: reduce size; use event/news-driven trades or wider stops.
+
+High Volatility Selloff: avoid leverage; watch breadth washout, credit stress, VIX term structure.
+
+Post-Crash Recovery: breadth thrust + credit improvement + trend reclaim are key confirmation tools.
+
+Earnings Season: prioritize surprise, guidance, revisions, IV crush, expected move.
+
+Macro Event Week: prioritize rates, dollar, VIX, index levels, sector duration sensitivity.
+
+Single-Stock Catalyst: prioritize news, volume, options flow, short interest, borrow, levels.
+
+Low-Float Momentum: prioritize float, RVOL, halt risk, short interest, offering risk.
+
+Options Trade: prioritize IV rank, skew, term structure, expected move, Greeks, liquidity.
+
+Long/Short Quant: prioritize factor neutrality, ranking quality, borrow costs, turnover, capacity.
+
+================================================================================
+35) MINIMUM VIABLE RESEARCH WORKFLOW
+================================================================================
+
+1. Define hypothesis: exact reason edge should exist.
+
+2. Define universe: stocks, liquidity threshold, price threshold, survivorship-free.
+
+3. Define signal: formula using only point-in-time available data.
+
+4. Define target: next-day/week/month return, risk-adjusted return, or trade outcome.
+
+5. Split data: train/validation/test by time, not random.
+
+6. Include costs: spread, slippage, fees, borrow, market impact.
+
+7. Test robustness: parameters, subperiods, regimes, sectors, liquidity buckets.
+
+8. Test significance: t-stat, bootstrap, probabilistic/deflated Sharpe.
+
+9. Control exposure: beta, sector, factor, concentration, correlation.
+
+10. Size positions: volatility/risk budget/Kelly fraction.
+
+11. Simulate execution: delay, partial fills, volume caps.
+
+12. Paper trade live: verify data latency, fills, behavior.
+
+13. Trade small: measure live slippage and alpha decay.
+
+14. Monitor decay: rolling Sharpe, hit rate, drawdown, IC, factor exposure.
+
+15. Kill or resize: stop when live behavior violates expected distribution.
+
+================================================================================
+36) COMMON SOFTWARE / PLATFORMS / LIBRARIES
+================================================================================
+
+Python: primary research language for quant trading.
+
+pandas: tabular time-series data manipulation.
+
+NumPy: numerical arrays and vectorized calculations.
+
+SciPy: statistics, optimization, signal processing.
+
+statsmodels: regressions, ARIMA, statistical tests.
+
+scikit-learn: machine learning baselines.
+
+XGBoost/LightGBM/CatBoost: gradient-boosted tree models.
+
+PyTorch/TensorFlow/JAX: deep learning frameworks.
+
+TA-Lib: technical indicator library.
+
+vectorbt: vectorized backtesting framework.
+
+backtrader: Python event-driven backtesting.
+
+zipline-reloaded: point-in-time style backtesting framework.
+
+QuantConnect/LEAN: cloud/local quant research and execution platform.
+
+QuantLib: derivatives/pricing library.
+
+cvxpy: convex optimization for portfolios.
+
+PyPortfolioOpt: portfolio optimization utilities.
+
+mlfinlab: financial ML methods like triple-barrier/meta-labeling.
+
+Alpaca API: brokerage/data API for equities.
+
+Interactive Brokers API: professional brokerage/execution API.
+
+Polygon.io: market data API.
+
+IEX Cloud: market/fundamental data API.
+
+Tiingo: market/fundamental/news data API.
+
+Quandl/Nasdaq Data Link: economic/alternative/financial datasets.
+
+WRDS/Compustat/CRSP: institutional academic equity/fundamental data.
+
+Bloomberg Terminal: institutional market/news/fundamental platform.
+
+FactSet: institutional financial data/analytics.
+
+Refinitiv/LSEG Eikon: institutional data/news/analytics.
+
+S&P Capital IQ: company/fundamental/transaction data.
+
+Koyfin: market/fundamental dashboard.
+
+TradingView: charting/technical analysis/scripting.
+
+Thinkorswim: retail charting/options analytics.
+
+OptionMetrics: institutional options data.
+
+ORATS: options analytics/data.
+
+LiveVol/Cboe DataShop: options market data.
+
+Bookmap: order-book/volume visualization.
+
+Sierra Chart: futures/order-flow charting.
+
+TradeStation: strategy scripting/backtesting.
+
+MetaTrader: FX/CFD strategy platform.
+
+R: statistical language used in academic/quant finance.
+
+SQL: database querying for historical market data.
+
+DuckDB: local analytical database for research.
+
+Parquet: efficient columnar storage format for market data.
+
+Airflow/Prefect: data pipeline orchestration.
+
+Docker: reproducible research/execution environment.
+
+================================================================================
+37) PRACTICAL INDICATOR STACKS
+================================================================================
+
+Trend Stack: SMA_50>SMA_200 + price>SMA_50 + ADX rising + sector relative strength positive.
+
+Momentum Stack: 6/12-month return rank + 1-month reversal filter + earnings revision confirmation.
+
+Mean Reversion Stack: z-score extreme + low ADX + near support + no negative catalyst + liquidity sufficient.
+
+Breakout Stack: N-day high + RVOL spike + volatility compression before move + broad/sector confirmation.
+
+Earnings Long Stack: EPS/revenue beat + guidance raise + positive call tone + analyst revisions + gap holds.
+
+Short Squeeze Stack: high short float + high borrow fee + low float + bullish catalyst + call volume + price breakout.
+
+Options Long Vol Stack: IV low versus expected catalyst + realized vol rising + cheap straddle versus expected move.
+
+Options Short Vol Stack: IV rank high + event overpricing + liquid options + defined-risk spread.
+
+Risk-Off Warning Stack: credit spreads widen + VIX backwardation + breadth breakdown + small caps underperform + dollar/rates stress.
+
+AI/Tech Bubble Warning Stack: semiconductors underperform + mega-cap breadth breaks + credit weakens + high-beta sells off + vol spikes.
+
+================================================================================
+38) FINAL CORE POINTERS
+================================================================================
+
+Best empirical alpha families: momentum, trend, value, quality, earnings revisions, post-earnings drift, short-term reversal, volatility risk premium, event-driven mispricing.
+
+Best risk tools: volatility targeting, drawdown limits, liquidity caps, beta/factor exposure control, transaction cost modeling.
+
+Best execution tools: limit orders, VWAP/TWAP/POV, spread awareness, volume caps, auction awareness.
+
+Best data upgrades: point-in-time fundamentals, analyst revisions, options surface, borrow/short data, news/transcripts, order-flow where horizon justifies it.
+
+Best validation tools: walk-forward testing, purged cross-validation, out-of-sample results, cost/slippage stress tests, parameter robustness, live paper trading.
+
+Most dangerous fake edges: overfit technical indicators, survivorship-biased backtests, ignoring spread/slippage, using future data, trading illiquid names, assuming options flow is informed.
+
+The practical formula: Positive ROI = validated signal edge - transaction costs - slippage - taxes - borrow/financing - behavioral mistakes.

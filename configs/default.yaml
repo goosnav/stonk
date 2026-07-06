@@ -1,0 +1,127 @@
+# SpecForge default configuration. paper.yaml / live.yaml overlay this.
+# Everything here is editable from the GUI (changes are audit-logged);
+# the risk governor rejects dangerous values unless advanced_override: true.
+
+mode: paper                # paper | live
+broker: paper              # paper | robinhood_mcp | robinhood_bridge
+live_trading_enabled: false   # must ALSO set env LIVE_TRADING_ENABLED=true
+advanced_override: false
+
+db_path: data/specforge.db
+
+schedule:
+  timezone: America/New_York
+  scans: ["09:45", "12:30", "15:30"]
+  post_close: "16:30"        # attribution + weight updates
+  weekend_research: "SAT 10:00"
+
+universe:
+  symbols: [SPY, QQQ, IWM, DIA,
+            XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLU, XLB, XLRE, XLC,
+            AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AMD, AVGO, NFLX,
+            JPM, V, UNH, LLY, XOM, CVX, WMT, COST, ORCL, CRM,
+            QCOM, TXN, CAT, BA, GE, KO, PEP, MCD, DIS, MU]
+  benchmark: SPY
+  vix_symbol: ^VIX
+  min_price: 5.0
+  min_dollar_volume: 50000000
+  max_spread_pct: 0.005      # assumed spread cap for liquid-universe cost model
+
+risk:
+  # --- The primary safety check: per-scan-cycle deployment budget.
+  # Worst-case loss of all NEW positions opened in one cycle (full notional for
+  # equities, full premium for options) must fit inside this budget.
+  time_step_budget_pct: 0.10       # fraction of account equity per scan cycle
+  time_step_budget_abs_cap: 5000   # hard $ ceiling regardless of equity
+
+  max_account_deployment: 0.70
+  min_cash_reserve: 0.30
+  max_single_equity_position: 0.08
+  max_sector_exposure: 0.25
+  max_open_positions: 12
+  max_daily_new_positions: 3
+  max_daily_loss: 0.02
+  max_weekly_loss: 0.05
+  kill_switch_drawdown: 0.15
+  max_rejected_orders_per_day: 5
+  stale_data_max_age_days: 4       # refuse to trade on bars older than this
+  duplicate_order_cooldown_min: 60 # same symbol+side within window = duplicate
+
+  # Approval policy (autonomous by default; big bets need a human)
+  approval_mode: threshold         # auto | threshold | all
+  # "Big bets" queue for approval. Set above max_single_equity_position (8%) so
+  # routine cap-respecting entries run autonomously; only oversized/override
+  # orders (or future option plays above it) need a human.
+  approval_notional_threshold_pct: 0.10
+  approval_timeout_hours: 24       # unapproved intents expire
+
+  # Options (node auto-unlocks by account scale)
+  options_enabled: auto            # auto | true | false
+  min_viable_option_premium: 75    # $; unlock when equity*max_single_option_premium_risk >= this
+  max_single_option_premium_risk: 0.015
+  max_total_options_premium_risk: 0.06
+  option_min_dte: 21
+  option_max_dte: 120
+  option_min_delta: 0.25
+  option_max_delta: 0.70
+  option_max_spread_pct: 0.15
+  option_min_open_interest: 100
+
+execution:
+  order_type: limit                # limit | market (market requires advanced_override)
+  limit_offset_pct: 0.001          # limit at last price +/- offset (cross the spread a hair)
+  spread_cost_bps: 3               # cost model: half-spread for liquid names
+  slippage_bps: 5
+
+regime:
+  vix_risk_on_max: 20
+  vix_stress_min: 28
+  breadth_risk_on_min: 0.55        # fraction of universe above 50d SMA
+  breadth_risk_off_max: 0.35
+  # deployment multiplier by regime (scales time-step budget)
+  deployment_multiplier:
+    risk_on: 1.0
+    neutral: 0.6
+    risk_off: 0.25
+    stress: 0.0
+
+nodes:
+  # weight = base ensemble weight; regime multipliers & learned adjustments apply on top.
+  # status: experimental | probation | production | disabled
+  momentum:        {enabled: true,  weight: 0.30, status: production,  horizon_days: 20}
+  sector_rotation: {enabled: true,  weight: 0.20, status: production,  horizon_days: 20}
+  reversal:        {enabled: true,  weight: 0.10, status: probation,   horizon_days: 5}
+  earnings_drift:  {enabled: true,  weight: 0.25, status: probation,   horizon_days: 20}
+  quality_value:   {enabled: true,  role: filter, status: production}
+  news_sentiment:  {enabled: false, weight: 0.05, status: experimental, horizon_days: 5, ai: true}
+  congress_trades: {enabled: false, weight: 0.05, status: experimental, horizon_days: 60}
+  insider:         {enabled: false, weight: 0.05, status: experimental, horizon_days: 40}
+  options_vol:     {enabled: false, weight: 0.05, status: experimental, horizon_days: 30}
+
+ensemble:
+  min_final_score: 0.15            # below this: no trade (saying "no" is a feature)
+  conflict_dispersion_penalty: 0.5 # score dispersion across nodes shrinks conviction
+  weight_learning:                 # self-improvement bounds (governor enforces)
+    enabled: true
+    min_multiplier: 0.3
+    max_multiplier: 2.0
+    min_trades_before_update: 20
+    shrinkage: 0.7                 # Bayesian shrink toward zero edge
+
+sizing:
+  vol_target_pct: 0.01             # per-position daily vol target (fraction of equity)
+  atr_stop_multiple: 1.8
+  time_stop_days_default: 20
+
+ai:
+  enabled: false
+  base_url: https://openrouter.ai/api/v1
+  model: deepseek/deepseek-chat-v3-0324
+  daily_budget_usd: 1.00
+  # price table per 1M tokens, editable; used by the reserve-then-commit ledger
+  prices:
+    deepseek/deepseek-chat-v3-0324: {input: 0.25, output: 0.85}
+    qwen/qwen-2.5-72b-instruct:     {input: 0.35, output: 0.40}
+    anthropic/claude-haiku-4.5:     {input: 1.00, output: 5.00}
+  cache_ttl_hours: 24
+  est_tokens_per_headline: 220     # pre-flight cost estimate basis

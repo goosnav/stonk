@@ -1,0 +1,29 @@
+[project]
+name = "specforge"
+version = "0.1.0"
+description = "SpecForge — modular, risk-bounded speculation engine (Robinhood MCP first broker adapter)"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "apscheduler",
+    "pyyaml",
+    "yfinance",
+    "mcp",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+specforge = "specforge.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["specforge*"]

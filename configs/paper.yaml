@@ -1,0 +1,5 @@
+mode: paper
+broker: paper
+live_trading_enabled: false
+paper:
+  starting_cash: 1000.0

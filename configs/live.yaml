@@ -1,0 +1,9 @@
+# Small live mode. Requires BOTH this flag and env LIVE_TRADING_ENABLED=true
+# plus a non-empty RH_ACCOUNT_WHITELIST.
+mode: live
+broker: robinhood_mcp        # falls back to robinhood_bridge if OAuth is blocked
+live_trading_enabled: true
+risk:
+  time_step_budget_pct: 0.05
+  time_step_budget_abs_cap: 50   # tiny live probation: <= $50 deployed per cycle
+  approval_mode: threshold
