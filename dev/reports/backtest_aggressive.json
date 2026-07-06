@@ -1,0 +1,78 @@
+{
+  "tag": "aggressive",
+  "window": [
+    "2016-07-08",
+    "2026-07-06"
+  ],
+  "years_requested": 10,
+  "overall": {
+    "total_return": 1.6645,
+    "cagr": 0.1034,
+    "vol_annual": 0.1416,
+    "sharpe": 0.77,
+    "sortino": 0.66,
+    "max_drawdown": 0.2485,
+    "calmar": 0.42,
+    "sessions": 2510
+  },
+  "in_sample_70pct": {
+    "total_return": 1.7388,
+    "cagr": 0.1556,
+    "vol_annual": 0.1482,
+    "sharpe": 1.05,
+    "sortino": 0.96,
+    "max_drawdown": 0.2179,
+    "calmar": 0.71,
+    "sessions": 1756
+  },
+  "out_of_sample_30pct": {
+    "total_return": -0.0236,
+    "cagr": -0.008,
+    "vol_annual": 0.1246,
+    "sharpe": -0.0,
+    "sortino": -0.0,
+    "max_drawdown": 0.2485,
+    "calmar": -0.03,
+    "sessions": 753
+  },
+  "benchmark_buy_hold_return": 3.1379,
+  "n_trades": 1745,
+  "win_rate": 0.47,
+  "avg_win": 0.068,
+  "avg_loss": -0.0443,
+  "profit_factor": 1.36,
+  "avg_holding_days": 19.5,
+  "by_regime": {
+    "neutral": {
+      "n": 484,
+      "avg_ret": 0.0104
+    },
+    "risk_off": {
+      "n": 261,
+      "avg_ret": -0.0022
+    },
+    "risk_on": {
+      "n": 1000,
+      "avg_ret": 0.0103
+    }
+  },
+  "by_node": {
+    "momentum": {
+      "n": 1563,
+      "avg_ret": 0.0085
+    },
+    "reversal": {
+      "n": 68,
+      "avg_ret": 0.0014
+    },
+    "sector_rotation": {
+      "n": 725,
+      "avg_ret": 0.0038
+    }
+  },
+  "costs_included": true,
+  "exit_reasons": {
+    "time_stop": 994,
+    "stop_loss": 751
+  }
+}

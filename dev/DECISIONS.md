@@ -92,6 +92,18 @@ HWM is computed only from equity since that date. Semantics: each drawdown
 episode absorbs one kill_switch_drawdown tranche, then the book restarts flat
 with a fresh baseline. Test: test_drawdown_trip_clears_and_baseline_resets.
 
+## D18. Backtest v3 = validation gate PASSED; aggressive profile failed OOS (2026-07-06)
+v3 (default risk, D15+D17 fixes, dev/reports/backtest_v3.json): CAGR 7.55%,
+Sharpe 0.76, maxDD 16.8%, PF 1.39, 1756 cost-included trades — and OOS (last
+30%) BETTER than in-sample (8.8% vs 7.1% CAGR): no overfit signature. Momentum
++0.95%/trade (n=1593), sector_rotation +0.66% (n=695), reversal ≈0 (n=64,
+both runs) → reversal defaulted OFF. configs/aggressive.yaml: 15.6% in-sample
+but −0.8% OOS and 25% maxDD → NOT default; treat as a paper experiment only.
+Conclusion: default stack ships as-is; growth path is new nodes measured live
+(earnings drift, congress, insider, news, options overlay), not bigger sizing.
+v3's 1756 analog trades feed live error bars (restored after the aggressive
+run clobbered them — backtests that copy analogs must run LAST or re-copy).
+
 ## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
 Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
 momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%

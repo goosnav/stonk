@@ -91,7 +91,9 @@ nodes:
   # status: experimental | probation | production | disabled
   momentum:        {enabled: true,  weight: 0.30, status: production,  horizon_days: 20}
   sector_rotation: {enabled: true,  weight: 0.20, status: production,  horizon_days: 20}
-  reversal:        {enabled: true,  weight: 0.10, status: probation,   horizon_days: 5}
+  # reversal defaulted OFF: flat expectancy across two independent 10y
+  # backtests (dev/DECISIONS.md D18) — re-enable only if paper data disagrees
+  reversal:        {enabled: false, weight: 0.10, status: experimental, horizon_days: 5}
   earnings_drift:  {enabled: true,  weight: 0.25, status: probation,   horizon_days: 20}
   quality_value:   {enabled: true,  role: filter, status: production}
   news_sentiment:  {enabled: false, weight: 0.05, status: experimental, horizon_days: 5, ai: true}

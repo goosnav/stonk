@@ -63,11 +63,20 @@
 - earnings_drift never fires in backtest (no deep earnings history from
   yfinance) — its scorecard only accumulates from paper/live.
 
-### Remaining
-- [ ] v2/aggressive backtest reports → set final default weights
-- [ ] Paper multi-cycle live-fire via scheduler (let it run days)
-- [ ] RH OAuth probe when user is ready (needs browser + funded agentic acct)
-- [ ] CLAUDE_RUN_SUMMARY.md at session end
+### Validation gate — PASSED (2026-07-06, D18)
+- v3 backtest (default risk): CAGR 7.55%, Sharpe 0.76, maxDD 16.8%, PF 1.39,
+  1756 trades, OOS > in-sample. Report: dev/reports/backtest_v3.json.
+- aggressive profile: failed OOS (−0.8%) → kept as experiment, not default.
+- reversal node defaulted off (flat in both runs); analogs (v3) loaded into
+  the live DB → GUI projection shows 12.9% APR [9.0%, 16.4%] confidence=low.
+
+## BUILD COMPLETE — system is in OPERATION phase
+Everything from here is running/measuring/scaling, not construction.
+→ **Next steps live in [ROADMAP.md](ROADMAP.md)** (Sprint A: paper campaign;
+Sprint B: live probation — needs human to fund RH agentic account + .env;
+Sprint C: learn/scale; Sprint D: hardening backlog).
+Session deliverable summary: [../CLAUDE_RUN_SUMMARY.md](../CLAUDE_RUN_SUMMARY.md).
+GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 
 ## Environment notes
 - Run everything with `.venv/bin/python` / `.venv/bin/pytest` (no uv on machine).
