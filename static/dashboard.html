@@ -197,6 +197,11 @@
 <!-- ============ ACTIVITY ============ -->
 <div class="page" data-page="activity" style="display:none">
   <section class="wide">
+    <h2>Data freshness</h2>
+    <p class="explain">Daily bars refresh at each scan. The risk governor hard-refuses any trade whose data is stale — this panel shows what it sees.</p>
+    <div id="freshness" class="dim">—</div>
+  </section>
+  <section class="wide">
     <h2>Audit log</h2>
     <p class="explain">Append-only record of every decision. Any trade is reconstructable from here.</p>
     <select id="auditfilter" onchange="refreshAudit()">
@@ -379,7 +384,7 @@ async function refreshNodes(){
          onchange="post('/api/nodes/${n.id}',{enabled:this.checked}).then(refreshNodes)"></td>
     <td><b>${n.id}</b>${n.ai?' 🤖':''}</td>
     <td class="dim" style="font-size:11.5px;max-width:340px">${NODE_DESC[n.id]||''}</td>
-    <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}</td>
+    <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}${n.degraded?` <span class="neg" title="${String(n.degraded).replace(/"/g,'&quot;')}">⚠ degraded</span>`:''}</td>
     <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
          onchange="post('/api/nodes/${n.id}',{weight:parseFloat(this.value)})">`}</td>
     <td>${(n.weight_multiplier??1).toFixed(2)}</td><td>${n.n_trades}</td>
@@ -387,7 +392,9 @@ async function refreshNodes(){
     <td>${n.win_rate==null?'—':pct(n.win_rate,0)}</td></tr>`).join('');
   const props = await api('/api/proposals');
   $('proposals').innerHTML = (props&&props.length) ? props.map(p=>
-    `<div>⬆ <b>${p.node_id}</b>: ${p.from} → ${p.to} (n=${p.basis.n}, expectancy ${pct(p.basis.expectancy)})</div>`).join('')
+    `<div style="margin:4px 0">⬆ <b>${p.node_id}</b>: ${p.from} → ${p.to}
+      (n=${p.basis.n}, expectancy ${pct(p.basis.expectancy)})
+      <button class="ok" onclick="approvePromotion('${p.node_id}','${p.to}')">apply</button></div>`).join('')
     : '<span class="dim">none yet — proposals appear after nodes accumulate enough closed trades</span>';
 }
 
@@ -467,6 +474,21 @@ async function refreshMC(){
       `E[max drawdown] ${pct(mc.expected_max_drawdown)}`;
   }catch(e){$('mcnote').textContent='n/a (no open positions)';}
 }
+async function approvePromotion(nodeId, to){
+  await post('/api/nodes/'+nodeId, {status: to});
+  toast(`${nodeId} promoted to ${to} (audit-logged config override)`);
+  refreshNodes();
+}
+async function refreshFreshness(){
+  const f = await api('/api/freshness');
+  const today = new Date().toISOString().slice(0,10);
+  const stale = f.symbols.filter(s=>!s.latest_bar);
+  const dates = f.symbols.map(s=>s.latest_bar).filter(Boolean).sort();
+  $('freshness').innerHTML = `newest bar <b>${dates[dates.length-1]||'—'}</b> ·
+    oldest <b>${dates[0]||'—'}</b> · ${f.symbols.length} symbols tracked ·
+    governor refuses trades on data older than ${f.stale_data_max_age_days} days` +
+    (stale.length?`<br><span class="neg">no data at all: ${stale.map(s=>s.symbol).join(', ')}</span>`:'');
+}
 async function refreshAudit(){
   const f=$('auditfilter').value;
   const rows=await api('/api/audit?limit=120');
@@ -485,7 +507,7 @@ async function scanNow(){
 }
 function refreshAll(){refreshMarket();refreshStatus();refreshBroker();refreshCandidates();
   refreshApprovals();refreshTrades();refreshNodes();refreshRisk();refreshCosts();
-  refreshCurve();refreshMC();refreshAudit();}
+  refreshCurve();refreshMC();refreshAudit();refreshFreshness();}
 refreshAll();
 setInterval(()=>{refreshStatus();refreshApprovals();},10000);
 setInterval(()=>{refreshMarket();},30000);

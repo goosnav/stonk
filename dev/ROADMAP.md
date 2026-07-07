@@ -130,9 +130,15 @@ Do these in order; each step is small, committable, and independently useful.
    alert rail, explainers, node descriptions, Connect Robinhood card).
    Acceptance: every section has an explainer line; positions P&L uses live
    marks; broker card shows connect flow states. [DONE 2026-07-06 — first pass]
-4. **Polish pass** (NOT done): thesis tooltips on candidates, per-symbol data
-   freshness on Activity tab, $-equivalents next to risk percentages, node
-   promotion Approve button writing the status override, empty-state copy.
+4. **Polish pass** [DONE 2026-07-06]: thesis tooltips on candidates, data
+   freshness panel on Activity tab (+ /api/freshness), $-equivalents next to
+   risk percentages, promotion "apply" button (validated status override),
+   node degraded badges (from audit), empty-state copy. Verified: endpoints
+   200, invalid status rejected 400, JS node --check clean, DOM id
+   cross-check clean, 25 tests green.
+   Remaining known-unverified: no human has SEEN the page render (Chrome
+   extension offline for the agent). First look may find cosmetic nits only —
+   the API contract and JS syntax/id references are machine-verified.
 5. **Packaging spike** (later): pipx entry point already exists
    (`specforge serve`); document + screenshot for a landing page.
 

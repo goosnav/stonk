@@ -178,6 +178,12 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         for t in trades:
             for nd in json.loads(t["nodes"] or "[]"):
                 by_node.setdefault(nd, []).append(t["ret"])
+        # most recent degradation per node (data feed failures surface here)
+        degraded: dict[str, str] = {}
+        for r in store.audit_rows(limit=400):
+            if r["event_type"] == "node_degraded":
+                p = json.loads(r["payload"] or "{}")
+                degraded.setdefault(p.get("node", ""), p.get("error", ""))
         out = []
         for node_id, nc in (c.get("nodes", default={}) or {}).items():
             rets = by_node.get(node_id, [])
@@ -187,8 +193,20 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 "n_trades": len(rets),
                 "expectancy": round(sum(rets) / len(rets), 5) if rets else None,
                 "win_rate": round(sum(1 for r in rets if r > 0) / len(rets), 3) if rets else None,
+                "degraded": degraded.get(node_id),
             })
         return out
+
+    @app.get("/api/freshness")
+    def freshness():
+        """Per-symbol bar age — the governor refuses stale data; this shows why."""
+        c = fresh_cfg()
+        out = []
+        for sym in c.get("universe", "symbols", default=[]) + \
+                [c.get("universe", "vix_symbol", default="^VIX")]:
+            out.append({"symbol": sym, "latest_bar": store.latest_bar_date(sym)})
+        stale_limit = c.get("risk", "stale_data_max_age_days", default=4)
+        return {"symbols": out, "stale_data_max_age_days": stale_limit}
 
     @app.get("/api/candidates")
     def candidates():
@@ -275,7 +293,10 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         c = fresh_cfg()
         if node_id not in (c.get("nodes", default={}) or {}):
             raise HTTPException(404, f"unknown node {node_id}")
-        for key in ("enabled", "weight"):
+        if "status" in body and body["status"] not in (
+                "experimental", "probation", "production", "disabled"):
+            raise HTTPException(400, f"invalid status {body['status']}")
+        for key in ("enabled", "weight", "status"):
             if key in body:
                 try:
                     _set_override(["nodes", node_id, key], body[key])
