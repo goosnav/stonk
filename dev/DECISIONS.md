@@ -119,6 +119,14 @@ against dead feeds (equity 0 + no positions ⇒ skip, don't wipe state).
 Found via a dev accident (DB deleted under a live server process — never
 `rm data/specforge.db` while anything is running).
 
+## D21. Per-thread SQLite connections (2026-07-06)
+The dashboard fires ~13 parallel fetches; FastAPI's threadpool + ONE shared
+sqlite3 connection interleaved cursors → random 500s (JSONDecodeError on
+empty rows). Store.db is now a threading.local per-thread connection (WAL =
+safe concurrent readers, busy_timeout=15s for writers). Verified with a
+140-request concurrency hammer: 0 non-200s. Found via headless Playwright
+render testing — screenshots in dev/reports/gui_*.png.
+
 ## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
 Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
 momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%

@@ -95,13 +95,30 @@ def _now() -> str:
 
 
 class Store:
+    """One connection PER THREAD (threading.local): the FastAPI threadpool
+    fires many handlers concurrently, and a shared sqlite3 connection
+    interleaves cursors under load (manifested as random 500s with
+    JSONDecodeError on empty rows). WAL mode makes concurrent readers safe."""
+
     def __init__(self, path: str | Path):
+        import threading
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self.db.executescript(SCHEMA)
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=False,
+                                   timeout=15)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+            self._local.conn = conn
+        return conn
 
     # ---------- audit ----------
     def audit(self, event_type: str, payload: Any = None, cycle_id: str = "") -> None:
