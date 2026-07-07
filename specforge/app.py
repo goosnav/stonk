@@ -381,9 +381,24 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             summary = run_cycle(cfg, store)
             print(f"[scheduler] scan done: {summary['cycle_id']} "
                   f"entries={summary['entries']} exits={summary['exits']}")
+            if summary.get("kill_switches"):
+                _notify("SpecForge kill switch",
+                        f"active: {', '.join(summary['kill_switches'])} — "
+                        f"open the dashboard")
         except Exception as e:                      # noqa: BLE001
             store.audit("scheduler_error", {"error": str(e)})
+            _notify("SpecForge scan FAILED", str(e)[:120])
             print(f"[scheduler] scan FAILED: {e}")
+
+    def _notify(title: str, msg: str) -> None:
+        """Best-effort local desktop notification (macOS); silent elsewhere."""
+        import subprocess
+        try:
+            subprocess.run(["osascript", "-e",
+                            f'display notification "{msg}" with title "{title}"'],
+                           timeout=5, capture_output=True)
+        except Exception:                           # noqa: BLE001
+            pass
 
     def post_close_job():
         """Mark-to-market + attribution: the self-improvement heartbeat."""
@@ -397,9 +412,25 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             if proposals:
                 store.audit("promotion_proposals", proposals)
                 store.kv_set("promotion_proposals", proposals)
+                _notify("SpecForge", f"{len(proposals)} node promotion proposal(s) "
+                                     f"await your review")
+            _backup_db(store)
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "post_close", "error": str(e)})
             print(f"[scheduler] post-close FAILED: {e}")
+
+    def _backup_db(store: Store) -> None:
+        """Nightly sqlite online backup; keep the newest 14."""
+        from datetime import date as _date
+        bdir = Path(store.path).parent / "backups"
+        bdir.mkdir(exist_ok=True)
+        dest = bdir / f"specforge_{_date.today().isoformat()}.db"
+        import sqlite3 as _sq
+        with _sq.connect(dest) as out:
+            store.db.backup(out)
+        for old in sorted(bdir.glob("specforge_*.db"))[:-14]:
+            old.unlink()
+        store.audit("db_backup", {"path": str(dest)})
 
     cfg = current_config(store, mode)
     tz = cfg.get("schedule", "timezone", default="America/New_York")
