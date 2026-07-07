@@ -103,6 +103,16 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         c = fresh_cfg()
         probe = store.kv_get("broker_probe") or {"connected": False,
                                                  "state": "never_attempted"}
+        # a 'connecting' older than the OAuth window means the thread died
+        # (server restart mid-login) — say so instead of spinning forever
+        if probe.get("state") == "connecting":
+            started = probe.get("started_at", "")
+            from datetime import timedelta
+            cutoff = (datetime.now().astimezone() - timedelta(minutes=6)).isoformat()
+            if not started or started < cutoff:
+                probe = {**probe, "state": "interrupted",
+                         "error": "previous attempt was interrupted (likely a "
+                                  "server restart mid-login) — click Connect again"}
         ok, why = c.live_trading_allowed()
         return {"configured_broker": c.get("broker"), "probe": probe,
                 "live_gate_ok": ok, "live_gate_reason": why}
@@ -114,7 +124,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         import threading
 
         def _run():
-            store.kv_set("broker_probe", {"connected": False, "state": "connecting"})
+            store.kv_set("broker_probe", {"connected": False, "state": "connecting",
+                                          "started_at": datetime.now().astimezone()
+                                          .isoformat(timespec="seconds")})
             try:
                 from .broker.robinhood_mcp import RobinhoodMCPBroker
                 b = RobinhoodMCPBroker(fresh_cfg(), store)

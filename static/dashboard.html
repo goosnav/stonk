@@ -328,7 +328,7 @@ async function refreshBroker(){
     <tr><td>configured broker</td><td>${b.configured_broker}</td></tr>
     <tr><td>live gate</td><td class="${b.live_gate_ok?'pos':'neg'}">${b.live_gate_ok?'OPEN':'closed'} — ${b.live_gate_reason}</td></tr>
     <tr><td>Robinhood connection</td><td>${p.state||'never attempted'}</td></tr>`;
-  if(p.state==='error') html += `<tr><td>error</td><td class="neg" style="font-size:11px">${p.error}</td></tr>`;
+  if(p.error) html += `<tr><td>detail</td><td class="neg" style="font-size:11px">${p.error}</td></tr>`;
   if(p.accounts) html += `<tr><td>accounts</td><td class="mono" style="font-size:11px">${
     p.accounts.map(a=>`${a.account_number} ${a.agentic_allowed?'✓ agentic':'✗ not agentic'}`).join('<br>')}</td></tr>
     <tr><td>whitelisted</td><td class="mono">${p.whitelist||'<span class="neg">EMPTY — set RH_ACCOUNT_WHITELIST in .env</span>'}</td></tr>`;

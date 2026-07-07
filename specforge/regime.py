@@ -39,7 +39,7 @@ def classify(ctx: MarketContext, cfg) -> RegimeState:
     vix = ctx.vix()
     vix_on = cfg.get("regime", "vix_risk_on_max", default=20)
     vix_stress = cfg.get("regime", "vix_stress_min", default=28)
-    ev.append(f"VIX={vix}")
+    ev.append(f"VIX={round(vix, 2) if vix is not None else None}")
 
     breadth = ctx.breadth_above_sma(50)
     ev.append(f"breadth(>50sma)={breadth if breadth is None else round(breadth, 2)}")
