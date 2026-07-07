@@ -386,6 +386,31 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     return app
 
 
+def _commit_reports(store: Store, root: Path | None = None) -> None:
+    """Nightly git snapshot of dev/reports (ROADMAP Sprint D). Best-effort:
+    skips silently when there is nothing new or git is unavailable."""
+    import subprocess
+    root = root or Path(__file__).resolve().parent.parent
+    if not (root / ".git").is_dir():
+        return
+    try:
+        subprocess.run(["git", "add", "dev/reports"], cwd=root,
+                       timeout=15, capture_output=True, check=True)
+        dirty = subprocess.run(["git", "diff", "--cached", "--quiet",
+                                "--", "dev/reports"], cwd=root,
+                               timeout=15, capture_output=True)
+        if dirty.returncode == 0:
+            return                              # nothing new under dev/reports
+        subprocess.run(["git", "commit", "-m",
+                        "chore: nightly dev/reports snapshot",
+                        "--", "dev/reports"], cwd=root,
+                       timeout=15, capture_output=True, check=True)
+        store.audit("reports_committed", {})
+    except Exception as e:                      # noqa: BLE001
+        store.audit("scheduler_error", {"job": "commit_reports",
+                                        "error": str(e)})
+
+
 def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -431,6 +456,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 _notify("SpecForge", f"{len(proposals)} node promotion proposal(s) "
                                      f"await your review")
             _backup_db(store)
+            _commit_reports(store)
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "post_close", "error": str(e)})
             print(f"[scheduler] post-close FAILED: {e}")
@@ -451,13 +477,28 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     cfg = current_config(store, mode)
     tz = cfg.get("schedule", "timezone", default="America/New_York")
     sched = BackgroundScheduler(timezone=tz)
+    # misfire_grace_time: a scan fired up to 30 min late (laptop wake) still
+    # runs; later than that APScheduler drops it and the listener below alerts.
     for hhmm in cfg.get("schedule", "scans", default=[]):
         h, m = hhmm.split(":")
         sched.add_job(scan_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
-                                            minute=int(m), timezone=tz))
+                                            minute=int(m), timezone=tz),
+                      misfire_grace_time=1800)
     pc = cfg.get("schedule", "post_close", default="16:30")
     h, m = pc.split(":")
     sched.add_job(post_close_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
-                                              minute=int(m), timezone=tz))
+                                              minute=int(m), timezone=tz),
+                  misfire_grace_time=1800)
+
+    def _on_missed(event):
+        """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped
+        (machine asleep past the grace window) — make it loud."""
+        store.audit("scheduler_missed", {"scheduled": str(event.scheduled_run_time)})
+        _notify("SpecForge missed a scan",
+                f"scheduled {event.scheduled_run_time:%H:%M} never ran — "
+                f"machine asleep?")
+
+    from apscheduler.events import EVENT_JOB_MISSED
+    sched.add_listener(_on_missed, EVENT_JOB_MISSED)
     sched.start()
     app.state.scheduler = sched

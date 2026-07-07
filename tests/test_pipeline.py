@@ -75,3 +75,35 @@ def test_paper_positions_invisible_to_live_mode(cfg, store):
         "status": "open", "mode": "paper"})
     assert len(store.open_positions(mode="paper")) == 1
     assert store.open_positions(mode="live") == []
+
+
+def test_commit_reports_snapshots_dev_reports(store, tmp_path):
+    """Nightly report snapshot: commits new files under dev/reports, audits it,
+    and is a no-op when nothing changed."""
+    import subprocess
+
+    from specforge.app import _commit_reports
+
+    root = tmp_path / "repo"
+    (root / "dev" / "reports").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=root, check=True)
+    (root / "dev" / "reports" / "r.json").write_text("{}")
+    # commit identity via repo config so _commit_reports's plain git works
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+
+    _commit_reports(store, root=root)
+    log = subprocess.run(["git", "log", "--oneline"], cwd=root,
+                         capture_output=True, text=True).stdout
+    assert "nightly dev/reports snapshot" in log
+    assert store.db.execute(
+        "select count(*) from audit where event_type='reports_committed'"
+    ).fetchone()[0] == 1
+
+    _commit_reports(store, root=root)  # nothing new → no second commit/audit
+    log2 = subprocess.run(["git", "log", "--oneline"], cwd=root,
+                          capture_output=True, text=True).stdout
+    assert log2.count("nightly") == 1

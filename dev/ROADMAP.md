@@ -141,16 +141,18 @@ Do these in order; each step is small, committable, and independently useful.
 
 ## Sprint D — Hardening backlog (do opportunistically, lowest priority first)
 
-- launchd/systemd service files for `specforge serve` (survive reboots).
-- Nightly `git commit` of dev/reports + a DB backup (sqlite `.backup`).
+- [DONE D22] launchd service file (`scripts/install_service.sh`).
+- [DONE 2026-07-07, D26] Nightly `git commit` of dev/reports (post-close job,
+  `_commit_reports`) + DB backup (`_backup_db`, keep 14).
 - [DONE 2026-07-07, D24] Regime-conditioned weight multipliers in attribution.py
   (per-cell shrunk-IR, kv `regime_multipliers`, replaces global when n≥30).
 - Earnings drift: replace yfinance earnings with a point-in-time source
   (EDGAR 8-K parsing) so it can be backtested honestly.
 - Alpaca adapter (`broker/alpaca.py`, REST) as a second live venue.
-- GUI: render `promotion_proposals` and node `degraded_reason`.
-- Watchdog: alert (push/email) when a kill switch trips or the scheduler
-  misses a scan.
+- [DONE Sprint E] GUI: render `promotion_proposals` and node `degraded_reason`.
+- [DONE 2026-07-07, D27] Watchdog: desktop notification on kill-switch trip,
+  scan failure, and missed scans (APScheduler EVENT_JOB_MISSED listener +
+  30-min misfire grace).
 
 ## What success looks like
 

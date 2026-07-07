@@ -142,3 +142,21 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 - yfinance earnings history only reaches back ~2 years → earnings_drift backtest
   sample is thin; judge that node mostly on paper/live scorecards.
 - Stooq occasionally rate-limits bursts → data.py sleeps 0.2s/symbol.
+
+## Sprint D progress (2026-07-07 afternoon, scheduled session #2)
+- Daily check: live server healthy, 4 scans ran (09:45/12:30/15:30 + probes),
+  zero scheduler_errors, nightly db_backup fired, 10 intents pending approval
+  (they expire per D25 — approve during market hours or let them lapse).
+- [x] D26: `_commit_reports()` in app.py — post-close job now git-commits
+  dev/reports when it changed (best-effort, audited `reports_committed`).
+  Hoisted to module level for testability; test in test_pipeline.py.
+- [x] D27: missed-scan watchdog — scan/post-close jobs get
+  misfire_grace_time=1800 (fires up to 30 min late after laptop wake) and an
+  EVENT_JOB_MISSED listener that audits `scheduler_missed` + desktop-notifies.
+  Kill-switch and scan-failure notifications already existed (Sprint E).
+- 30 tests green. NOTE: the running live server (pid from before this session)
+  still runs the old code — restart `specforge --mode live serve` outside
+  market hours to pick up D26/D27. Not restarted automatically to avoid
+  disturbing the live broker session.
+- Remaining Sprint D backlog: EDGAR point-in-time earnings, Alpaca adapter
+  (both are big, deliberate builds — not scheduled-session material).
