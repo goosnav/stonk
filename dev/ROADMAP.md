@@ -112,6 +112,30 @@ options (locked at this account size anyway).
    mirroring the equity methods — schemas via runtime tool discovery) and add
    a paper test. Until then options only work on the paper broker.
 
+## Sprint E — Control Center v2 (product-ization; spec in [PRODUCT.md](PRODUCT.md))
+
+Goal: the GUI becomes the sellable product — glanceable, live, self-explaining.
+Do these in order; each step is small, committable, and independently useful.
+
+1. **QuoteService** (`specforge/quotes.py`): provider chain broker→stooq→
+   yfinance from `configs data_sources.quotes`, 30s cache, `{price,
+   change_pct, as_of, source}` per symbol. Acceptance: `/api/quotes?symbols=
+   SPY,QQQ` returns live-ish prices with source labels; offline → clear error
+   fields, no crash. [DONE 2026-07-06]
+2. **New endpoints** in app.py: `/api/market`, `/api/quotes`,
+   `/api/broker/status`, `/api/broker/connect` (background OAuth probe →
+   kv `broker_probe`), `/api/proposals`. Status positions marked with live
+   quotes. Acceptance: curl each, 200 + sane JSON. [DONE 2026-07-06]
+3. **Dashboard v2** per PRODUCT.md layout (tabs, market strip, countdown,
+   alert rail, explainers, node descriptions, Connect Robinhood card).
+   Acceptance: every section has an explainer line; positions P&L uses live
+   marks; broker card shows connect flow states. [DONE 2026-07-06 — first pass]
+4. **Polish pass** (NOT done): thesis tooltips on candidates, per-symbol data
+   freshness on Activity tab, $-equivalents next to risk percentages, node
+   promotion Approve button writing the status override, empty-state copy.
+5. **Packaging spike** (later): pipx entry point already exists
+   (`specforge serve`); document + screenshot for a landing page.
+
 ## Sprint D — Hardening backlog (do opportunistically, lowest priority first)
 
 - launchd/systemd service files for `specforge serve` (survive reboots).

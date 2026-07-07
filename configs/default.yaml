@@ -86,6 +86,10 @@ regime:
     risk_off: 0.25
     stress: 0.0
 
+data_sources:
+  # quote provider chain, first hit wins per symbol (specforge/quotes.py)
+  quotes: [broker, stooq, yfinance]
+
 nodes:
   # weight = base ensemble weight; regime multipliers & learned adjustments apply on top.
   # status: experimental | probation | production | disabled

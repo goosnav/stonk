@@ -29,8 +29,10 @@ def current_config(store: Store, mode: str):
 
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
+    from .quotes import QuoteService
     app = FastAPI(title="SpecForge", docs_url="/api/docs")
     mode = cfg.mode
+    quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
 
     def fresh_cfg():
         return current_config(store, mode)
@@ -44,10 +46,94 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             broker.set_quotes(ctx.prices())
         return c, broker, ctx
 
+    def _positions_marked(acct, daily_prices):
+        """Positions with LIVE marks where the quote chain has them; falls
+        back to last daily close, labeled by source either way."""
+        open_pos = [p for p in acct.positions if p.qty > 0]
+        live = quotes.get([p.symbol for p in open_pos]) if open_pos else {}
+        out = []
+        for p in open_pos:
+            q = live.get(p.symbol)
+            mark = q["price"] if q else daily_prices.get(p.symbol, p.avg_cost)
+            mult = 100.0 if p.asset_type == "option" else 1.0
+            out.append({
+                "symbol": p.option_symbol or p.symbol, "qty": p.qty,
+                "asset_type": p.asset_type, "avg_cost": round(p.avg_cost, 2),
+                "last": round(mark, 2),
+                "quote_source": q["source"] if q else "daily close",
+                "quote_as_of": q["as_of"] if q else None,
+                "pnl_pct": round(mark / p.avg_cost - 1, 4) if p.avg_cost else 0,
+                "pnl_usd": round((mark - p.avg_cost) * p.qty * mult, 2),
+                "value": round(p.qty * mark * mult, 2)})
+        return out
+
     # ---------------- pages ----------------
     @app.get("/")
     def index():
         return FileResponse(STATIC / "dashboard.html")
+
+    # ---------------- live data ----------------
+    @app.get("/api/quotes")
+    def api_quotes(symbols: str):
+        return quotes.get([s.strip() for s in symbols.split(",") if s.strip()])
+
+    @app.get("/api/market")
+    def market():
+        """The Overview market strip + regime + next scan, in one call."""
+        c, _, ctx = broker_and_ctx()
+        from . import regime as regime_mod
+        strip = quotes.get(["SPY", "QQQ", "IWM", "DIA",
+                            c.get("universe", "vix_symbol", default="^VIX")])
+        reg = regime_mod.classify(ctx, c)
+        sched = c.get("schedule", default={}) or {}
+        return {"strip": strip, "regime": reg.regime,
+                "regime_evidence": reg.evidence,
+                "deployment_multiplier": reg.deployment_multiplier,
+                "breadth_above_50sma": ctx.breadth_above_sma(50),
+                "scan_times": sched.get("scans", []),
+                "post_close": sched.get("post_close"),
+                "timezone": sched.get("timezone"),
+                "last_cycle": (store.audit_rows(limit=1000) and next(
+                    (json.loads(r["payload"]) for r in store.audit_rows(limit=200)
+                     if r["event_type"] == "cycle_end"), None))}
+
+    # ---------------- broker connect flow ----------------
+    @app.get("/api/broker/status")
+    def broker_status():
+        c = fresh_cfg()
+        probe = store.kv_get("broker_probe") or {"connected": False,
+                                                 "state": "never_attempted"}
+        ok, why = c.live_trading_allowed()
+        return {"configured_broker": c.get("broker"), "probe": probe,
+                "live_gate_ok": ok, "live_gate_reason": why}
+
+    @app.post("/api/broker/connect")
+    def broker_connect():
+        """Kick off the Robinhood OAuth probe in a background thread — the
+        browser opens on this machine for login. Poll /api/broker/status."""
+        import threading
+
+        def _run():
+            store.kv_set("broker_probe", {"connected": False, "state": "connecting"})
+            try:
+                from .broker.robinhood_mcp import RobinhoodMCPBroker
+                b = RobinhoodMCPBroker(fresh_cfg(), store)
+                result = b.probe()
+                result["state"] = "connected"
+                store.kv_set("broker_probe", result)
+                store.audit("broker_probe_ok", result)
+            except Exception as e:                  # noqa: BLE001
+                store.kv_set("broker_probe", {"connected": False, "state": "error",
+                                              "error": str(e)[:500]})
+                store.audit("broker_probe_failed", {"error": str(e)[:500]})
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True, "note": "OAuth window should open in your browser; "
+                                    "poll /api/broker/status"}
+
+    @app.get("/api/proposals")
+    def proposals():
+        return store.kv_get("promotion_proposals", [])
 
     # ---------------- read API ----------------
     @app.get("/api/status")
@@ -77,12 +163,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "options_unlocked": gov.options_unlocked(acct),
             "cycle_budget": round(gov.cycle_budget(acct, reg.deployment_multiplier), 2),
             "approval_mode": c.get("risk", "approval_mode"),
-            "positions": [{
-                "symbol": p.symbol, "qty": p.qty, "avg_cost": round(p.avg_cost, 2),
-                "last": prices.get(p.symbol),
-                "pnl_pct": round(prices.get(p.symbol, p.avg_cost) / p.avg_cost - 1, 4),
-                "value": round(p.qty * prices.get(p.symbol, p.avg_cost), 2),
-            } for p in acct.positions if p.qty > 0],
+            "positions": _positions_marked(acct, prices),
             "projection": portfolio_projection(store, c.mode),
             "ai_spend_today": round(store.ai_spend_today(), 4),
             "schedule": c.get("schedule", default={}),

@@ -179,6 +179,24 @@ class RobinhoodMCPBroker:
                                          "response_keys": list(out)[:20]})
         return out
 
+    # ---------------- connect probe (GUI "Connect Robinhood" flow) ----------
+    def probe(self) -> dict:
+        """Read-only connection test: OAuth + list accounts. Never places
+        orders; safe regardless of the live triple-gate. Returns a dict the
+        GUI can render directly."""
+        res = self._call("get_accounts", {})
+        accounts = _first(res, "accounts", "results",
+                          default=res if isinstance(res, list) else [])
+        wl = os.environ.get("RH_ACCOUNT_WHITELIST", "")
+        out = []
+        for a in accounts or []:
+            out.append({"account_number": _first(a, "account_number", "number", "id"),
+                        "agentic_allowed": bool(_first(a, "agentic_allowed",
+                                                       "is_agentic", default=False)),
+                        "type": _first(a, "type", "account_type", default="")})
+        return {"connected": True, "accounts": out, "whitelist": wl,
+                "probed_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+
     # ---------------- account resolution ----------------
     def _account(self) -> str:
         if self.account_number:

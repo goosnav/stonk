@@ -197,7 +197,9 @@ class Store:
     def orders_today(self, side: str | None = None, day: str | None = None) -> list[dict]:
         """day: ISO date; defaults to the real today (backtester passes as_of)."""
         day = day or date.today().isoformat()
-        q, args = "SELECT * FROM orders WHERE date(created_at)=?", [day]
+        # 'localtime': created_at carries a tz offset; bare date() would shift
+        # evening orders to the next UTC day and break daily caps after ~5pm PT
+        q, args = "SELECT * FROM orders WHERE date(created_at,'localtime')=?", [day]
         if side:
             q += " AND side=?"; args.append(side)
         return [dict(r) for r in self.db.execute(q, args)]
