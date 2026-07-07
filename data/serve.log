@@ -1,0 +1,71 @@
+INFO:     Started server process [17797]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8420 (Press CTRL+C to quit)
+INFO:     127.0.0.1:51672 - "GET /api/version HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51674 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51681 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51682 - "GET /api/candidates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51683 - "GET /api/trades?limit=15 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51684 - "GET /api/equity_curve HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51683 - "GET /api/audit?limit=120 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51682 - "GET /api/costs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51681 - "GET /api/montecarlo HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51680 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51679 - "GET /api/market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51703 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51679 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51710 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51709 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51716 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51714 - "GET /api/market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51715 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51718 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51717 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51721 - "GET /api/broker/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51725 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51724 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51726 - "GET /api/candidates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51728 - "GET /api/equity_curve HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51727 - "GET /api/trades?limit=15 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51730 - "GET /api/costs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51731 - "GET /api/audit?limit=120 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51727 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51729 - "GET /api/montecarlo HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51728 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51736 - "POST /api/broker/connect HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51726 - "GET /api/market HTTP/1.1" 200 OK
+Session termination failed: 400
+INFO:     127.0.0.1:51769 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51768 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51770 - "GET /api/broker/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51774 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51773 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51778 - "GET /api/market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51779 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51778 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51783 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51782 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51789 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51788 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51790 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51791 - "GET /api/candidates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51792 - "GET /api/trades?limit=15 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51795 - "GET /api/costs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51793 - "GET /api/equity_curve HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51796 - "GET /api/audit?limit=120 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51795 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51794 - "GET /api/montecarlo HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51792 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51791 - "GET /api/market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51802 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51801 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51806 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51805 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51809 - "GET /api/market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51810 - "GET /api/approvals HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51809 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [17797]

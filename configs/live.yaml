@@ -3,7 +3,15 @@
 mode: live
 broker: robinhood_mcp        # falls back to robinhood_bridge if OAuth is blocked
 live_trading_enabled: true
+# advanced_override justified: on a $50 probation account the standard
+# percentage caps produce sub-$5 orders (below exchange/engine minimums).
+# The DOLLAR amounts stay tiny; revert to defaults as equity grows past ~$500.
+advanced_override: true
 risk:
-  time_step_budget_pct: 0.05
-  time_step_budget_abs_cap: 50   # tiny live probation: <= $50 deployed per cycle
-  approval_mode: threshold
+  time_step_budget_pct: 0.40     # $20/cycle on $50 — still an absolute pittance
+  time_step_budget_abs_cap: 50   # hard ceiling regardless of account growth
+  max_single_equity_position: 0.30   # $15 max position on $50
+  # probation day one: EVERY order waits for your approve click in the GUI.
+  # After you've watched a clean fill + reconcile, switch to `threshold`
+  # (GUI → Risk & Budget) for autonomous small orders.
+  approval_mode: all
