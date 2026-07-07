@@ -63,3 +63,15 @@ def test_registry_skips_unimplemented_nodes(cfg):
     reg = build_registry(cfg)
     assert "nonexistent_node" not in reg
     assert "momentum" in reg
+
+
+def test_paper_positions_invisible_to_live_mode(cfg, store):
+    """Paper and live share one DB; a live scan must not see paper positions."""
+    from specforge.models import new_id
+    store.save_position(new_id(), {
+        "symbol": "AAA", "asset_type": "equity", "qty": 1.0, "avg_cost": 100.0,
+        "opened_at": "2026-01-01T00:00:00", "horizon_days": 20, "stop_price": 0,
+        "candidate_id": "x", "nodes": [], "option_symbol": None,
+        "status": "open", "mode": "paper"})
+    assert len(store.open_positions(mode="paper")) == 1
+    assert store.open_positions(mode="live") == []

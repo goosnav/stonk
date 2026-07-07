@@ -55,7 +55,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # 4. settle async fills from prior cycles, then exits (free budget before
     #    spending it)
     reconciled = executor.reconcile(cycle_id)
-    mismatches = _position_mismatch(store, account)
+    mismatches = _position_mismatch(store, account, mode=source)
     if mismatches:
         # engine thinks it holds something the broker doesn't (or vice versa):
         # trading blind on wrong state is how phantom orders happen. Close the
@@ -63,7 +63,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         store.audit("position_mismatch", mismatches, cycle_id)
         for pid in mismatches.get("engine_only_ids", []):
             store.close_position(pid)
-    exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime)
+    exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime, mode=source)
 
     # 5. human-approved intents from the queue
     approvals = executor.process_approval_queue(account, ctx, cycle_id, reg.regime)
@@ -137,7 +137,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     return summary
 
 
-def _position_mismatch(store: Store, account) -> dict:
+def _position_mismatch(store: Store, account, mode: str = 'paper') -> dict:
     """Compare engine position metadata vs broker truth. Broker wins: engine
     rows without broker backing get closed (audited, no trade recorded);
     broker holdings the engine doesn't know are reported for the operator."""
@@ -145,7 +145,7 @@ def _position_mismatch(store: Store, account) -> dict:
         return {}   # dead/missing feed (e.g. bridge snapshot absent) — don't
                     # mistake "no data" for "no positions" and wipe state
     broker_syms = {(p.option_symbol or p.symbol) for p in account.positions if p.qty > 0}
-    engine = store.open_positions()
+    engine = store.open_positions(mode=mode)
     engine_only = [p for p in engine
                    if (p["option_symbol"] or p["symbol"]) not in broker_syms]
     engine_syms = {(p["option_symbol"] or p["symbol"]) for p in engine}
@@ -158,12 +158,12 @@ def _position_mismatch(store: Store, account) -> dict:
 
 
 def _check_exits(ctx: MarketContext, store: Store, executor: Executor,
-                 account, cycle_id: str, regime: str) -> dict:
+                 account, cycle_id: str, regime: str, mode: str = 'paper') -> dict:
     """Stop-loss and time-stop exits (AGENTS.md §28 MVP subset; score-decay and
     regime exits arrive with attribution in Phase 5)."""
     results = {}
     as_of_dt = datetime.strptime(ctx.as_of, "%Y-%m-%d")
-    for pos in store.open_positions():
+    for pos in store.open_positions(mode=mode):
         is_option = pos["asset_type"] == "option"
         price = _option_mark(ctx, pos) if is_option else ctx.close(pos["symbol"])
         if price is None:

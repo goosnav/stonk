@@ -32,6 +32,8 @@ class Executor:
         self.governor = governor
         # logical clock (matches governor's) — see dev/PROGRESS.md clock injection
         self.now_iso = now_iso or governor.now_iso
+        # positions/trades in the shared DB are tagged by mode (paper|live)
+        self.mode = "live" if cfg.mode == "live" else "paper"
 
     def _limit_price(self, last_price: float, side: str) -> float:
         off = self.cfg.get("execution", "limit_offset_pct", default=0.001)
@@ -123,7 +125,8 @@ class Executor:
                 "qty": fill.qty, "avg_cost": fill.price, "opened_at": self.now_iso,
                 "horizon_days": cand.horizon_days, "stop_price": stop,
                 "candidate_id": cand.id, "nodes": cand.contributing_nodes,
-                "option_symbol": intent.option_symbol, "status": "open"})
+                "option_symbol": intent.option_symbol, "status": "open",
+                "mode": self.mode})
         return "filled"
 
     def execute_exit(self, position: dict, last_price: float, reason: str,
@@ -209,7 +212,8 @@ class Executor:
                     "stop_price": round(fill.price * (1 - stop_mult * 0.02), 4),
                     "candidate_id": o["candidate_id"],
                     "nodes": cand.contributing_nodes if cand else [],
-                    "option_symbol": o["option_symbol"], "status": "open"})
+                    "option_symbol": o["option_symbol"], "status": "open",
+                    "mode": self.mode})
             results[o["symbol"]] = "filled"
         return results
 

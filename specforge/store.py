@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS fills(
 CREATE TABLE IF NOT EXISTS positions(               -- engine-side open position metadata
   id TEXT PRIMARY KEY, symbol TEXT, asset_type TEXT, qty REAL, avg_cost REAL,
   opened_at TEXT, horizon_days INTEGER, stop_price REAL, candidate_id TEXT,
-  nodes TEXT, option_symbol TEXT, status TEXT DEFAULT 'open'  -- open|closed
+  nodes TEXT, option_symbol TEXT, status TEXT DEFAULT 'open',  -- open|closed
+  mode TEXT DEFAULT 'paper'                          -- paper|live (shared DB)
 );
 CREATE TABLE IF NOT EXISTS trades(                  -- closed round-trips (+ backtest analogs)
   id TEXT PRIMARY KEY, symbol TEXT, asset_type TEXT,
@@ -107,6 +108,12 @@ class Store:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self.db.executescript(SCHEMA)
+        # migration for DBs created before positions.mode existed
+        try:
+            self.db.execute("ALTER TABLE positions ADD COLUMN mode TEXT DEFAULT 'paper'")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass    # column already there
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -243,16 +250,21 @@ class Store:
         self.db.commit()
 
     # ---------- positions ----------
-    def open_positions(self) -> list[dict]:
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM positions WHERE status='open'")]
+    def open_positions(self, mode: str | None = None) -> list[dict]:
+        """mode filter matters: paper and live share this DB — a live scan
+        must never mistake paper positions for real holdings."""
+        q, args = "SELECT * FROM positions WHERE status='open'", []
+        if mode:
+            q += " AND mode=?"; args.append(mode)
+        return [dict(r) for r in self.db.execute(q, args)]
 
     def save_position(self, pid: str, p: dict) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, p["symbol"], p["asset_type"], p["qty"], p["avg_cost"], p["opened_at"],
              p["horizon_days"], p["stop_price"], p.get("candidate_id", ""),
-             json.dumps(p.get("nodes", [])), p.get("option_symbol"), p.get("status", "open")))
+             json.dumps(p.get("nodes", [])), p.get("option_symbol"),
+             p.get("status", "open"), p.get("mode", "paper")))
         self.db.commit()
 
     def close_position(self, pid: str) -> None:
