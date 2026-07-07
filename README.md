@@ -32,11 +32,16 @@ Data → Signal nodes → Regime gate → Ensemble (+error bars) → Portfolio
 - **Bounded instruments only**: long equities/ETFs and long calls/puts (max
   loss = premium). No shorting, no naked options, no margin, ever.
 
+![SpecForge Control Center — Overview](docs/screenshot_overview.png)
+![Signal switchboard](docs/screenshot_switchboard.png)
+
 ## Quick start
 
 ```bash
 ./run.sh                 # creates .venv, installs, smoke-tests, starts the GUI
 # → http://127.0.0.1:8420
+
+./scripts/install_service.sh          # optional: run at login + auto-restart (macOS)
 ```
 
 Or manually:

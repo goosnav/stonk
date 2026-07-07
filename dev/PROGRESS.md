@@ -96,6 +96,21 @@
   Robinhood" on the Overview tab (or POST /api/broker/connect) — OAuth opens
   in the browser; on allowlist error switch to the bridge (TUTORIAL §5).
 
+## LIVE MILESTONE (2026-07-06 21:11, D22) — Robinhood connected for real
+- User completed OAuth via the GUI Connect card; standalone Python MCP client
+  verified against the real agentic account 934803396: equity $50 read live,
+  real-time quotes, review_equity_order dry-run passed (order-arg mapping
+  correct: fractional⇒market, string params). Bridge = fallback only.
+- .env autoloaded by config.py; whitelist + LIVE_TRADING_ENABLED set; third
+  gate (config flag) opens only with `--mode live`.
+- order_checks.alertType parsing added: unknown alert types block orders.
+- Concurrency fix D21 (per-thread sqlite). GUI render-verified headless
+  (tests/test_gui.py, needs playwright; screenshots dev/reports/gui_*.png).
+- scripts/install_service.sh — launchd persistence (login start, crash restart).
+- NEXT LIVE STEP (human): during market hours run
+  `.venv/bin/specforge --mode live serve`, approve the first queued intent in
+  the GUI, verify the fill in the Robinhood app + next-cycle reconcile.
+
 ## BUILD COMPLETE — system is in OPERATION phase
 Everything from here is running/measuring/scaling, not construction.
 → **Next steps live in [ROADMAP.md](ROADMAP.md)** (Sprint A: paper campaign;
