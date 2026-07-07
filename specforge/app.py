@@ -147,6 +147,18 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def proposals():
         return store.kv_get("promotion_proposals", [])
 
+    @app.get("/api/version")
+    def version():
+        from . import __version__
+        import subprocess
+        try:
+            rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5,
+                                 cwd=STATIC.parent).stdout.strip()
+        except Exception:                       # noqa: BLE001 — shipped w/o git
+            rev = None
+        return {"version": __version__, "git": rev, "mode": mode}
+
     # ---------------- read API ----------------
     @app.get("/api/status")
     def status():
