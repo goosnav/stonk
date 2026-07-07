@@ -143,8 +143,8 @@ Do these in order; each step is small, committable, and independently useful.
 
 - launchd/systemd service files for `specforge serve` (survive reboots).
 - Nightly `git commit` of dev/reports + a DB backup (sqlite `.backup`).
-- Regime-conditioned weight multipliers in attribution.py (data exists in
-  scorecards `by_regime`; apply multiplier per regime once n≥30 per cell).
+- [DONE 2026-07-07, D24] Regime-conditioned weight multipliers in attribution.py
+  (per-cell shrunk-IR, kv `regime_multipliers`, replaces global when n≥30).
 - Earnings drift: replace yfinance earnings with a point-in-time source
   (EDGAR 8-K parsing) so it can be backtested honestly.
 - Alpaca adapter (`broker/alpaca.py`, REST) as a second live venue.

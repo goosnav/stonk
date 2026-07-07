@@ -159,3 +159,17 @@ treat leftover paper positions as real holdings (and the D20 mismatch guard
 would churn closing them). positions.mode column added (ALTER-migration for
 existing DBs, default 'paper'); engine reads filter by the cycle's mode.
 Trades were already source-tagged; equity_curve keyed by source.
+
+## D24. Regime-conditioned weight multipliers replace, not stack (2026-07-07)
+ROADMAP Sprint D item. attribution.update_weights now computes a per-regime
+multiplier for each node using the same shrunk-IR formula, but only for
+(node, regime) cells with n >= weight_learning.regime_min_n (default 30).
+Stored in kv `regime_multipliers` = {node_id: {regime: mult}}; consumed in
+ensemble.s_node_weight INSTEAD OF the global multiplier when the current
+regime has a qualifying cell (fallback: global). Chose "replace" over
+"stack" (global x regime) so the governor's [min_multiplier, max_multiplier]
+bound holds trivially — a product of two in-bound factors could reach 4.0.
+Cells that fall below the threshold get their entry deleted so stale
+multipliers cannot outlive their evidence. Inert today: no (node, regime)
+cell has 30 paper/live trades yet; it activates as Sprint A accumulates data.
+Test: tests/test_ai_attribution.py::test_regime_conditioned_multipliers.

@@ -39,7 +39,7 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
         # can't short; negative scores just suppress the long case)
         contribs, weights = [], []
         for s in sigs:
-            w = s_node_weight(s.node_id, cfg, store)
+            w = s_node_weight(s.node_id, cfg, store, regime)
             if w <= 0:
                 continue
             sign = {"long": 1, "long_call": 1}.get(s.direction, -1)
@@ -87,6 +87,12 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
     return candidates
 
 
-def s_node_weight(node_id: str, cfg, store: Store) -> float:
+def s_node_weight(node_id: str, cfg, store: Store, regime: str | None = None) -> float:
     base = float(cfg.get("nodes", node_id, "weight", default=0.0) or 0.0)
+    # regime-conditioned multiplier replaces the global one when attribution
+    # has a meaningful sample for this (node, regime) cell — see attribution.py
+    if regime:
+        rm = (store.kv_get("regime_multipliers", {}) or {}).get(node_id, {})
+        if regime in rm:
+            return base * rm[regime]
     return base * store.get_weight_multiplier(node_id)

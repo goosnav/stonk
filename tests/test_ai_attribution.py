@@ -69,3 +69,28 @@ def test_weight_update_bounds_and_auto_disable(cfg, store):
     ov = store.kv_get("config_overrides")
     assert ov["nodes"]["reversal"]["enabled"] is False
     assert store.get_weight_multiplier("reversal") == 0.3   # clamped at min
+
+def test_regime_conditioned_multipliers(cfg, store):
+    # 30 risk_on winners + 30 risk_off losers on one node: the regime cells
+    # qualify (n >= regime_min_n) and must yield opposite-signed multipliers,
+    # consumed instead of the global one; regimes without a sample fall back.
+    for regime, ret, px in (("risk_on", 0.04, 104), ("risk_off", -0.03, 97)):
+        for i in range(30):
+            store.record_trade({"symbol": "CCC", "entry_date": "2026-01-01",
+                                "exit_date": "2026-02-01", "entry_price": 100,
+                                "exit_price": px, "qty": 1, "pnl": ret * 100,
+                                "ret": ret + (i % 3) * 0.001,  # non-zero variance
+                                "nodes": ["momentum"], "source": "paper",
+                                "regime": regime, "score_bucket": "s2"})
+    update_weights(cfg, store, log=lambda *a: None)
+    rm = store.kv_get("regime_multipliers")["momentum"]
+    assert rm["risk_on"] > 1.0 and rm["risk_off"] < 1.0
+    assert 0.3 <= rm["risk_off"] and rm["risk_on"] <= 2.0
+
+    from specforge.ensemble import s_node_weight
+    base = float(cfg.get("nodes", "momentum", "weight", default=0.0))
+    assert s_node_weight("momentum", cfg, store, "risk_on") == base * rm["risk_on"]
+    assert s_node_weight("momentum", cfg, store, "risk_off") == base * rm["risk_off"]
+    # neutral has no cell -> global multiplier path
+    assert s_node_weight("momentum", cfg, store, "neutral") == \
+        base * store.get_weight_multiplier("momentum")

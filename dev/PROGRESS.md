@@ -119,6 +119,16 @@ Sprint C: learn/scale; Sprint D: hardening backlog).
 Session deliverable summary: [../CLAUDE_RUN_SUMMARY.md](../CLAUDE_RUN_SUMMARY.md).
 GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 
+## Sprint D progress (2026-07-07, scheduled session)
+- Sprint A daily check: server up, scheduler armed for 09:45 ET; zero
+  scheduler_errors; yesterday's kill-switch churn in the audit was the D19
+  dev session itself (fix verified holding: post-21:00 cycles show governor
+  vetoes with kill_switches=[]). 27 -> 28 tests green.
+- [x] Regime-conditioned weight multipliers (D24) — per-(node, regime)
+  shrunk-IR multiplier, kv `regime_multipliers`, replaces the global
+  multiplier when the cell has >=30 trades (config regime_min_n). Inert
+  until paper data accumulates; test added.
+
 ## Environment notes
 - Run everything with `.venv/bin/python` / `.venv/bin/pytest` (no uv on machine).
 - No API keys needed until Phase 5 (AI) / Phase 4 live (Robinhood OAuth interactive).

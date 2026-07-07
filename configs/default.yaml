@@ -114,6 +114,7 @@ ensemble:
     max_multiplier: 2.0
     min_trades_before_update: 20
     shrinkage: 0.7                 # Bayesian shrink toward zero edge
+    regime_min_n: 30               # trades per (node, regime) cell before a regime multiplier applies
 
 sizing:
   vol_target_pct: 0.01             # per-position daily vol target (fraction of equity)
