@@ -128,6 +128,9 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   shrunk-IR multiplier, kv `regime_multipliers`, replaces the global
   multiplier when the cell has >=30 trades (config regime_min_n). Inert
   until paper data accumulates; test added.
+- [x] D25: expired intents can no longer be approved (guard in
+  store.decide_approval; GUI 409 / CLI REFUSED; order+approval marked
+  expired). 28 -> 29 tests green.
 
 ## Environment notes
 - Run everything with `.venv/bin/python` / `.venv/bin/pytest` (no uv on machine).

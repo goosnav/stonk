@@ -358,7 +358,11 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         decision = body.get("decision")
         if decision not in ("approved", "rejected"):
             raise HTTPException(400, "decision must be approved|rejected")
-        store.decide_approval(intent_id, decision)
+        try:
+            store.decide_approval(intent_id, decision)
+        except ValueError as e:                    # approving an expired intent
+            store.audit("approval_expired", {"intent": intent_id, "via": "gui"})
+            raise HTTPException(409, str(e))
         if decision == "rejected":
             store.update_order(intent_id, status="rejected")
         store.audit("approval_decided", {"intent": intent_id, "decision": decision,

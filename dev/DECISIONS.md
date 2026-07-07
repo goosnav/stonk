@@ -173,3 +173,17 @@ Cells that fall below the threshold get their entry deleted so stale
 multipliers cannot outlive their evidence. Inert today: no (node, regime)
 cell has 30 paper/live trades yet; it activates as Sprint A accumulates data.
 Test: tests/test_ai_attribution.py::test_regime_conditioned_multipliers.
+
+## D25. Approval expiry enforced at decision time, not just cycle start (2026-07-07)
+Gap found during live probation review: the cycle-start expiry sweep in
+execution.process_approval_queue only scans approvals with status='pending'.
+If the human clicked Approve on an intent whose expires_at had already
+passed (e.g. approving a 12:30 proposal at 15:20), the row flipped to
+'approved' before any sweep saw it, and the next cycle would place the
+order at a price quoted hours earlier. Fix lives in store.decide_approval —
+the single chokepoint both the GUI (/api/approvals) and the CLI (approve
+command) route through — which now checks expires_at when status='approved',
+marks the approval AND the order 'expired', and raises ValueError. GUI maps
+it to HTTP 409; CLI prints REFUSED. String comparison of ISO-with-tz
+timestamps matches the existing convention in process_approval_queue.
+Test: tests/test_risk.py::test_approve_after_expiry_refused.

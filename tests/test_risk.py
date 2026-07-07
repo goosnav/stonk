@@ -181,3 +181,19 @@ def test_drawdown_trip_clears_and_baseline_resets(cfg, store):
     store.record_equity(800, 800, "paper", d=future[:10])
     g2.check_kill_switches(acct(equity=800), "paper")
     assert "drawdown" not in g2.active_switches()
+
+
+def test_approve_after_expiry_refused(store):
+    """D25: approving an intent past its expires_at must not place it — the
+    cycle-start expiry sweep only covers 'pending' rows, so the guard lives
+    in decide_approval itself (shared by GUI and CLI)."""
+    import pytest as _pt
+    store.db.execute(
+        "INSERT INTO orders VALUES('i1','c1','','AAA','equity','buy',1,10.0,10.0,"
+        "'k1','pending_approval',NULL,NULL,'2026-01-01T10:00:00-07:00','')")
+    store.queue_approval("i1", "2026-01-01T11:00:00-07:00")   # long past
+    with _pt.raises(ValueError, match="expired"):
+        store.decide_approval("i1", "approved")
+    a = store.db.execute("SELECT status FROM approvals WHERE intent_id='i1'").fetchone()
+    o = store.db.execute("SELECT status FROM orders WHERE id='i1'").fetchone()
+    assert a["status"] == "expired" and o["status"] == "expired"

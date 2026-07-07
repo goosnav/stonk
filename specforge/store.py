@@ -350,6 +350,21 @@ class Store:
             "FROM approvals a JOIN orders o ON o.id=a.intent_id WHERE a.status='pending'")]
 
     def decide_approval(self, intent_id: str, status: str) -> None:
+        # Guard here, not in the callers: both the GUI and the CLI route
+        # through this method, and an intent approved after its expires_at
+        # would otherwise be placed at a stale price on the next cycle
+        # (the cycle-start expiry sweep only looks at 'pending' rows).
+        if status == "approved":
+            row = self.db.execute("SELECT expires_at FROM approvals WHERE intent_id=?",
+                                  (intent_id,)).fetchone()
+            if row and row["expires_at"] < _now():
+                self.db.execute("UPDATE approvals SET status='expired', decided_at=? "
+                                "WHERE intent_id=?", (_now(), intent_id))
+                self.db.execute("UPDATE orders SET status='expired', updated_at=? "
+                                "WHERE id=?", (_now(), intent_id))
+                self.db.commit()
+                raise ValueError(f"intent {intent_id} expired at {row['expires_at']}; "
+                                 "wait for the next scan to re-propose it")
         self.db.execute("UPDATE approvals SET status=?, decided_at=? WHERE intent_id=?",
                         (status, _now(), intent_id))
         self.db.commit()

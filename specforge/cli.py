@@ -79,7 +79,12 @@ def cmd_serve(args, cfg, store):
 
 
 def cmd_approve(args, cfg, store):
-    store.decide_approval(args.intent_id, "approved")
+    try:
+        store.decide_approval(args.intent_id, "approved")
+    except ValueError as e:                        # approving an expired intent
+        store.audit("approval_expired", {"intent": args.intent_id, "via": "cli"})
+        print(f"REFUSED: {e}")
+        return
     store.audit("approval_decided", {"intent": args.intent_id, "decision": "approved",
                                      "via": "cli"})
     print(f"approved {args.intent_id}; it will place on the next scan cycle")
