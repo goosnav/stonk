@@ -12,6 +12,21 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "configs"
 
+
+def _load_dotenv() -> None:
+    """Minimal .env loader (stdlib): real env vars win over file values."""
+    env = ROOT / ".env"
+    if not env.exists():
+        return
+    for line in env.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_dotenv()
+
 # (path, predicate, message) — governor-level sanity on config itself
 _DANGEROUS = [
     (("risk", "kill_switch_drawdown"), lambda v: v > 0.5, "kill_switch_drawdown > 50%"),

@@ -149,7 +149,9 @@ def test_live_triple_gate(monkeypatch):
     from specforge.config import load_config
     cfg = load_config("paper", overrides={"live_trading_enabled": True,
                                           "broker": "robinhood_mcp"})
+    # isolate from the machine's real .env (config.py loads it at import)
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.delenv("RH_ACCOUNT_WHITELIST", raising=False)
     ok, why = cfg.live_trading_allowed()
     assert not ok and "env" in why
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")

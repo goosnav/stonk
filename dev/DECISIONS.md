@@ -127,6 +127,19 @@ safe concurrent readers, busy_timeout=15s for writers). Verified with a
 140-request concurrency hammer: 0 non-200s. Found via headless Playwright
 render testing — screenshots in dev/reports/gui_*.png.
 
+## D22. Standalone Robinhood MCP client VERIFIED LIVE (2026-07-06 21:11)
+The D6 primary path works: user completed OAuth in-browser, tokens cached at
+~/.specforge/rh_tokens.json (0600), and the Python MCP client then read the
+real account with NO browser: equity $50 / cash $50 / buying_power $50 on
+agentic account 934803396 (agentic_allowed=true, type=cash), plus real-time
+quotes (SPY 751.31 incl. bid/ask). The bridge remains a fallback only.
+Live response shapes encoded in the adapter: everything wraps in
+{"data": ..., "guide": ...} (unwrapped once in _call); portfolio buying_power
+is NESTED {"buying_power": "50.0000"}; quotes are data.results[].quote.
+.env is now auto-loaded by config.py (stdlib parser, real env wins);
+RH_ACCOUNT_WHITELIST=934803396 and LIVE_TRADING_ENABLED=true are set — live
+orders still require starting with `--mode live` (config flag is the third gate).
+
 ## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
 Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
 momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%

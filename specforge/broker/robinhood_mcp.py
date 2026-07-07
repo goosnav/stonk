@@ -177,6 +177,10 @@ class RobinhoodMCPBroker:
         out = asyncio.run(self._call_async(tool, args))
         self.store.audit("rh_mcp_call", {"tool": tool, "args": args,
                                          "response_keys": list(out)[:20]})
+        # RH wraps payloads as {"data": {...}, "guide": "..."} (observed live
+        # 2026-07-06); unwrap once here so parsers see the payload directly
+        if isinstance(out, dict) and isinstance(out.get("data"), (dict, list)):
+            out = out["data"] if isinstance(out["data"], dict) else {"results": out["data"]}
         return out
 
     # ---------------- connect probe (GUI "Connect Robinhood" flow) ----------
@@ -234,9 +238,13 @@ class RobinhoodMCPBroker:
                     avg_cost=_f(_first(p, "average_cost", "avg_cost",
                                        "average_buy_price")),
                     opened_at=_first(p, "created_at", default="")))
-        equity = _f(_first(port, "market_value", "total_market_value", "equity"))
+        # live shape (observed 2026-07-06): total_value/cash as strings,
+        # buying_power NESTED as {"buying_power": "50.0000", ...}
+        equity = _f(_first(port, "total_value", "market_value", "equity"))
         cash = _f(_first(port, "cash", "cash_balance", "uninvested_cash"))
-        bp = _f(_first(port, "buying_power", "cash_available", default=cash))
+        bp_raw = _first(port, "buying_power", default=cash)
+        bp = _f(_first(bp_raw, "buying_power", default=None)) \
+            if isinstance(bp_raw, dict) else _f(bp_raw, cash)
         return AccountState(equity=equity or (cash + sum(p.cost_basis for p in positions)),
                             cash=cash, buying_power=bp, positions=positions,
                             as_of=datetime.now().astimezone().isoformat())
@@ -244,7 +252,8 @@ class RobinhoodMCPBroker:
     def get_quotes(self, symbols: list[str]) -> dict[str, float]:
         res = self._call("get_equity_quotes", {"symbols": symbols})
         out = {}
-        for q in _first(res, "quotes", "results", default=[]) or []:
+        for row in _first(res, "results", "quotes", default=[]) or []:
+            q = row.get("quote", row) if isinstance(row, dict) else {}
             sym = _first(q, "symbol", "ticker")
             px = _f(_first(q, "last_trade_price", "last", "price", "mark_price"))
             if sym and px:
