@@ -152,3 +152,10 @@ paper/live only. Aggressiveness knob = sizing/deployment, not new signals.
 Live/bridge orders don't fill synchronously. Executor.reconcile() polls
 resting/relayed orders each cycle via broker.poll_order() and creates
 positions/trades through the same bookkeeping path as immediate fills.
+
+## D23. Positions are mode-tagged (2026-07-06)
+Paper and live share data/specforge.db. Without tagging, a live scan would
+treat leftover paper positions as real holdings (and the D20 mismatch guard
+would churn closing them). positions.mode column added (ALTER-migration for
+existing DBs, default 'paper'); engine reads filter by the cycle's mode.
+Trades were already source-tagged; equity_curve keyed by source.
