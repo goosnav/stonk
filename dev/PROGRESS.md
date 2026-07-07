@@ -70,6 +70,32 @@
 - reversal node defaulted off (flat in both runs); analogs (v3) loaded into
   the live DB → GUI projection shows 12.9% APR [9.0%, 16.4%] confidence=low.
 
+## Sprint E — Control Center v2 (2026-07-06 evening, commits 32ae062 + c885163)
+- [x] specforge/quotes.py — QuoteService provider chain (broker→stooq→yfinance),
+      30s cache, every quote stamped {price, change_pct, as_of, source}.
+      VERIFIED live: /api/quotes returned real prices (source-labeled).
+- [x] app.py: /api/market (strip+regime+breadth+scan times), /api/quotes,
+      /api/broker/status, /api/broker/connect (background OAuth probe → kv
+      broker_probe; RH adapter got read-only probe()), /api/proposals; status
+      positions now marked with live quotes incl. P&L $ and quote provenance.
+      All 14 endpoints curl-verified 200.
+- [x] static/dashboard.html v2 — full control center: 5 tabs (Overview /
+      Trading / Switchboard / Risk & Budget / Activity), live market strip,
+      next-scan countdown, alert rail, per-section plain-English explainers,
+      node descriptions, $-equivalents on risk %, Connect Robinhood card,
+      audit filter. JS `node --check` clean; NOT yet eyeballed in a browser
+      (Chrome extension was disconnected) — first human look may find layout
+      nits, logic is contract-tested.
+- [x] Bug fixes with tests: tz-safe daily order counting (evening UTC-shift),
+      governor vetoes ≠ broker rejections (D19, kill-switch livelock),
+      engine↔broker position mismatch guard (D20, self-heals orphan state).
+- Product vision + scope fences: dev/PRODUCT.md. Remaining polish list:
+  ROADMAP Sprint E step 4 (tooltips, freshness panel, promotion Approve
+  button, empty states) — all small, no unwritten load-bearing blocks.
+- USER ACTION WAITING: $50 is in the Robinhood account. Click "Connect
+  Robinhood" on the Overview tab (or POST /api/broker/connect) — OAuth opens
+  in the browser; on allowlist error switch to the bridge (TUTORIAL §5).
+
 ## BUILD COMPLETE — system is in OPERATION phase
 Everything from here is running/measuring/scaling, not construction.
 → **Next steps live in [ROADMAP.md](ROADMAP.md)** (Sprint A: paper campaign;
