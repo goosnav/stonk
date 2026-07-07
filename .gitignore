@@ -8,3 +8,4 @@ data/*.db-*
 .pytest_cache/
 .DS_Store
 ~/.specforge/
+.claude/*.local.md
