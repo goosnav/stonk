@@ -61,7 +61,10 @@ class Executor:
                                            "verdict": decision.verdict,
                                            "reasons": decision.reasons}, cycle_id)
         if decision.verdict == "REJECTED":
-            intent.status = "rejected"
+            # governor "no" is healthy — status 'vetoed', distinct from broker
+            # 'rejected', so routine vetoes never trip the rejected-order storm
+            # kill switch (that switch exists for broker bounces)
+            intent.status = "vetoed"
             self.store.record_order(intent)
             return "rejected"
 

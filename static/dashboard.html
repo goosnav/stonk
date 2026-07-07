@@ -2,210 +2,357 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SpecForge</title>
+<title>SpecForge Control Center</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9;
-          --dim:#8b949e; --green:#3fb950; --red:#f85149; --amber:#d29922;
-          --blue:#58a6ff; }
+  :root { --bg:#0b0e14; --panel:#12161f; --panel2:#171c27; --border:#262d3b;
+          --text:#d3dae6; --dim:#7d8799; --green:#41c56f; --red:#f0555f;
+          --amber:#e0a83c; --blue:#5aa2f7; --purple:#a883f0; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text);
-         font:14px/1.45 -apple-system, "SF Mono", Menlo, monospace; }
-  header { display:flex; gap:24px; align-items:baseline; padding:14px 20px;
-           border-bottom:1px solid var(--border); flex-wrap:wrap; }
-  h1 { font-size:18px; margin:0; color:var(--blue); }
-  .stat b { font-size:16px; } .stat span { color:var(--dim); font-size:11px;
-           display:block; text-transform:uppercase; letter-spacing:.06em; }
-  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px 20px; }
+         font:13.5px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .mono { font-family:"SF Mono", Menlo, monospace; }
+  /* top bar */
+  #top { display:flex; align-items:center; gap:14px; padding:10px 18px;
+         border-bottom:1px solid var(--border); background:var(--panel);
+         position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  #brand { font-weight:700; font-size:16px; color:var(--blue); white-space:nowrap; }
+  .chip { padding:3px 10px; border:1px solid var(--border); border-radius:14px;
+          font-size:12px; white-space:nowrap; }
+  .tick { display:flex; gap:4px; align-items:baseline; cursor:default; }
+  .tick b { font-weight:600; }
+  #countdown { margin-left:auto; color:var(--dim); font-size:12px; }
+  button { background:#1d2432; color:var(--text); border:1px solid var(--border);
+           border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit;
+           font-size:12.5px; }
+  button:hover { border-color:var(--blue); }
+  button.primary { background:var(--blue); color:#0b0e14; font-weight:600; }
+  button.ok { color:var(--green); } button.no { color:var(--red); }
+  /* alert rail */
+  #alerts { padding:0 18px; }
+  .alert { margin:8px 0; padding:8px 12px; border-radius:8px; font-size:12.5px;
+           border:1px solid var(--red); background:#2a1215; color:#ffb3b8;
+           display:flex; gap:10px; align-items:center; }
+  .alert.warn { border-color:var(--amber); background:#2a2210; color:#f0d9a0; }
+  /* tabs */
+  #tabs { display:flex; gap:2px; padding:10px 18px 0; }
+  #tabs div { padding:8px 16px; cursor:pointer; border:1px solid transparent;
+              border-bottom:none; border-radius:8px 8px 0 0; color:var(--dim); }
+  #tabs div.on { background:var(--panel); border-color:var(--border);
+                 color:var(--text); font-weight:600; }
+  main { padding:14px 18px 40px; display:grid; grid-template-columns:1fr 1fr;
+         gap:14px; }
+  .page { display:contents; }
   section { background:var(--panel); border:1px solid var(--border);
-            border-radius:8px; padding:14px; }
+            border-radius:10px; padding:14px; min-width:0; }
   section.wide { grid-column:1 / -1; }
   h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
-       color:var(--dim); margin:0 0 10px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; color:var(--dim); font-weight:normal; font-size:11px;
-       text-transform:uppercase; padding:4px 8px 4px 0; border-bottom:1px solid var(--border); }
-  td { padding:5px 8px 5px 0; border-bottom:1px solid #21262d; vertical-align:top; }
+       color:var(--blue); margin:0 0 2px; }
+  .explain { color:var(--dim); font-size:11.5px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th { text-align:left; color:var(--dim); font-weight:500; font-size:10.5px;
+       text-transform:uppercase; letter-spacing:.05em; padding:4px 8px 4px 0;
+       border-bottom:1px solid var(--border); }
+  td { padding:6px 8px 6px 0; border-bottom:1px solid #1b2130; vertical-align:top; }
   .pos { color:var(--green); } .neg { color:var(--red); } .dim { color:var(--dim); }
-  .badge { padding:2px 8px; border-radius:10px; font-size:11px; border:1px solid var(--border); }
+  .badge { padding:1px 8px; border-radius:10px; font-size:10.5px;
+           border:1px solid var(--border); text-transform:uppercase;
+           letter-spacing:.04em; }
   .badge.risk_on { color:var(--green); border-color:var(--green); }
   .badge.neutral { color:var(--amber); border-color:var(--amber); }
-  .badge.risk_off, .badge.stress { color:var(--red); border-color:var(--red); }
-  .kill { background:#3d1214; border:1px solid var(--red); color:var(--red);
-          padding:6px 10px; border-radius:6px; margin:4px 0; font-size:12px; }
-  button { background:#21262d; color:var(--text); border:1px solid var(--border);
-           border-radius:6px; padding:4px 10px; cursor:pointer; font:inherit; font-size:12px; }
-  button:hover { border-color:var(--blue); }
-  button.ok { color:var(--green); } button.no { color:var(--red); }
+  .badge.risk_off,.badge.stress { color:var(--red); border-color:var(--red); }
+  .badge.production { color:var(--green); border-color:var(--green); }
+  .badge.probation { color:var(--amber); border-color:var(--amber); }
+  .badge.experimental { color:var(--purple); border-color:var(--purple); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+           gap:10px; }
+  .card { background:var(--panel2); border:1px solid var(--border);
+          border-radius:8px; padding:10px 12px; }
+  .card b { display:block; font-size:19px; font-weight:650; }
+  .card span { color:var(--dim); font-size:10.5px; text-transform:uppercase;
+               letter-spacing:.06em; }
   input[type=number], input[type=text], select {
-    background:#0d1117; color:var(--text); border:1px solid var(--border);
-    border-radius:4px; padding:3px 6px; width:80px; font:inherit; font-size:12px; }
-  input[type=text] { width:220px; }
-  canvas { width:100%; height:120px; }
-  .proj { font-size:15px; }
-  .proj .apr { font-size:26px; font-weight:bold; }
-  .note { color:var(--dim); font-size:12px; margin-top:6px; }
-  #toast { position:fixed; bottom:16px; right:16px; background:#21262d;
+    background:#0b0e14; color:var(--text); border:1px solid var(--border);
+    border-radius:5px; padding:4px 7px; width:90px; font:inherit; font-size:12px; }
+  input[type=text] { width:230px; }
+  canvas { width:100%; height:130px; }
+  .proj .apr { font-size:26px; font-weight:700; }
+  #toast { position:fixed; bottom:16px; right:16px; background:#1d2432;
            border:1px solid var(--border); padding:10px 14px; border-radius:8px;
-           display:none; max-width:420px; white-space:pre-wrap; }
+           display:none; max-width:440px; white-space:pre-wrap; z-index:10;
+           font-size:12.5px; }
+  .kv td:first-child { color:var(--dim); width:56%; }
 </style>
 </head>
 <body>
-<header>
-  <h1>⚒ SpecForge</h1>
-  <div class="stat"><b id="equity">—</b><span>equity</span></div>
-  <div class="stat"><b id="cash">—</b><span>cash</span></div>
-  <div class="stat"><b id="daypnl">—</b><span>day P&L</span></div>
-  <div class="stat"><b id="dd">—</b><span>drawdown</span></div>
-  <div class="stat"><b id="budget">—</b><span>cycle budget</span></div>
-  <div class="stat"><b id="regime">—</b><span>regime</span></div>
-  <div class="stat"><b id="mode">—</b><span>mode</span></div>
-  <div class="stat"><b id="aispend">—</b><span>AI spend today</span></div>
-  <div style="margin-left:auto"><button onclick="scanNow()">▶ scan now</button></div>
-</header>
+<div id="top">
+  <span id="brand">⚒ SpecForge</span>
+  <span class="chip" id="modechip">—</span>
+  <span id="strip" style="display:flex;gap:14px;flex-wrap:wrap"></span>
+  <span id="countdown">—</span>
+  <button class="primary" onclick="scanNow()">▶ Scan now</button>
+</div>
+<div id="alerts"></div>
+<div id="tabs">
+  <div data-p="overview" class="on">Overview</div>
+  <div data-p="trading">Trading</div>
+  <div data-p="switchboard">Switchboard</div>
+  <div data-p="risk">Risk &amp; Budget</div>
+  <div data-p="activity">Activity</div>
+</div>
 <main>
-  <section class="wide" id="killbox" style="display:none"><h2>Kill switches</h2><div id="kills"></div></section>
-
+<!-- ============ OVERVIEW ============ -->
+<div class="page" data-page="overview">
+  <section class="wide">
+    <h2>Account</h2>
+    <p class="explain">Live snapshot of the account this engine controls. Cycle budget = the most it may deploy in the next scan (worst-case loss cap per time step).</p>
+    <div class="cards" id="acct"></div>
+  </section>
   <section>
     <h2>Projected strategy return</h2>
+    <p class="explain">Bootstrapped from every measured trade (backtest → paper → live). The interval and confidence label are the point — a naked number would be a lie.</p>
     <div class="proj" id="projection">—</div>
-    <div class="note" id="projnote"></div>
+    <div class="explain" id="projnote"></div>
   </section>
-
   <section>
-    <h2>Portfolio Monte Carlo (20d, 2000 paths)</h2>
-    <canvas id="mc" height="120"></canvas>
-    <div class="note" id="mcnote">—</div>
+    <h2>Regime</h2>
+    <p class="explain">Macro gate: trend + VIX + breadth decide how much of the budget is deployable. Stress = no new entries at all.</p>
+    <div id="regimebox">—</div>
   </section>
-
   <section class="wide">
     <h2>Equity curve</h2>
-    <canvas id="curve" height="120"></canvas>
+    <p class="explain">Marked once per scan cycle. Source: <span id="curvesrc">paper</span> account.</p>
+    <canvas id="curve" height="130"></canvas>
   </section>
-
   <section>
-    <h2>Open positions</h2>
-    <table id="positions"><thead><tr><th>sym</th><th>qty</th><th>avg</th><th>last</th><th>P&L%</th><th>value</th></tr></thead><tbody></tbody></table>
+    <h2>Portfolio Monte Carlo — next 20 sessions</h2>
+    <p class="explain">2,000 simulated paths of the current holdings (green p95 / blue median / red p5).</p>
+    <canvas id="mc" height="130"></canvas>
+    <div class="explain" id="mcnote">—</div>
   </section>
-
   <section>
-    <h2>Pending approvals (big bets)</h2>
-    <table id="approvals"><thead><tr><th>sym</th><th>side</th><th>qty</th><th>limit</th><th>notional</th><th></th></tr></thead><tbody></tbody></table>
-    <div class="note">Orders above the approval threshold wait here; everything else runs autonomously.</div>
+    <h2>Broker connection</h2>
+    <p class="explain">Paper needs nothing. Live trading = connect Robinhood, whitelist the agentic account, and pass the triple gate.</p>
+    <div id="brokerbox">—</div>
   </section>
-
+</div>
+<!-- ============ TRADING ============ -->
+<div class="page" data-page="trading" style="display:none">
   <section class="wide">
-    <h2>Candidate trades (latest scan)</h2>
-    <table id="candidates"><thead><tr>
-      <th>sym</th><th>score</th><th>exp return (horizon)</th><th>80% interval</th>
-      <th>P(&gt;0)</th><th>APR (secondary)</th><th>days</th><th>conf</th><th>nodes</th>
-    </tr></thead><tbody></tbody></table>
+    <h2>Open positions</h2>
+    <p class="explain">Marked with live quotes when available (source + age shown). Stops and time stops are enforced by the engine at each scan, not intraday.</p>
+    <table id="positions"><thead><tr><th>symbol</th><th>qty</th><th>avg cost</th><th>mark</th><th>src</th><th>P&amp;L %</th><th>P&amp;L $</th><th>value</th></tr></thead><tbody></tbody></table>
   </section>
-
+  <section class="wide">
+    <h2>Candidates — latest scan</h2>
+    <p class="explain">What the ensemble wants, before risk gating. Horizon return with 80% interval; APR is secondary because annualizing short trades amplifies noise. Hover a row for the thesis.</p>
+    <table id="candidates"><thead><tr><th>sym</th><th>score</th><th>exp return</th><th>80% interval</th><th>P(&gt;0)</th><th>days</th><th>conf</th><th>contributing nodes</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Approvals — big bets waiting on you</h2>
+    <p class="explain">Orders above the approval threshold. They expire unanswered after the timeout.</p>
+    <table id="approvals"><thead><tr><th>sym</th><th>side</th><th>qty</th><th>limit</th><th>notional</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Recent closed trades</h2>
+    <p class="explain">Round-trips with exit reasons — the raw material of the learning loop.</p>
+    <table id="trades"><thead><tr><th>sym</th><th>exit</th><th>ret</th><th>reason</th><th>nodes</th></tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<!-- ============ SWITCHBOARD ============ -->
+<div class="page" data-page="switchboard" style="display:none">
   <section class="wide">
     <h2>Signal switchboard</h2>
-    <table id="nodes"><thead><tr>
-      <th>on</th><th>node</th><th>status</th><th>base w</th><th>learned ×</th>
-      <th>trades</th><th>expectancy</th><th>win rate</th><th>ai</th>
-    </tr></thead><tbody></tbody></table>
+    <p class="explain">Each node is one strategy. Base weight × learned multiplier = its ensemble voice. Expectancy/win-rate come from closed trades it contributed to. The engine can only nudge multipliers within 0.3–2.0× and auto-disable clear losers — promotions are yours.</p>
+    <table id="nodes"><thead><tr><th>on</th><th>node</th><th>what it does</th><th>status</th><th>base w</th><th>learned ×</th><th>trades</th><th>expectancy</th><th>win</th></tr></thead><tbody></tbody></table>
   </section>
-
+  <section class="wide">
+    <h2>Promotion proposals</h2>
+    <p class="explain">The system proposes status upgrades when a node earns them; a human applies them (edit the node's status in configs/default.yaml after reviewing).</p>
+    <div id="proposals" class="mono dim">none yet</div>
+  </section>
+</div>
+<!-- ============ RISK ============ -->
+<div class="page" data-page="risk" style="display:none">
   <section>
     <h2>Risk controls</h2>
-    <table id="risk"><tbody></tbody></table>
-    <button onclick="saveRisk()">save risk settings</button>
-    <div class="note">Dangerous values are rejected by the governor (advanced_override only via config file).</div>
+    <p class="explain">These bind the engine — the governor enforces them on every order. $ column shows each limit at current equity. Dangerous values are rejected.</p>
+    <table id="risk" class="kv"><tbody></tbody></table>
+    <button onclick="saveRisk()">Save risk settings</button>
   </section>
-
   <section>
     <h2>AI &amp; cost meter</h2>
-    <table><tbody id="ai">
+    <p class="explain">AI only enriches signals — it can never place trades or bypass the governor. The ledger reserves a task's full cost up front and skips work when the daily budget is spent.</p>
+    <table class="kv"><tbody id="ai">
       <tr><td>AI enabled</td><td><input type="checkbox" id="ai_enabled"></td></tr>
-      <tr><td>model</td><td><input type="text" id="ai_model"></td></tr>
+      <tr><td>model (OpenRouter id)</td><td><input type="text" id="ai_model"></td></tr>
       <tr><td>daily budget $</td><td><input type="number" step="0.25" id="ai_budget"></td></tr>
       <tr><td>spend today</td><td id="ai_today">—</td></tr>
-      <tr><td>est. $/day (enabled AI nodes)</td><td id="ai_est">—</td></tr>
-      <tr><td>friction (round trip)</td><td id="friction">—</td></tr>
+      <tr><td>estimated $/day (enabled AI nodes)</td><td id="ai_est">—</td></tr>
+      <tr><td>trading friction (round trip)</td><td id="friction">—</td></tr>
     </tbody></table>
-    <button onclick="saveAI()">save AI settings</button>
+    <button onclick="saveAI()">Save AI settings</button>
   </section>
-
+</div>
+<!-- ============ ACTIVITY ============ -->
+<div class="page" data-page="activity" style="display:none">
   <section class="wide">
-    <h2>Audit log (latest)</h2>
+    <h2>Audit log</h2>
+    <p class="explain">Append-only record of every decision. Any trade is reconstructable from here.</p>
+    <select id="auditfilter" onchange="refreshAudit()">
+      <option value="">all events</option><option>risk_decision</option>
+      <option>order_filled</option><option>kill_switch_tripped</option>
+      <option>cycle_end</option><option>config_override</option>
+      <option>node_degraded</option><option>scheduler_error</option>
+      <option>weight_update</option><option>broker_review</option>
+    </select>
     <table id="audit"><tbody></tbody></table>
   </section>
+</div>
 </main>
 <div id="toast"></div>
 <script>
 const $ = id => document.getElementById(id);
-const fmt$ = v => v==null ? '—' : '$'+Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
+const fmt$ = v => v==null ? '—' : (v<0?'-':'')+'$'+Math.abs(Number(v)).toLocaleString(undefined,{maximumFractionDigits:2});
 const pct = (v,d=1) => v==null ? '—' : (v*100).toFixed(d)+'%';
 const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
-function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block';
-  setTimeout(()=>t.style.display='none', 4000); }
-async function api(path, opts){ const r = await fetch(path, opts);
-  if(!r.ok){ toast('error: '+(await r.text())); throw new Error(path); } return r.json(); }
-async function post(path, body){ return api(path, {method:'POST',
-  headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); }
+function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';
+  setTimeout(()=>t.style.display='none',4500);}
+async function api(p,o){const r=await fetch(p,o);
+  if(!r.ok){toast('error: '+(await r.text()).slice(0,300));throw new Error(p);}return r.json();}
+async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
 
-function line(canvas, series, labels){   // minimal multi-line chart
-  const c = canvas, x = c.getContext('2d'), W = c.width = c.offsetWidth, H = c.height;
+/* tabs */
+document.querySelectorAll('#tabs div').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('#tabs div').forEach(x=>x.classList.remove('on'));
+  t.classList.add('on');
+  document.querySelectorAll('.page').forEach(p=>
+    p.style.display = p.dataset.page===t.dataset.p ? 'contents' : 'none');});
+
+const NODE_DESC = {
+  momentum:'12-1 momentum + trend + relative strength; the workhorse (+0.95%/trade over 10y backtest)',
+  sector_rotation:'leans into leading sector ETFs, avoids lagging ones',
+  earnings_drift:'rides post-earnings underreaction after a real beat + positive reaction',
+  reversal:'oversold snapback in uptrends (flat in backtests — off by default)',
+  quality_value:'veto filter: blocks fundamentally broken names, adds no score',
+  news_sentiment:'AI classifies headlines into catalysts; deterministic logic scores them',
+  congress_trades:'politician disclosure clusters, filing-date keyed, slow thematic tilt',
+  insider:'insider cluster BUYS (selling is noise, buying is signal)',
+  options_vol:'converts the top conviction into a bounded-premium long call (unlocks ~$5k)',
+};
+
+function line(canvas, series){
+  const c=canvas,x=c.getContext('2d'),W=c.width=c.offsetWidth,H=c.height;
   x.clearRect(0,0,W,H);
-  const all = series.flatMap(s=>s.data); if(!all.length) return;
-  const lo = Math.min(...all), hi = Math.max(...all), pad = (hi-lo)||1;
-  series.forEach(s=>{ x.beginPath(); x.strokeStyle = s.color; x.lineWidth = s.w||1.5;
-    s.data.forEach((v,i)=>{ const px = i/(s.data.length-1||1)*W,
-      py = H-6-((v-lo)/pad)*(H-12); i?x.lineTo(px,py):x.moveTo(px,py); }); x.stroke(); });
-  x.fillStyle = '#8b949e'; x.font = '10px monospace';
-  x.fillText(hi.toFixed(0), 4, 10); x.fillText(lo.toFixed(0), 4, H-2);
+  const all=series.flatMap(s=>s.data); if(!all.length)return;
+  const lo=Math.min(...all),hi=Math.max(...all),pad=(hi-lo)||1;
+  series.forEach(s=>{x.beginPath();x.strokeStyle=s.color;x.lineWidth=s.w||1.5;
+    s.data.forEach((v,i)=>{const px=i/(s.data.length-1||1)*W,
+      py=H-8-((v-lo)/pad)*(H-16);i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();});
+  x.fillStyle='#7d8799';x.font='10px monospace';
+  x.fillText(hi.toFixed(0),4,10);x.fillText(lo.toFixed(0),4,H-2);
 }
 
+/* ---------- top bar: market strip + countdown ---------- */
+let scanTimes=[], tzName='America/New_York';
+function nextScanText(){
+  if(!scanTimes.length) return '—';
+  const now=new Date();
+  const etNow=new Intl.DateTimeFormat('en-GB',{timeZone:tzName,hour:'2-digit',
+    minute:'2-digit',weekday:'short'}).formatToParts(now);
+  const wd=etNow.find(p=>p.type==='weekday').value;
+  const hm=etNow.find(p=>p.type==='hour').value+':'+etNow.find(p=>p.type==='minute').value;
+  const weekend=(wd==='Sat'||wd==='Sun');
+  const upcoming=scanTimes.filter(t=>t>hm);
+  if(!weekend && upcoming.length) return `next scan ${upcoming[0]} ET`;
+  return `next scan ${scanTimes[0]} ET ${weekend?'Monday':'tomorrow'}`;
+}
+async function refreshMarket(){
+  const m = await api('/api/market');
+  scanTimes = m.scan_times||[]; tzName = m.timezone||tzName;
+  $('countdown').textContent = nextScanText();
+  $('strip').innerHTML = Object.entries(m.strip||{}).map(([s,q])=>
+    `<span class="tick" title="source: ${q.source} · as of ${q.as_of}">
+       <span class="dim">${s.replace('^','')}</span><b>${q.price}</b>
+       <span class="${cls(q.change_pct)}">${q.change_pct==null?'':pct(q.change_pct)}</span></span>`).join('');
+  $('regimebox').innerHTML = `<span class="badge ${m.regime}">${m.regime}</span>
+    <b> ×${m.deployment_multiplier}</b> deployment<br>
+    <span class="dim" style="font-size:11.5px">${(m.regime_evidence||[]).join(' · ')}</span>
+    <br><span class="dim" style="font-size:11.5px">breadth &gt;50sma: ${m.breadth_above_50sma==null?'—':pct(m.breadth_above_50sma,0)}</span>`;
+}
+
+/* ---------- overview ---------- */
 async function refreshStatus(){
   const s = await api('/api/status');
-  $('equity').textContent = fmt$(s.equity);
-  $('cash').textContent = fmt$(s.cash);
-  $('daypnl').textContent = s.day_pnl==null?'—':fmt$(s.day_pnl);
-  $('daypnl').className = cls(s.day_pnl);
-  $('dd').textContent = pct(s.drawdown_from_peak);
-  $('budget').textContent = fmt$(s.cycle_budget);
-  $('regime').innerHTML = `<span class="badge ${s.regime}">${s.regime}</span> ×${s.deployment_multiplier}`;
-  $('mode').textContent = s.mode + ' / ' + s.broker + (s.options_unlocked?' · options ✓':' · options locked');
-  $('aispend').textContent = fmt$(s.ai_spend_today);
-  const kills = Object.entries(s.kill_switches||{});
-  $('killbox').style.display = kills.length?'block':'none';
-  $('kills').innerHTML = kills.map(([k,v])=>
-    `<div class="kill">⛔ ${k}: ${v.reason} <button onclick="post('/api/kill/${k}/reset',{}).then(refreshAll)">reset</button></div>`).join('');
-  const tb = $('positions').tBodies[0];
-  tb.innerHTML = (s.positions||[]).map(p=>`<tr><td>${p.symbol}</td><td>${p.qty}</td>
-    <td>${p.avg_cost}</td><td>${p.last??'—'}</td>
-    <td class="${cls(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td>${fmt$(p.value)}</td></tr>`).join('')
-    || '<tr><td colspan=6 class="dim">no open positions</td></tr>';
-  const pr = s.projection||{};
+  $('modechip').textContent = `${s.mode} · ${s.broker}` + (s.options_unlocked?' · options ✓':'');
+  $('acct').innerHTML = [
+    ['equity', fmt$(s.equity)], ['cash', fmt$(s.cash)],
+    ['day P&L', `<span class="${cls(s.day_pnl)}">${s.day_pnl==null?'—':fmt$(s.day_pnl)}</span>`],
+    ['drawdown', pct(s.drawdown_from_peak)],
+    ['cycle budget', fmt$(s.cycle_budget)],
+    ['AI spend today', fmt$(s.ai_spend_today)],
+  ].map(([k,v])=>`<div class="card"><b>${v}</b><span>${k}</span></div>`).join('');
+  /* alerts */
+  const alerts=[];
+  for(const [k,v] of Object.entries(s.kill_switches||{}))
+    alerts.push(`<div class="alert">⛔ kill switch <b>${k}</b>: ${v.reason}
+      <button onclick="post('/api/kill/${k}/reset',{}).then(refreshAll)">reset</button></div>`);
+  const pend = window._pendApprovals||0;
+  if(pend) alerts.push(`<div class="alert warn">✋ ${pend} order(s) waiting for approval — Trading tab</div>`);
+  $('alerts').innerHTML = alerts.join('');
+  /* positions (Trading tab) */
+  $('positions').tBodies[0].innerHTML = (s.positions||[]).map(p=>`<tr>
+    <td><b>${p.symbol}</b></td><td>${p.qty}</td><td>${p.avg_cost}</td>
+    <td>${p.last}</td><td class="dim" title="${p.quote_as_of||''}">${p.quote_source}</td>
+    <td class="${cls(p.pnl_pct)}">${pct(p.pnl_pct)}</td>
+    <td class="${cls(p.pnl_usd)}">${fmt$(p.pnl_usd)}</td><td>${fmt$(p.value)}</td></tr>`).join('')
+    || '<tr><td colspan=8 class="dim">no open positions — the engine says "no trade" when it lacks conviction</td></tr>';
+  const pr=s.projection||{};
   if(pr.apr!=null){
     $('projection').innerHTML = `<span class="apr ${cls(pr.apr)}">${pct(pr.apr)}</span> APR
-      <span class="dim">80% interval</span> ${pct(pr.apr_ci_low)} … ${pct(pr.apr_ci_high)}
-      · P(win trade) ${pct(pr.prob_positive_trade,0)} ·
-      <span class="badge">${pr.confidence} confidence</span>`;
-    $('projnote').textContent = `basis: ${JSON.stringify(pr.basis)} — ${pr.n_trades} closed trades. `+
-      `Horizon returns are the primary number; annualization amplifies noise.`;
-  } else { $('projection').textContent = '—'; $('projnote').textContent = pr.note||''; }
+      &nbsp;<span class="dim">80% interval</span> ${pct(pr.apr_ci_low)} … ${pct(pr.apr_ci_high)}
+      &nbsp;·&nbsp;P(win) ${pct(pr.prob_positive_trade,0)}
+      &nbsp;<span class="badge">${pr.confidence} confidence</span>`;
+    $('projnote').textContent = `basis: ${Object.entries(pr.basis||{}).map(([k,v])=>`${v} ${k}`).join(', ')} trades`;
+  } else { $('projection').textContent='—'; $('projnote').textContent=pr.note||''; }
+}
+async function refreshBroker(){
+  const b = await api('/api/broker/status');
+  const p = b.probe||{};
+  let html = `<table class="kv"><tbody>
+    <tr><td>configured broker</td><td>${b.configured_broker}</td></tr>
+    <tr><td>live gate</td><td class="${b.live_gate_ok?'pos':'neg'}">${b.live_gate_ok?'OPEN':'closed'} — ${b.live_gate_reason}</td></tr>
+    <tr><td>Robinhood connection</td><td>${p.state||'never attempted'}</td></tr>`;
+  if(p.state==='error') html += `<tr><td>error</td><td class="neg" style="font-size:11px">${p.error}</td></tr>`;
+  if(p.accounts) html += `<tr><td>accounts</td><td class="mono" style="font-size:11px">${
+    p.accounts.map(a=>`${a.account_number} ${a.agentic_allowed?'✓ agentic':'✗ not agentic'}`).join('<br>')}</td></tr>
+    <tr><td>whitelisted</td><td class="mono">${p.whitelist||'<span class="neg">EMPTY — set RH_ACCOUNT_WHITELIST in .env</span>'}</td></tr>`;
+  html += `</tbody></table>
+    <button class="primary" onclick="connectRH()">🔗 Connect Robinhood</button>
+    <span class="explain"> opens Robinhood's OAuth login in your browser; if it errors with a registration/allowlist message, use the bridge (scripts/bridge_prompt.md).</span>`;
+  $('brokerbox').innerHTML = html;
+}
+async function connectRH(){
+  await post('/api/broker/connect',{});
+  toast('OAuth starting — watch for a browser window. This card refreshes automatically.');
+  let n=0; const iv=setInterval(async()=>{ await refreshBroker(); if(++n>20) clearInterval(iv); },3000);
 }
 
+/* ---------- trading ---------- */
 async function refreshCandidates(){
   const cands = await api('/api/candidates');
-  $('candidates').tBodies[0].innerHTML = cands.map(c=>`<tr>
+  $('candidates').tBodies[0].innerHTML = cands.map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
     <td><b>${c.symbol}</b></td><td>${c.final_score}</td>
     <td class="${cls(c.expected_return)}">${pct(c.expected_return)}</td>
     <td class="dim">${pct(c.ci_low)} … ${pct(c.ci_high)}</td>
-    <td>${pct(c.probability_positive,0)}</td>
-    <td class="dim">${pct(c.expected_apr,0)} (${pct(c.apr_ci_low,0)}…${pct(c.apr_ci_high,0)})</td>
-    <td>${c.horizon_days}</td><td>${c.confidence_label}</td>
+    <td>${pct(c.probability_positive,0)}</td><td>${c.horizon_days}</td>
+    <td>${c.confidence_label}</td>
     <td class="dim">${(c.contributing_nodes||[]).join(', ')}</td></tr>`).join('')
-    || '<tr><td colspan=9 class="dim">no candidates in latest scan — "no trade" is a feature</td></tr>';
+    || '<tr><td colspan=8 class="dim">no candidates in latest scan</td></tr>';
 }
-
 async function refreshApprovals(){
   const rows = await api('/api/approvals');
+  window._pendApprovals = rows.length;
   $('approvals').tBodies[0].innerHTML = rows.map(a=>`<tr>
     <td>${a.symbol}</td><td>${a.side}</td><td>${a.qty}</td><td>${a.limit_price}</td>
     <td>${fmt$(a.notional)}</td>
@@ -213,100 +360,137 @@ async function refreshApprovals(){
         <button class="no" onclick="decide('${a.intent_id}','rejected')">reject</button></td></tr>`).join('')
     || '<tr><td colspan=6 class="dim">queue empty</td></tr>';
 }
-async function decide(id, d){ await post('/api/approvals/'+id, {decision:d}); refreshApprovals(); }
+async function decide(id,d){await post('/api/approvals/'+id,{decision:d});refreshApprovals();}
+async function refreshTrades(){
+  const rows = await api('/api/trades?limit=15');
+  $('trades').tBodies[0].innerHTML = rows.map(t=>`<tr>
+    <td><b>${t.symbol}</b></td><td class="dim">${t.exit_date}</td>
+    <td class="${cls(t.ret)}">${pct(t.ret)}</td>
+    <td class="dim">${(t.exit_reason||'').split(' ')[0]}</td>
+    <td class="dim" style="font-size:11px">${JSON.parse(t.nodes||'[]').join(', ')}</td></tr>`).join('')
+    || '<tr><td colspan=5 class="dim">no closed trades yet</td></tr>';
+}
 
+/* ---------- switchboard ---------- */
 async function refreshNodes(){
   const nodes = await api('/api/nodes');
   $('nodes').tBodies[0].innerHTML = nodes.map(n=>`<tr>
     <td><input type="checkbox" ${n.enabled?'checked':''}
          onchange="post('/api/nodes/${n.id}',{enabled:this.checked}).then(refreshNodes)"></td>
-    <td><b>${n.id}</b></td><td>${n.status||''}${n.role?' · '+n.role:''}</td>
-    <td>${n.role==='filter'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
+    <td><b>${n.id}</b>${n.ai?' 🤖':''}</td>
+    <td class="dim" style="font-size:11.5px;max-width:340px">${NODE_DESC[n.id]||''}</td>
+    <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}</td>
+    <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
          onchange="post('/api/nodes/${n.id}',{weight:parseFloat(this.value)})">`}</td>
-    <td>${(n.weight_multiplier??1).toFixed(2)}</td>
-    <td>${n.n_trades}</td>
+    <td>${(n.weight_multiplier??1).toFixed(2)}</td><td>${n.n_trades}</td>
     <td class="${cls(n.expectancy)}">${n.expectancy==null?'—':pct(n.expectancy)}</td>
-    <td>${n.win_rate==null?'—':pct(n.win_rate,0)}</td>
-    <td>${n.ai?'🤖':''}</td></tr>`).join('');
+    <td>${n.win_rate==null?'—':pct(n.win_rate,0)}</td></tr>`).join('');
+  const props = await api('/api/proposals');
+  $('proposals').innerHTML = (props&&props.length) ? props.map(p=>
+    `<div>⬆ <b>${p.node_id}</b>: ${p.from} → ${p.to} (n=${p.basis.n}, expectancy ${pct(p.basis.expectancy)})</div>`).join('')
+    : '<span class="dim">none yet — proposals appear after nodes accumulate enough closed trades</span>';
 }
 
-const RISK_FIELDS = ['time_step_budget_pct','time_step_budget_abs_cap','max_single_equity_position',
-  'max_account_deployment','max_daily_new_positions','max_open_positions','max_daily_loss',
-  'max_weekly_loss','kill_switch_drawdown','approval_mode','approval_notional_threshold_pct','options_enabled'];
+/* ---------- risk & budget ---------- */
+const RISK_META = [
+  ['time_step_budget_pct','Budget per scan cycle (% of equity)', v=>true],
+  ['time_step_budget_abs_cap','Budget hard ceiling ($/cycle)', v=>false],
+  ['max_single_equity_position','Max single position (% of equity)', v=>true],
+  ['max_account_deployment','Max total deployed (%)', v=>true],
+  ['max_daily_new_positions','Max new positions per day', v=>false],
+  ['max_open_positions','Max open positions', v=>false],
+  ['max_daily_loss','Daily loss halt (%)', v=>true],
+  ['max_weekly_loss','Weekly loss halt (%)', v=>true],
+  ['kill_switch_drawdown','Drawdown kill switch (%)', v=>true],
+  ['approval_notional_threshold_pct','Approval needed above (% of equity)', v=>true],
+  ['approval_mode','Approval mode', null],
+  ['options_enabled','Options', null],
+];
+let _equityNow=0;
 async function refreshRisk(){
   const r = await api('/api/risk');
-  $('risk').tBodies[0].innerHTML = RISK_FIELDS.map(k=>{
-    const v = r[k];
-    const input = (k==='approval_mode')
-      ? `<select id="rk_${k}"><option${v==='auto'?' selected':''}>auto</option>
-         <option${v==='threshold'?' selected':''}>threshold</option>
-         <option${v==='all'?' selected':''}>all</option></select>`
-      : (k==='options_enabled')
-      ? `<select id="rk_${k}"><option${v==='auto'?' selected':''}>auto</option>
-         <option${v===true?' selected':''}>true</option>
-         <option${v===false?' selected':''}>false</option></select>`
-      : `<input type="number" step="any" id="rk_${k}" value="${v}">`;
-    return `<tr><td>${k}</td><td>${input}</td></tr>`; }).join('');
+  $('risk').tBodies[0].innerHTML = RISK_META.map(([k,label,isPct])=>{
+    const v=r[k];
+    let input;
+    if(k==='approval_mode') input=`<select id="rk_${k}">
+      <option${v==='auto'?' selected':''}>auto</option>
+      <option${v==='threshold'?' selected':''}>threshold</option>
+      <option${v==='all'?' selected':''}>all</option></select>`;
+    else if(k==='options_enabled') input=`<select id="rk_${k}">
+      <option${v==='auto'?' selected':''}>auto</option>
+      <option${v===true?' selected':''}>true</option>
+      <option${v===false?' selected':''}>false</option></select>`;
+    else input=`<input type="number" step="any" id="rk_${k}" value="${v}">`;
+    const usd = (isPct && typeof v==='number' && _equityNow) ?
+      `<span class="dim"> ≈ ${fmt$(v*_equityNow)}</span>` : '';
+    return `<tr><td>${label}</td><td>${input}${usd}</td></tr>`;}).join('');
 }
 async function saveRisk(){
-  const body = {};
-  for(const k of RISK_FIELDS){ const el = $('rk_'+k); if(!el) continue;
-    let v = el.value;
+  const body={};
+  for(const [k] of RISK_META){const el=$('rk_'+k);if(!el)continue;
+    let v=el.value;
     if(k==='options_enabled') v = v==='auto'?'auto':v==='true';
-    else if(k!=='approval_mode') v = parseFloat(v);
-    body[k] = v; }
-  await post('/api/risk', body); toast('risk settings saved (audit-logged)');
+    else if(k!=='approval_mode') v=parseFloat(v);
+    body[k]=v;}
+  await post('/api/risk',body); toast('risk settings saved (audit-logged)'); refreshRisk();
 }
-
 async function refreshCosts(){
   const c = await api('/api/costs');
-  $('ai_enabled').checked = c.ai_enabled; $('ai_model').value = c.ai_model||'';
-  $('ai_budget').value = c.ai_daily_budget_usd??1;
-  $('ai_today').textContent = fmt$(c.ai_spend_today);
-  $('ai_est').textContent = fmt$(c.estimated_daily_total) +
-    (Object.keys(c.estimated_daily_by_node).length ?
-     '  ('+Object.entries(c.estimated_daily_by_node).map(([k,v])=>`${k} ${fmt$(v)}`).join(', ')+')' : '');
-  $('friction').textContent = c.friction_round_trip_bps + ' bps';
+  $('ai_enabled').checked=c.ai_enabled;$('ai_model').value=c.ai_model||'';
+  $('ai_budget').value=c.ai_daily_budget_usd??1;
+  $('ai_today').textContent=fmt$(c.ai_spend_today);
+  $('ai_est').textContent=fmt$(c.estimated_daily_total)+
+    (Object.keys(c.estimated_daily_by_node||{}).length?
+     ' ('+Object.entries(c.estimated_daily_by_node).map(([k,v])=>`${k} ${fmt$(v)}`).join(', ')+')':'');
+  $('friction').textContent=c.friction_round_trip_bps+' bps';
 }
 async function saveAI(){
-  await post('/api/ai', {enabled:$('ai_enabled').checked, model:$('ai_model').value,
-                         daily_budget_usd:parseFloat($('ai_budget').value)});
-  toast('AI settings saved'); refreshCosts();
+  await post('/api/ai',{enabled:$('ai_enabled').checked,model:$('ai_model').value,
+    daily_budget_usd:parseFloat($('ai_budget').value)});
+  toast('AI settings saved');refreshCosts();
 }
 
+/* ---------- charts / activity ---------- */
 async function refreshCurve(){
-  const rows = await api('/api/equity_curve');
-  line($('curve'), [{data: rows.map(r=>r.equity), color:'#58a6ff'}]);
+  const rows=await api('/api/equity_curve');
+  if(rows.length){_equityNow=rows[rows.length-1].equity;}
+  line($('curve'),[{data:rows.map(r=>r.equity),color:'#5aa2f7',w:2}]);
 }
 async function refreshMC(){
   try{
-    const mc = await api('/api/montecarlo');
-    const p = mc.percentile_paths||{};
-    line($('mc'), [{data:p.p95||[], color:'#3fb950'},
-                   {data:p.p50||[], color:'#58a6ff', w:2},
-                   {data:p.p5||[],  color:'#f85149'}]);
-    $('mcnote').textContent = `median ${fmt$(mc.median_terminal_equity)} · 90% range `+
+    const mc=await api('/api/montecarlo');
+    const p=mc.percentile_paths||{};
+    line($('mc'),[{data:p.p95||[],color:'#41c56f'},{data:p.p50||[],color:'#5aa2f7',w:2},
+                  {data:p.p5||[],color:'#f0555f'}]);
+    $('mcnote').textContent=`median ${fmt$(mc.median_terminal_equity)} · 90% range `+
       `${fmt$(mc.ci_5)}–${fmt$(mc.ci_95)} · P(loss) ${pct(mc.probability_loss,0)} · `+
-      `E[maxDD] ${pct(mc.expected_max_drawdown)}`;
-  }catch(e){ $('mcnote').textContent = 'n/a'; }
+      `E[max drawdown] ${pct(mc.expected_max_drawdown)}`;
+  }catch(e){$('mcnote').textContent='n/a (no open positions)';}
 }
 async function refreshAudit(){
-  const rows = await api('/api/audit?limit=30');
-  $('audit').tBodies[0].innerHTML = rows.map(r=>`<tr><td class="dim">${(r.ts||'').slice(5,19)}</td>
-    <td>${r.event_type}</td><td class="dim">${(r.payload||'').slice(0,160)}</td></tr>`).join('');
+  const f=$('auditfilter').value;
+  const rows=await api('/api/audit?limit=120');
+  $('audit').tBodies[0].innerHTML=rows
+    .filter(r=>!f||r.event_type===f).slice(0,40).map(r=>`<tr>
+    <td class="dim mono" style="font-size:11px">${(r.ts||'').slice(5,19)}</td>
+    <td>${r.event_type}</td>
+    <td class="dim mono" style="font-size:11px">${(r.payload||'').slice(0,170)}</td></tr>`).join('');
 }
 async function scanNow(){
   toast('scanning…');
-  const s = await post('/api/scan', {});
+  const s=await post('/api/scan',{});
   toast(`scan ${s.cycle_id}: ${s.signals} signals → ${s.candidates} candidates\n`+
-        `entries ${JSON.stringify(s.entries)} exits ${JSON.stringify(s.exits)}`);
+    `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
-function refreshAll(){ refreshStatus(); refreshCandidates(); refreshApprovals();
-  refreshNodes(); refreshRisk(); refreshCosts(); refreshCurve(); refreshMC(); refreshAudit(); }
+function refreshAll(){refreshMarket();refreshStatus();refreshBroker();refreshCandidates();
+  refreshApprovals();refreshTrades();refreshNodes();refreshRisk();refreshCosts();
+  refreshCurve();refreshMC();refreshAudit();}
 refreshAll();
-setInterval(()=>{ refreshStatus(); refreshApprovals(); refreshAudit(); }, 10000);
-setInterval(()=>{ refreshCandidates(); refreshCurve(); refreshMC(); refreshCosts(); }, 60000);
+setInterval(()=>{refreshStatus();refreshApprovals();},10000);
+setInterval(()=>{refreshMarket();},30000);
+setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
+  refreshCosts();refreshAudit();},60000);
 </script>
 </body>
 </html>

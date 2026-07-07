@@ -215,7 +215,7 @@ class Store:
         r = self.db.execute(
             "SELECT COUNT(*) c FROM orders WHERE symbol=? AND side=? "
             "AND created_at >= ? "
-            "AND status NOT IN ('rejected','expired','cancelled') "
+            "AND status NOT IN ('rejected','vetoed','expired','cancelled') "
             "AND datetime(created_at) >= datetime(?, ?)",
             (symbol, side, coarse, now, f"-{cooldown_min} minutes")).fetchone()
         return r["c"] > 0

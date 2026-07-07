@@ -104,6 +104,21 @@ Conclusion: default stack ships as-is; growth path is new nodes measured live
 v3's 1756 analog trades feed live error bars (restored after the aggressive
 run clobbered them — backtests that copy analogs must run LAST or re-copy).
 
+## D19. Governor vetoes ≠ broker rejections (2026-07-06)
+The rejected-orders kill switch livelocked: it counted the governor's healthy
+"no" decisions, and each trip caused more rejections next cycle. Governor
+vetoes now get order status `vetoed`; only broker-level `rejected` counts
+toward the storm switch (its actual purpose: runaway order loops at the
+broker). Vetoed orders are also excluded from the duplicate-cooldown check.
+
+## D20. Engine↔broker position mismatch guard (2026-07-06)
+Each cycle compares engine position metadata to broker truth. Broker wins:
+engine-only rows are closed (audited `position_mismatch`, no fake trade
+recorded); broker-only holdings are surfaced for the operator. Guarded
+against dead feeds (equity 0 + no positions ⇒ skip, don't wipe state).
+Found via a dev accident (DB deleted under a live server process — never
+`rm data/specforge.db` while anything is running).
+
 ## D16. Backtest v1 result (2026-07-06, dev/reports/backtest_v1.json)
 Per-trade engine works: PF 1.34, win 48%, avg win +6.5% vs avg loss -4.5%,
 momentum n=988 avg +0.74%/trade AFTER costs. Portfolio-level CAGR only 4%

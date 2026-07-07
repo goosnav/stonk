@@ -55,6 +55,14 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # 4. settle async fills from prior cycles, then exits (free budget before
     #    spending it)
     reconciled = executor.reconcile(cycle_id)
+    mismatches = _position_mismatch(store, account)
+    if mismatches:
+        # engine thinks it holds something the broker doesn't (or vice versa):
+        # trading blind on wrong state is how phantom orders happen. Close the
+        # orphan engine records, surface loudly, let the operator inspect.
+        store.audit("position_mismatch", mismatches, cycle_id)
+        for pid in mismatches.get("engine_only_ids", []):
+            store.close_position(pid)
     exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime)
 
     # 5. human-approved intents from the queue
@@ -127,6 +135,26 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     }
     store.audit("cycle_end", summary, cycle_id)
     return summary
+
+
+def _position_mismatch(store: Store, account) -> dict:
+    """Compare engine position metadata vs broker truth. Broker wins: engine
+    rows without broker backing get closed (audited, no trade recorded);
+    broker holdings the engine doesn't know are reported for the operator."""
+    if account.equity <= 0 and not account.positions:
+        return {}   # dead/missing feed (e.g. bridge snapshot absent) — don't
+                    # mistake "no data" for "no positions" and wipe state
+    broker_syms = {(p.option_symbol or p.symbol) for p in account.positions if p.qty > 0}
+    engine = store.open_positions()
+    engine_only = [p for p in engine
+                   if (p["option_symbol"] or p["symbol"]) not in broker_syms]
+    engine_syms = {(p["option_symbol"] or p["symbol"]) for p in engine}
+    broker_only = sorted(broker_syms - engine_syms)
+    if not engine_only and not broker_only:
+        return {}
+    return {"engine_only": [p["symbol"] for p in engine_only],
+            "engine_only_ids": [p["id"] for p in engine_only],
+            "broker_only_untracked": broker_only}
 
 
 def _check_exits(ctx: MarketContext, store: Store, executor: Executor,

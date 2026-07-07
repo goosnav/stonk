@@ -114,6 +114,7 @@ class Governor:
             self.trip("drawdown", f"equity {eq:.2f} is "
                                   f"{(1 - eq/peak):.1%} below peak {peak:.2f}",
                       auto_clear_days=cooldown)
+        # broker-level bounces only; governor vetoes carry status 'vetoed'
         rejected_today = len([o for o in self.store.orders_today(day=self.today)
                               if o["status"] == "rejected"])
         if rejected_today > self.r.get("max_rejected_orders_per_day", 5):
