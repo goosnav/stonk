@@ -38,6 +38,27 @@ RH_MCP_URL = "https://agent.robinhood.com/mcp/trading"
 TOKEN_PATH = Path.home() / ".specforge" / "rh_tokens.json"
 CALLBACK_PORT = 8425
 
+# Module-level read cache: the GUI polls status every 10s and adapters are
+# constructed per request — without this every poll fires several OAuth'd MCP
+# round-trips at Robinhood. Orders are NEVER cached; reads only.
+_READ_CACHE: dict[str, tuple[float, object]] = {}
+READ_TTL = 30.0
+
+
+def _cached(key: str, fn):
+    import time
+    hit = _READ_CACHE.get(key)
+    if hit and time.time() - hit[0] < READ_TTL:
+        return hit[1]
+    val = fn()
+    _READ_CACHE[key] = (time.time(), val)
+    return val
+
+
+def invalidate_read_cache() -> None:
+    """Called after any order placement so positions/cash refresh promptly."""
+    _READ_CACHE.clear()
+
 
 class BrokerAuthError(RuntimeError):
     """OAuth to the RH MCP failed — likely custom clients are not allowed.
@@ -225,6 +246,9 @@ class RobinhoodMCPBroker:
 
     # ---------------- BrokerAdapter ----------------
     def get_account(self) -> AccountState:
+        return _cached("account", self._get_account_uncached)
+
+    def _get_account_uncached(self) -> AccountState:
         acct = self._account()
         port = self._call("get_portfolio", {"account_number": acct})
         pos_res = self._call("get_equity_positions", {"account_number": acct})
@@ -250,6 +274,10 @@ class RobinhoodMCPBroker:
                             as_of=datetime.now().astimezone().isoformat())
 
     def get_quotes(self, symbols: list[str]) -> dict[str, float]:
+        return _cached("quotes:" + ",".join(sorted(symbols)),
+                       lambda: self._get_quotes_uncached(symbols))
+
+    def _get_quotes_uncached(self, symbols: list[str]) -> dict[str, float]:
         res = self._call("get_equity_quotes", {"symbols": symbols})
         out = {}
         for row in _first(res, "results", "quotes", default=[]) or []:
@@ -305,6 +333,7 @@ class RobinhoodMCPBroker:
         import uuid as _uuid
         args["ref_id"] = str(_uuid.uuid5(_uuid.NAMESPACE_URL, intent.idempotency_key))
         res = self._call("place_equity_order", args)
+        invalidate_read_cache()          # cash/positions changed
         order = _first(res, "order", default=res)
         broker_id = _first(order, "id", "order_id")
         self.store.update_order(intent.id, broker_order_id=broker_id)
