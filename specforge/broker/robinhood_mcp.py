@@ -287,6 +287,14 @@ class RobinhoodMCPBroker:
         alerts = _first(res, "alerts", "warnings", "pre_trade_alerts", default=[]) or []
         warnings = [str(_first(a, "message", "title", default=a))[:200] for a in alerts] \
             if isinstance(alerts, list) else [str(alerts)[:200]]
+        # live shape (observed 2026-07-06): pre-trade alerts arrive as
+        # order_checks.alertType. Anything not explicitly known-benign counts
+        # as a warning — unknown broker signals must never pass silently.
+        checks = res.get("order_checks") or {}
+        alert_type = checks.get("alertType") if isinstance(checks, dict) else str(checks)
+        benign = {None, "", "EQUITY_OVERNIGHT_MARKET_BUY_FTUX_POPUP"}  # informational FTUX
+        if alert_type not in benign:
+            warnings.append(f"order_check:{alert_type}")
         # unknown/severe warning ⇒ not ok (AGENTS.md §34.16); engine then skips
         return OrderReview(ok=not warnings, warnings=warnings, raw=res)
 

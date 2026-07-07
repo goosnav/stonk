@@ -69,16 +69,13 @@ Prereq: Sprint A accept criteria met, and the human has funded the Robinhood
 
 1. Human steps (cannot be done by an agent): fund account; `cp .env.example
    .env`; set `LIVE_TRADING_ENABLED=true`, `RH_ACCOUNT_WHITELIST=<acct#>`.
-2. OAuth probe: `.venv/bin/specforge --mode live status`. First call opens a
-   browser for Robinhood login. Two outcomes:
-   - **Works** → you'll see account JSON. Proceed with `broker: robinhood_mcp`.
-   - **BrokerAuthError mentioning registration/allowlist** → Robinhood doesn't
-     accept custom MCP clients. Edit `configs/live.yaml`: `broker:
-     robinhood_bridge`, then schedule a Claude Code session (with the
-     Robinhood connector enabled) to run [../scripts/bridge_prompt.md]
-     (../scripts/bridge_prompt.md) at ~09:50/12:35/15:35 ET each weekday.
-     The bridge protocol is tested (tests/test_bridge.py) — follow the prompt
-     file exactly.
+2. OAuth probe — **DONE 2026-07-06 (D22): the standalone MCP client WORKS.**
+   User completed OAuth via the GUI card; tokens cached (~/.specforge/);
+   agentic account 934803396 read live (equity $50); real-time quotes flow;
+   review_equity_order dry-run passed with correct order-arg mapping.
+   `.env` has the whitelist + LIVE_TRADING_ENABLED. The bridge remains a
+   documented fallback only (tests/test_bridge.py) — do not build on it
+   unless RH revokes custom-client access.
 3. Read-only soak for 2–3 days: run `--mode live status` daily; confirm
    account/position numbers match the Robinhood app. No orders yet (the $50
    `time_step_budget_abs_cap` in live.yaml plus approval thresholds keep any
