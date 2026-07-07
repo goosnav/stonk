@@ -9,3 +9,4 @@ data/*.db-*
 .DS_Store
 ~/.specforge/
 .claude/*.local.md
+data/backups/
