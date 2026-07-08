@@ -190,3 +190,18 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 - Ops: restarted live server ~00:10 PT (outside market hours) onto D29.
 - Still outstanding (human): launchd persistence — scripts/install_service.sh
   has never been run; server remains a plain nohup process.
+
+## Sprint D progress (2026-07-08 morning, scheduled session #5)
+- Daily check: /api/health OK (live, D29 code, scheduler armed for today),
+  zero scheduler_errors since 07-07, db_backup + weight_update fired,
+  4 cycles ran; 10 pending approvals are within their TTL window (the
+  cycle-start sweep + D25 guard handle expiry correctly — verified, no bug).
+- [x] D30: live approval TTL 24h -> 6h (configs/live.yaml). Approved intents
+  are placed at their original queue-time limit/qty (no re-pricing), so a
+  24h window let live orders fire at day-old prices. Config-only; 31 tests
+  green. Upgrade path if longer TTL is ever wanted: re-quote at placement.
+- Backfilled DECISIONS.md D26-D29 (sessions #2-#4 logged them in PROGRESS
+  only, violating ground rule 5).
+- NOTE: running live server predates this change but reads config per-run?
+  No — config is loaded at startup; restart outside market hours to pick up
+  D30. Still outstanding (human): launchd persistence never installed.

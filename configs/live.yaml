@@ -15,3 +15,8 @@ risk:
   # After you've watched a clean fill + reconcile, switch to `threshold`
   # (GUI → Risk & Budget) for autonomous small orders.
   approval_mode: all
+  # Approved intents are placed at their ORIGINAL limit/qty on the next cycle
+  # (execution.process_approval_queue re-runs broker review, not pricing).
+  # Default 24h TTL would let a live order fire at yesterday's price — cap it
+  # so intents queued at the 09:45 scan die after the 15:30 scan same day.
+  approval_timeout_hours: 6

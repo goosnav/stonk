@@ -187,3 +187,38 @@ marks the approval AND the order 'expired', and raises ValueError. GUI maps
 it to HTTP 409; CLI prints REFUSED. String comparison of ISO-with-tz
 timestamps matches the existing convention in process_approval_queue.
 Test: tests/test_risk.py::test_approve_after_expiry_refused.
+
+## D26. Nightly git commit of dev/reports (2026-07-07)
+Post-close job calls `_commit_reports()` (app.py, module level for
+testability): if `dev/reports` changed, `git add + commit` best-effort and
+audit `reports_committed`. Reports were accumulating uncommitted on a
+machine with no backup besides git. Test: tests/test_pipeline.py.
+
+## D27. Missed-scan watchdog (2026-07-07)
+Scan/post-close jobs get `misfire_grace_time=1800` (laptop-wake tolerance)
+and an APScheduler EVENT_JOB_MISSED listener that audits `scheduler_missed`
+and desktop-notifies. A sleeping laptop silently skipping scans was
+indistinguishable from a healthy no-trade day.
+
+## D28. /api/health liveness endpoint + named scheduler jobs (2026-07-07)
+No-broker-call probe returning mode, scheduler_running, and per-job
+next_runs; scan jobs renamed to readable ids (`scan_HH:MM`, `post_close`).
+Lets the daily check (and any future uptime monitor) verify the scheduler
+without touching Robinhood. Test: tests/test_pipeline.py.
+
+## D29. Notify when a scan queues approval intents (2026-07-08)
+Three days running, intents queued at scan time expired unseen (D25 made
+that safe but silent). scan_job now counts pending_approval entries in the
+cycle summary and desktop-notifies. Two-line count over already-tested
+summary data — no new test.
+
+## D30. Live approval TTL cut to 6h (2026-07-08)
+process_approval_queue places approved intents at their ORIGINAL limit/qty
+from queue time — it re-runs broker review but never re-prices. With
+live.yaml's approval_mode: all, every live order rides this path, so the
+default 24h approval_timeout_hours allowed a market-ish fractional order to
+fire at yesterday's price. Cheapest correct fix: live.yaml sets
+approval_timeout_hours: 6, so a 09:45 intent approved by the 15:30 scan
+still places same-session and anything older dies via the existing D25
+sweep. Re-quoting at placement is the upgrade path if TTL ever needs to
+grow. Config-only; default.yaml (paper) keeps 24h.
