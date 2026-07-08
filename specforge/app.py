@@ -147,6 +147,14 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def proposals():
         return store.kv_get("promotion_proposals", [])
 
+    @app.get("/api/health")
+    def health():
+        # Liveness probe: no broker/network calls, safe to poll every second.
+        sched = getattr(app.state, "scheduler", None)
+        jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
+        return {"ok": True, "mode": mode, "scheduler_running": bool(sched and sched.running),
+                "next_runs": jobs}
+
     @app.get("/api/version")
     def version():
         from . import __version__
@@ -483,12 +491,12 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         h, m = hhmm.split(":")
         sched.add_job(scan_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
                                             minute=int(m), timezone=tz),
-                      misfire_grace_time=1800)
+                      misfire_grace_time=1800, id=f"scan_{hhmm}")
     pc = cfg.get("schedule", "post_close", default="16:30")
     h, m = pc.split(":")
     sched.add_job(post_close_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
                                               minute=int(m), timezone=tz),
-                  misfire_grace_time=1800)
+                  misfire_grace_time=1800, id="post_close")
 
     def _on_missed(event):
         """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped

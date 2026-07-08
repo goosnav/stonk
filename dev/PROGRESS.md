@@ -160,3 +160,19 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   disturbing the live broker session.
 - Remaining Sprint D backlog: EDGAR point-in-time earnings, Alpaca adapter
   (both are big, deliberate builds — not scheduled-session material).
+
+## Sprint D progress (2026-07-07 evening, scheduled session #3)
+- Ops: restarted the live server outside market hours (23:05 ET) so it now
+  runs D26/D27 code (previous pid was pre-commit 99ab8db). Verified live
+  broker readback ($50 equity) and scheduler armed post-restart. NOTE: no
+  launchd agent is actually installed — scripts/install_service.sh exists
+  but was never run; server is a plain nohup process. Human decision:
+  run the install script for crash/reboot persistence.
+- Daily check: 4 cycles today, zero scheduler_errors, db_backup fired
+  13:30 PT, 10 intents queued then expired per D25 (nobody approved —
+  expected, human wasn't at the GUI during market hours).
+- [x] D28: `/api/health` endpoint — liveness probe (no broker calls) with
+  scheduler_running + named next_runs (scan jobs now have readable ids
+  `scan_HH:MM` / `post_close`). Test in test_pipeline.py. 30 tests green.
+- Remaining Sprint D backlog unchanged: EDGAR point-in-time earnings,
+  Alpaca adapter — deliberate builds, not scheduled-session material.

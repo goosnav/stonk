@@ -107,3 +107,10 @@ def test_commit_reports_snapshots_dev_reports(store, tmp_path):
     log2 = subprocess.run(["git", "log", "--oneline"], cwd=root,
                           capture_output=True, text=True).stdout
     assert log2.count("nightly") == 1
+
+
+def test_health_endpoint(cfg, store):
+    from fastapi.testclient import TestClient
+    from specforge.app import create_app
+    body = TestClient(create_app(cfg, store, with_scheduler=False)).get("/api/health").json()
+    assert body["ok"] is True and body["scheduler_running"] is False
