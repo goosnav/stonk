@@ -222,3 +222,13 @@ approval_timeout_hours: 6, so a 09:45 intent approved by the 15:30 scan
 still places same-session and anything older dies via the existing D25
 sweep. Re-quoting at placement is the upgrade path if TTL ever needs to
 grow. Config-only; default.yaml (paper) keeps 24h.
+
+## D31. Silence MCP session-termination warning noise (2026-07-08)
+Robinhood's MCP server returns 400 on the session-DELETE the mcp client
+library sends at teardown, so every broker call logged "Session termination
+failed: 400" (mcp/client/streamable_http.py warning) — ~2 lines per scan,
+pure noise in server.log. Not our bug and harmless (each _call_async opens
+a fresh session; nothing depends on clean termination). One-line fix: set
+the mcp.client.streamable_http logger to ERROR in robinhood_mcp.py, with a
+comment explaining why. Real transport failures still raise from the call
+itself, so nothing is masked.

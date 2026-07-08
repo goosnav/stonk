@@ -205,3 +205,18 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 - NOTE: running live server predates this change but reads config per-run?
   No — config is loaded at startup; restart outside market hours to pick up
   D30. Still outstanding (human): launchd persistence never installed.
+
+## Sprint D progress (2026-07-08 ~10:05 PT, scheduled session #6)
+- Daily check: /api/health OK (live, scheduler armed, 15:30 scan +
+  post_close pending today); server WAS restarted onto D30 at 05:06 PT
+  (session #5's "restart outstanding" note is stale — pid start time equals
+  the D30 commit time). Zero scheduler_errors; two scans today queued
+  CAT/GE/AMD intents (13 pending_approval, inside the new 6h TTL).
+- [x] D31: silenced the benign "Session termination failed: 400" warning
+  (mcp lib teardown vs RH server) via logger level in robinhood_mcp.py —
+  see DECISIONS.md D31. 31 tests green.
+- Remaining backlog unchanged: EDGAR point-in-time earnings, Alpaca adapter
+  (deliberate builds). Still outstanding (human): launchd persistence —
+  scripts/install_service.sh never run; server is a plain nohup process.
+- Note: server restart not needed for D31 urgently (log noise only); it will
+  be picked up at the next routine restart.

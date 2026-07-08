@@ -27,10 +27,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import logging
 import threading
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+
+# RH's MCP server 400s the session-DELETE the client sends at teardown; the
+# mcp lib logs "Session termination failed: 400" as a warning on every call.
+# Harmless (session is stateless per call here) — silence to keep server.log
+# readable. Real transport failures still raise from the call itself.
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 from ..models import AccountState, Fill, OrderIntent, OrderReview, Position
 
