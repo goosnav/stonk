@@ -114,3 +114,4 @@ def test_health_endpoint(cfg, store):
     from specforge.app import create_app
     body = TestClient(create_app(cfg, store, with_scheduler=False)).get("/api/health").json()
     assert body["ok"] is True and body["scheduler_running"] is False
+    assert body["pending_approvals"] == 0  # D32: fresh store has empty queue

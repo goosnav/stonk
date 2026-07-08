@@ -232,3 +232,15 @@ a fresh session; nothing depends on clean termination). One-line fix: set
 the mcp.client.streamable_http logger to ERROR in robinhood_mcp.py, with a
 comment explaining why. Real transport failures still raise from the call
 itself, so nothing is masked.
+
+## D32 (2026-07-08): pending_approvals in /api/health; stop tracking data/server.log
+Every scheduled-session daily check needed a raw sqlite query to see the
+human approval queue; /api/health is the surface those checks already poll.
+Added `pending_approvals` (local DB count via store.pending_approvals(), no
+broker calls, so the endpoint stays a cheap liveness probe). Alternative
+considered: separate /api/approvals summary endpoint — rejected, the GUI
+already lists approvals and the health probe just needs the count.
+Also: data/server.log was accidentally committed in the D28 commit
+(7d3029c) and showed as perpetually modified; removed from tracking and
+added data/*.log to .gitignore. Runtime logs are machine-local state like
+the DB, not repo history.

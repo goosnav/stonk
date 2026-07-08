@@ -153,7 +153,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         sched = getattr(app.state, "scheduler", None)
         jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
         return {"ok": True, "mode": mode, "scheduler_running": bool(sched and sched.running),
-                "next_runs": jobs}
+                "next_runs": jobs,
+                # local DB count only — keeps this endpoint broker-call-free (D32)
+                "pending_approvals": len(store.pending_approvals())}
 
     @app.get("/api/version")
     def version():

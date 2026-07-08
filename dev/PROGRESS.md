@@ -220,3 +220,18 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   scripts/install_service.sh never run; server is a plain nohup process.
 - Note: server restart not needed for D31 urgently (log noise only); it will
   be picked up at the next routine restart.
+
+## Sprint D progress (2026-07-08 ~15:05 PT, scheduled session #7)
+- Daily check: /api/health OK (live, running D30 code since 05:06 PT; D31
+  commit at 10:05 not yet picked up — log-noise only, fine to wait for next
+  routine restart). All 3 scans + post_close ran today, zero errors in
+  audit, db_backup + weight_update fired. 7 intents pending_approval
+  (within 6h TTL), 12 expired earlier today per D25.
+- [x] D32: /api/health now reports `pending_approvals` — daily checks no
+  longer need a raw sqlite query to see the human queue. Local-DB count
+  only, endpoint stays broker-call-free. Test extended; 31 tests green.
+- Hygiene: data/server.log was accidentally git-tracked since 7d3029c
+  (showed as perpetually modified); untracked + data/*.log gitignored.
+- Remaining backlog unchanged: EDGAR point-in-time earnings, Alpaca adapter
+  (deliberate builds). Still outstanding (human): launchd persistence —
+  scripts/install_service.sh never run; server is a plain nohup process.

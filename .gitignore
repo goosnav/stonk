@@ -10,3 +10,4 @@ data/*.db-*
 ~/.specforge/
 .claude/*.local.md
 data/backups/
+data/*.log
