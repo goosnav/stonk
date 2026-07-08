@@ -434,6 +434,14 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 _notify("SpecForge kill switch",
                         f"active: {', '.join(summary['kill_switches'])} — "
                         f"open the dashboard")
+            # D29: intents were silently expiring (D25) because nothing told
+            # the human they'd been queued — surface them at queue time
+            pending = sum(1 for s in summary.get("entries", {}).values()
+                          if s == "pending_approval")
+            if pending:
+                _notify("SpecForge: trades await approval",
+                        f"{pending} intent(s) pending — approve in the "
+                        f"dashboard before they expire")
         except Exception as e:                      # noqa: BLE001
             store.audit("scheduler_error", {"error": str(e)})
             _notify("SpecForge scan FAILED", str(e)[:120])

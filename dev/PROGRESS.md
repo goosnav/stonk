@@ -176,3 +176,17 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   `scan_HH:MM` / `post_close`). Test in test_pipeline.py. 30 tests green.
 - Remaining Sprint D backlog unchanged: EDGAR point-in-time earnings,
   Alpaca adapter — deliberate builds, not scheduled-session material.
+
+## Sprint D progress (2026-07-08 ~00:05 PT, scheduled session #4)
+- Daily check: /api/health OK (live mode, scheduler armed for today's
+  09:45/12:30/15:30 + post_close), zero scheduler_errors yesterday,
+  db_backup fired, 4 cycles ran; 10 approval_queued intents expired
+  unapproved again (third day running) — root cause: nobody is told.
+- [x] D29: desktop notification when a scan queues intents for approval —
+  D25 made silent expiry safe, but nothing ever TOLD the human intents
+  were waiting; scan_job now counts pending_approval entries in the cycle
+  summary and fires _notify. No new test: two-line count over
+  already-tested summary data inside the scheduler closure. 31 tests green.
+- Ops: restarted live server ~00:10 PT (outside market hours) onto D29.
+- Still outstanding (human): launchd persistence — scripts/install_service.sh
+  has never been run; server remains a plain nohup process.
