@@ -48,12 +48,17 @@ def test_dashboard_renders_all_tabs_without_js_errors(gui_server):
         pg.goto(gui_server, wait_until="networkidle", timeout=30000)
         pg.wait_for_timeout(1500)
         assert "$" in (pg.text_content("#acct") or "")          # account cards filled
-        for tab in ["trading", "switchboard", "risk", "activity", "overview"]:
+        for tab in ["trading", "switchboard", "risk", "model", "activity", "overview"]:
             pg.click(f'#tabs div[data-p="{tab}"]')
             pg.wait_for_timeout(300)
         # switchboard table populated from config
         pg.click('#tabs div[data-p="switchboard"]')
         assert "momentum" in (pg.text_content("#nodes") or "")
+        # model tab renders the network + ledger (V4)
+        pg.click('#tabs div[data-p="model"]')
+        pg.wait_for_timeout(800)
+        assert "momentum" in (pg.text_content("#model_table") or "")
+        assert pg.query_selector("#modelsvg svg") is not None
         b.close()
     # transient fetch aborts during teardown are fine; real JS errors are not
     real = [e for e in errors if "Failed to fetch" not in e and "NetworkError" not in e]

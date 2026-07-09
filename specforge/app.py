@@ -8,20 +8,19 @@ Config.validate() exactly like file edits — the GUI has no privileged path.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
-from .config import ConfigError, load_config
+from .config import OVERRIDES_KEY, ConfigError, apply_override, load_config
 from .data import MarketContext
 from .forecast import portfolio_projection
 from .risk import Governor
 from .store import Store
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-OVERRIDES_KEY = "config_overrides"
 
 # Known AI providers → OpenAI-compatible base URL. All four speak the same
 # chat-completions shape (Anthropic via its OpenAI-compat endpoint), so only the
@@ -197,6 +196,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         day_pnl = None
         if len(curve) >= 2:
             day_pnl = round(acct.equity - curve[-2]["equity"], 2)
+        if acct.equity > 0:                    # intraday mark (V4), throttled in store
+            store.record_intraday_mark(acct.equity, acct.cash,
+                                       "live" if c.mode == "live" else "paper")
         return {
             "mode": c.mode, "broker": c.get("broker"),
             "equity": round(acct.equity, 2), "cash": round(acct.cash, 2),
@@ -274,6 +276,25 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         c = fresh_cfg()
         return store.equity_curve(c.mode if c.mode == "live" else "paper")
 
+    @app.get("/api/portfolio_value")
+    def portfolio_value(range: str = "1M"):
+        """Total portfolio value series: daily scan marks merged with throttled
+        intraday marks (V4). Points: [{t, equity}] ascending."""
+        src = "live" if mode == "live" else "paper"
+        days = {"1D": 1, "1W": 7, "1M": 31, "ALL": 36500}.get(range, 31)
+        since = datetime.now().astimezone() - timedelta(days=days)
+        marks = store.intraday_marks(src, since_ts=since.isoformat())
+        intra_days = {r["ts"][:10] for r in marks}
+        # intraday marks supersede the daily scan mark for days they cover —
+        # the daily row's synthetic 16:00 stamp must not outrank fresher marks
+        daily = [{"t": r["d"] + "T16:00:00", "equity": r["equity"]}
+                 for r in store.equity_curve(src)
+                 if r["d"] >= since.date().isoformat() and r["d"] not in intra_days]
+        intra = [{"t": r["ts"][:19], "equity": r["equity"]} for r in marks]
+        pts = sorted(daily + intra, key=lambda p: p["t"])
+        return {"points": pts, "range": range, "source": src,
+                "current": pts[-1]["equity"] if pts else None}
+
     @app.get("/api/audit")
     def audit(limit: int = 100):
         return store.audit_rows(limit=limit)
@@ -323,15 +344,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     # ---------------- mutations (all audit-logged) ----------------
     def _set_override(path: list[str], value):
-        ov = store.kv_get(OVERRIDES_KEY, {}) or {}
-        cur = ov
-        for k in path[:-1]:
-            cur = cur.setdefault(k, {})
-        cur[path[-1]] = value
-        # validate merged result BEFORE persisting — GUI can't sneak past governor
-        load_config(mode, overrides=ov)
-        store.kv_set(OVERRIDES_KEY, ov)
-        store.audit("config_override", {"path": path, "value": value, "via": "gui"})
+        # validates merged result BEFORE persisting — GUI can't sneak past
+        # governor (shared with steering: config.apply_override)
+        apply_override(store, mode, path, value, via="gui")
 
     @app.post("/api/nodes/{node_id}")
     def set_node(node_id: str, body: dict):
@@ -426,6 +441,82 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         Governor(fresh_cfg(), store).reset(name)
         return {"ok": True}
 
+    # ---------------- steering (V4/D34, non-blocking) ----------------
+    @app.get("/api/steering")
+    def steering_list():
+        from . import steering as steering_mod
+        c = fresh_cfg()
+        steering_mod.sweep(c, store)           # expire-on-read
+        rows = store.steering_requests(limit=30)
+        return {"pending": [r for r in rows if r["status"] == "pending"],
+                "recent": [r for r in rows if r["status"] != "pending"][:10]}
+
+    @app.post("/api/steering/{sid}")
+    def steering_decide(sid: str, body: dict):
+        from . import steering as steering_mod
+        try:
+            return steering_mod.decide(fresh_cfg(), store, sid,
+                                       body.get("choice", ""), via="gui")
+        except (ValueError, ConfigError) as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.get("/api/hypotheses")
+    def hypotheses_list():
+        out = {"north_star": store.active_hypothesis("north_star"),
+               "short_term": store.active_hypothesis("short_term"),
+               "history": store.hypotheses(limit=20)}
+        return out
+
+    @app.get("/api/model")
+    def model():
+        """The model's current shape (V4): every node with its base weight ×
+        learned multiplier = effective weight, measured scorecard, recent
+        signal activity — plus ensemble params, regime, and hypothesis link."""
+        from . import regime as regime_mod
+        from .attribution import node_scorecard
+        from .ensemble import s_node_weight
+        c = fresh_cfg()
+        ctx = MarketContext(store, c)
+        reg = regime_mod.classify(ctx, c)
+        sig_counts = {r["node_id"]: r["n"] for r in store.db.execute(
+            "SELECT node_id, COUNT(*) n FROM signals "
+            "WHERE ts >= datetime('now', '-7 days') GROUP BY node_id")}
+        nodes = []
+        for node_id, nc in (c.get("nodes", default={}) or {}).items():
+            sc = node_scorecard(store, node_id)
+            nodes.append({
+                "id": node_id, "enabled": bool(nc.get("enabled")),
+                "role": nc.get("role", "alpha"), "status": nc.get("status"),
+                "ai": bool(nc.get("ai")) or node_id == "hypothesis",
+                "base_weight": nc.get("weight", 0.0),
+                "multiplier": round(store.get_weight_multiplier(node_id), 3),
+                "effective_weight": round(s_node_weight(node_id, c, store,
+                                                        reg.regime), 4),
+                "signals_7d": sig_counts.get(node_id, 0),
+                "trades_n": sc.get("n", 0),
+                "expectancy": sc.get("expectancy"),
+                "hit_rate": sc.get("hit_rate"),
+                "per_trade_ir": sc.get("per_trade_ir"),
+            })
+        st = store.active_hypothesis("short_term")
+        return {
+            "regime": reg.regime,
+            "deployment_multiplier": reg.deployment_multiplier,
+            "kill_switches": sorted(Governor(c, store).active_switches()),
+            "ensemble": {"min_final_score": c.get("ensemble", "min_final_score"),
+                         "conflict_dispersion_penalty":
+                             c.get("ensemble", "conflict_dispersion_penalty"),
+                         "weight_learning": c.get("ensemble", "weight_learning")},
+            "hypothesis": {
+                "enabled": bool(c.get("hypothesis", "enabled", default=False)),
+                "short_term": {"id": st["id"][:8], "activated_at": st["activated_at"],
+                               "stances": len(json.loads(st["stances"] or "[]")),
+                               "watchlist": json.loads(st["watchlist"] or "[]")}
+                if st else None,
+                "north_star_active": store.active_hypothesis("north_star") is not None},
+            "nodes": sorted(nodes, key=lambda n: -n["effective_weight"]),
+        }
+
     @app.post("/api/scan")
     def manual_scan():
         from .engine import run_cycle
@@ -513,6 +604,17 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         try:
             run_cycle(cfg, store)              # final scan marks equity + exits
             update_weights(cfg, store)
+            # hypothesis upkeep (V4/D34): regen/review through steering; a
+            # failure here must never break attribution or the backup below
+            try:
+                from . import steering as steering_mod
+                hs = steering_mod.maintain(cfg, store)
+                if hs.get("short_term_proposed") or hs.get("north_star_proposed"):
+                    _notify("SpecForge: hypothesis proposal",
+                            "a strategic choice awaits (or auto-applies at "
+                            "expiry) — see the dashboard")
+            except Exception as e:              # noqa: BLE001
+                store.audit("scheduler_error", {"job": "hypothesis", "error": str(e)})
             proposals = propose_promotions(cfg, store)
             if proposals:
                 store.audit("promotion_proposals", proposals)

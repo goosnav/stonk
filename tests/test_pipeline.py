@@ -196,3 +196,57 @@ def test_ai_provider_endpoint_never_leaks_key(cfg, store, tmp_path, monkeypatch)
     # bad base_url rejected
     assert client.post("/api/ai/provider",
                        json={"provider": "custom", "base_url": "ftp://x"}).status_code == 400
+
+
+def test_portfolio_value_and_steering_endpoints(cfg, store):
+    """V4: portfolio series merges daily + intraday marks; steering API lists,
+    decides, and rejects bad choices."""
+    from fastapi.testclient import TestClient
+
+    from specforge import steering
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+
+    from datetime import date, timedelta as td
+    store.record_equity(1000.0, 500.0, "paper",
+                        d=(date.today() - td(days=1)).isoformat())
+    store.record_equity(1005.0, 500.0, "paper")          # today's scan mark
+    assert store.record_intraday_mark(1010.0, 500.0, "paper") is True
+    assert store.record_intraday_mark(1011.0, 500.0, "paper") is False   # throttled
+    pv = client.get("/api/portfolio_value?range=1W").json()
+    # yesterday's daily + today's intraday; today's daily superseded by intraday
+    assert pv["current"] == 1010.0 and len(pv["points"]) == 2
+
+    r = steering.create(cfg, store, "risk_suggestion", title="t", context="c",
+                        options=[{"key": "adopt", "label": "a", "detail": ""},
+                                 {"key": "keep", "label": "k", "detail": ""}],
+                        recommended="adopt",
+                        payload={"path": ["risk", "max_daily_loss"], "value": 0.03})
+    body = client.get("/api/steering").json()
+    assert [p["id"] for p in body["pending"]] == [r["id"]]
+    assert client.post(f"/api/steering/{r['id']}", json={"choice": "zzz"}).status_code == 400
+    assert client.post(f"/api/steering/{r['id']}", json={"choice": "adopt"}).status_code == 200
+    assert client.get("/api/steering").json()["pending"] == []
+    # dangerous suggested value still bounced by the shared validated path
+    r2 = steering.create(cfg, store, "risk_suggestion", title="t", context="c",
+                         options=[{"key": "adopt", "label": "a", "detail": ""}],
+                         recommended="adopt",
+                         payload={"path": ["risk", "max_daily_loss"], "value": 0.5})
+    assert client.post(f"/api/steering/{r2['id']}", json={"choice": "adopt"}).status_code == 400
+
+
+def test_model_endpoint(cfg, store):
+    """V4: the model view exposes every configured node with effective weight
+    = base × learned multiplier, plus regime and hypothesis link."""
+    from fastapi.testclient import TestClient
+
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    store.set_weight_multiplier("momentum", 1.5, note="test")
+    m = client.get("/api/model").json()
+    by = {n["id"]: n for n in m["nodes"]}
+    assert by["momentum"]["multiplier"] == 1.5
+    assert by["momentum"]["effective_weight"] == round(
+        by["momentum"]["base_weight"] * 1.5, 4)
+    assert m["regime"] and "min_final_score" in m["ensemble"]
+    assert m["hypothesis"]["enabled"] is False and m["hypothesis"]["short_term"] is None

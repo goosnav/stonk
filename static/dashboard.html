@@ -120,7 +120,8 @@
   <div data-p="overview" class="on">Overview</div>
   <div data-p="trading">Trading</div>
   <div data-p="switchboard">Switchboard</div>
-  <div data-p="risk">Risk &amp; Budget</div>
+  <div data-p="risk">Config</div>
+  <div data-p="model">Model</div>
   <div data-p="activity">Activity</div>
 </div>
 <main>
@@ -130,6 +131,11 @@
     <h2>Account</h2>
     <p class="explain">Live snapshot of the account this engine controls. Cycle budget = the most it may deploy in the next scan (worst-case loss cap per time step).</p>
     <div class="cards" id="acct"></div>
+  </section>
+  <section class="wide" id="steersec" style="display:none">
+    <h2>Steering — strategic choices</h2>
+    <p class="explain">The engine keeps trading autonomously while these wait. Each request applies its stated default when the countdown ends — answering is optional, never required.</p>
+    <div id="steering">—</div>
   </section>
   <section>
     <h2>Projected strategy return</h2>
@@ -143,9 +149,13 @@
     <div id="regimebox">—</div>
   </section>
   <section class="wide">
-    <h2>Equity curve</h2>
-    <p class="explain">Marked once per scan cycle. Source: <span id="curvesrc">…</span>. Early live marks can dip while an order is in flight (cash reserved, position not yet reported).</p>
-    <canvas id="curve" height="130"></canvas>
+    <h2>Portfolio value <span id="pv_now" style="float:right"></span></h2>
+    <p class="explain">Total account value (cash + positions). Daily scan marks plus throttled intraday marks. Source: <span id="curvesrc">…</span>.</p>
+    <div id="pv_ranges" style="margin:4px 0 6px">
+      <button data-r="1D">1D</button><button data-r="1W">1W</button>
+      <button data-r="1M" class="on">1M</button><button data-r="ALL">ALL</button>
+    </div>
+    <canvas id="curve" height="170"></canvas>
   </section>
   <section>
     <h2>Portfolio Monte Carlo — next 20 sessions</h2>
@@ -237,6 +247,21 @@
       <tr><td>trading friction (round trip)</td><td id="friction">—</td></tr>
     </tbody></table>
     <button onclick="saveAI()">Save AI settings</button>
+  </section>
+</div>
+<!-- ============ MODEL ============ -->
+<div class="page" data-page="model" style="display:none">
+  <section class="wide">
+    <h2>Model shape — <span id="model_regime">…</span></h2>
+    <p class="explain">The live signal network as it has self-improved. Box height tracks effective weight (base × learned multiplier, regime-conditioned); green/red edge = measured per-trade expectancy; dashed = disabled. The governor gates everything — no node ever places an order.</p>
+    <div id="modelsvg" style="overflow-x:auto">—</div>
+  </section>
+  <section class="wide">
+    <h2>Node ledger</h2>
+    <p class="explain">Base weight is set by backtest; the multiplier is LEARNED from measured trades (bounded by config). Effective = what the ensemble actually uses right now.</p>
+    <table><thead><tr><th>node</th><th>status</th><th>base</th><th>learned ×</th>
+      <th>effective</th><th>signals 7d</th><th>trades</th><th>expectancy</th>
+      <th>hit</th><th>IR</th></tr></thead><tbody id="model_table"></tbody></table>
   </section>
 </div>
 <!-- ============ ACTIVITY ============ -->
@@ -563,11 +588,72 @@ async function saveProvider(){
 }
 
 /* ---------- charts / activity ---------- */
+let PV_RANGE='1M';
+document.querySelectorAll('#pv_ranges button').forEach(b=>b.onclick=()=>{
+  PV_RANGE=b.dataset.r;
+  document.querySelectorAll('#pv_ranges button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); refreshCurve();
+});
+function tchart(canvas, pts){
+  /* time-aware line chart: $ gridlines + time ticks. pts=[{t,equity}] asc */
+  const c=canvas,x=c.getContext('2d'),W=c.width=c.offsetWidth,H=c.height;
+  x.clearRect(0,0,W,H);
+  if(pts.length<2){x.fillStyle='#7d8799';x.font='11px monospace';
+    x.fillText(pts.length?'one mark so far — chart appears with the next':'no marks yet',8,H/2);return;}
+  const L=46,R=6,T=8,B=18, ts=pts.map(p=>+new Date(p.t)), vs=pts.map(p=>p.equity);
+  const t0=ts[0],t1=ts[ts.length-1]||t0+1, lo=Math.min(...vs), hi=Math.max(...vs);
+  const pad=(hi-lo)||Math.abs(hi)*0.01||1, vlo=lo-pad*0.08, vhi=hi+pad*0.08;
+  const X=t=>L+(t-t0)/((t1-t0)||1)*(W-L-R), Y=v=>T+(1-(v-vlo)/(vhi-vlo))*(H-T-B);
+  x.strokeStyle='#232630';x.fillStyle='#7d8799';x.font='10px monospace';
+  for(let i=0;i<=3;i++){const v=vlo+(vhi-vlo)*i/3,py=Y(v);
+    x.beginPath();x.moveTo(L,py);x.lineTo(W-R,py);x.stroke();
+    x.fillText('$'+v.toFixed(v<100?2:0),2,py+3);}
+  const spanD=(t1-t0)/864e5;
+  for(let i=0;i<=2;i++){const t=t0+(t1-t0)*i/2,d=new Date(t);
+    const lbl=spanD<2?d.toTimeString().slice(0,5):d.toISOString().slice(5,10);
+    x.fillText(lbl,Math.min(X(t),W-34),H-5);}
+  x.beginPath();x.strokeStyle='#5aa2f7';x.lineWidth=2;
+  pts.forEach((p,i)=>{i?x.lineTo(X(ts[i]),Y(vs[i])):x.moveTo(X(ts[i]),Y(vs[i]));});
+  x.stroke();
+  const lastX=X(ts[ts.length-1]),lastY=Y(vs[vs.length-1]);
+  x.fillStyle='#5aa2f7';x.beginPath();x.arc(lastX,lastY,2.5,0,7);x.fill();
+}
 async function refreshCurve(){
-  const rows=await api('/api/equity_curve');
+  const pv=await api('/api/portfolio_value?range='+PV_RANGE);
   $('curvesrc').textContent = SIM ? 'SIMULATION account' : 'LIVE account';
-  if(rows.length){_equityNow=rows[rows.length-1].equity;}
-  line($('curve'),[{data:rows.map(r=>r.equity),color:'#5aa2f7',w:2}]);
+  if(pv.current!=null){_equityNow=pv.current;
+    const first=pv.points[0]?.equity, chg=first?(pv.current/first-1):0;
+    $('pv_now').innerHTML=`${fmt$(pv.current)} <span style="color:${chg>=0?'var(--green)':'var(--red)'}">${(chg*100).toFixed(2)}% ${PV_RANGE}</span>`;}
+  tchart($('curve'), pv.points);
+}
+function steerCountdown(exp){
+  const ms=+new Date(exp)-Date.now();
+  if(ms<=0) return 'expiring…';
+  const h=Math.floor(ms/36e5),m=Math.floor(ms%36e5/6e4);
+  return h?`${h}h ${m}m`:`${m}m`;
+}
+async function refreshSteering(){
+  const s=await api('/api/steering');
+  const sec=$('steersec');
+  if(!s.pending.length){sec.style.display='none';return;}
+  sec.style.display='';
+  $('steering').innerHTML=s.pending.map(r=>{
+    const opts=JSON.parse(r.options||'[]').map(o=>
+      `<button class="${o.key===r.recommended?'primary':''}"
+        onclick="steer('${r.id}','${o.key}')"
+        title="${(o.detail||'').replace(/"/g,'&quot;')}">${o.label}</button>`).join(' ');
+    const dflt=r.default_on_expiry==='adopt'
+      ?'adopts the recommendation':'keeps the status quo';
+    return `<div class="card" style="margin-bottom:8px">
+      <b>${r.title}</b>
+      <span class="dim" style="float:right">expires in ${steerCountdown(r.expires_at)} → ${dflt}</span>
+      <div class="explain" style="white-space:pre-wrap;margin:6px 0">${(r.context||'').slice(0,600)}</div>
+      ${opts}</div>`;}).join('');
+}
+async function steer(id, key){
+  await post('/api/steering/'+id,{choice:key});
+  toast('steering decision applied (audit-logged)');
+  refreshSteering(); refreshCurve();
 }
 async function refreshMC(){
   try{
@@ -619,6 +705,57 @@ async function guard(fn, panelId){
     if(el) el.innerHTML = '<span class="feed-error">-- FEED ERROR: '
       + String(e.message||e).slice(0,120) + ' --</span>'; }
 }
+async function refreshModel(){
+  const m=await api('/api/model');
+  $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
+    (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
+  const nodes=m.nodes;
+  const rowH=n=>Math.max(26, Math.min(64, 20+n.effective_weight*90));
+  let y=14; const pos={};
+  nodes.forEach(n=>{pos[n.id]={y, h:rowH(n)}; y+=rowH(n)+10;});
+  const H=Math.max(y+8, 240), NX=170, NW=178, EX=430, GX=560, BX=676;
+  const mid=t=>pos[t].y+pos[t].h/2;
+  const col=n=>n.status==='production'?'var(--green)':n.status==='probation'
+    ?'var(--amber)':'#7d8799';
+  const edge=n=>{
+    const w=Math.max(1, n.effective_weight*8);
+    const c=n.trades_n<3?'#3a3f4c':(n.expectancy>0?'var(--green)':'var(--red)');
+    return `<path d="M ${NX+NW} ${mid(n.id)} C ${EX-40} ${mid(n.id)}, ${EX-40} ${H/2}, ${EX} ${H/2}"
+      stroke="${c}" stroke-width="${n.enabled?w:0.6}" fill="none"
+      ${n.enabled?'':'stroke-dasharray="3,3"'} opacity="${n.enabled?0.9:0.35}"/>`;};
+  const box=n=>{
+    const p=pos[n.id], c=col(n);
+    return `<rect x="${NX}" y="${p.y}" width="${NW}" height="${p.h}" fill="var(--panel)"
+      stroke="${c}" ${n.enabled?'':'stroke-dasharray="4,3"'} opacity="${n.enabled?1:0.45}"/>
+    <text x="${NX+8}" y="${p.y+15}" fill="${c}" font-size="11" font-family="monospace">${n.id}${n.ai?' ⚡AI':''}${n.role==='filter'?' [veto]':''}</text>
+    <text x="${NX+8}" y="${p.y+p.h-6}" fill="#7d8799" font-size="9" font-family="monospace">
+      eff ${n.effective_weight.toFixed(2)} (${n.base_weight}×${n.multiplier})${n.trades_n?` · ${n.trades_n} trades ${(n.expectancy*100).toFixed(1)}%`:''}</text>`;};
+  const hypoOn=m.hypothesis.enabled && pos['hypothesis'];
+  const hypoBox=hypoOn?`<rect x="8" y="${pos['hypothesis'].y}" width="130" height="${pos['hypothesis'].h}"
+      fill="none" stroke="var(--cyan)"/>
+    <text x="14" y="${pos['hypothesis'].y+15}" fill="var(--cyan)" font-size="10" font-family="monospace">AI hypothesis</text>
+    <text x="14" y="${pos['hypothesis'].y+pos['hypothesis'].h-6}" fill="#7d8799" font-size="9" font-family="monospace">${m.hypothesis.short_term?`${m.hypothesis.short_term.stances} stances`: 'none active'}</text>
+    <line x1="138" y1="${mid('hypothesis')}" x2="${NX}" y2="${mid('hypothesis')}" stroke="var(--cyan)"/>`:'';
+  const chain=(x,label,sub)=>`<rect x="${x}" y="${H/2-26}" width="104" height="52" fill="var(--panel)" stroke="var(--line)"/>
+    <text x="${x+8}" y="${H/2-8}" fill="var(--text)" font-size="11" font-family="monospace">${label}</text>
+    <text x="${x+8}" y="${H/2+10}" fill="#7d8799" font-size="9" font-family="monospace">${sub}</text>`;
+  $('modelsvg').innerHTML=`<svg viewBox="0 0 800 ${H}" width="100%" style="min-width:760px">
+    <text x="8" y="10" fill="#7d8799" font-size="9" font-family="monospace">market data → signal nodes → ensemble → governor → broker</text>
+    ${hypoBox}${nodes.map(edge).join('')}${nodes.map(box).join('')}
+    ${chain(EX,'ENSEMBLE',`min score ${m.ensemble.min_final_score}`)}
+    ${chain(GX,'GOVERNOR',m.kill_switches.length?'KILL ACTIVE':'budget-gated')}
+    ${chain(BX,'BROKER','orders')}
+    <line x1="${EX+104}" y1="${H/2}" x2="${GX}" y2="${H/2}" stroke="var(--line)"/>
+    <line x1="${GX+104}" y1="${H/2}" x2="${BX}" y2="${H/2}" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/>
+  </svg>`;
+  $('model_table').innerHTML=nodes.map(n=>`<tr style="opacity:${n.enabled?1:0.45}">
+    <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
+    <td>${n.status||'—'}</td><td>${n.base_weight??'—'}</td><td>×${n.multiplier}</td>
+    <td><b>${n.effective_weight}</b></td><td>${n.signals_7d}</td><td>${n.trades_n}</td>
+    <td>${n.expectancy!=null?(n.expectancy*100).toFixed(2)+'%':'—'}</td>
+    <td>${n.hit_rate!=null?(n.hit_rate*100).toFixed(0)+'%':'—'}</td>
+    <td>${n.per_trade_ir??'—'}</td></tr>`).join('');
+}
 function refreshAll(){
   guard(refreshHealth,'readiness'); guard(refreshMarket,'strip');
   guard(refreshStatus,'acct'); guard(refreshBroker,'brokerbox');
@@ -627,12 +764,13 @@ function refreshAll(){
   guard(refreshRisk,'risk'); guard(refreshCosts,'ai'); guard(refreshProvider,'ai');
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
+  guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
 }
 refreshAll();
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
-  refreshCosts();refreshAudit();},60000);
+  refreshCosts();refreshAudit();refreshSteering();},60000);
 </script>
 </body>
 </html>

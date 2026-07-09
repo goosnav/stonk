@@ -302,3 +302,38 @@ live, so the next scan's fresh AIClient picks it up without a restart. ai.py
 now reads AI_API_KEY first, falling back to OPENROUTER_API_KEY for back-compat.
 Secrets never touch the DB and are never echoed back: GET returns only
 {key_set, last-4 hint}; the audit logs provider/base_url but not the key.
+
+## D34. V4: hypothesis layer + steering + model observatory (2026-07-09, user)
+Plan: dev/V4_PLAN.md. Two AI-generated hypothesis tiers in the `hypotheses`
+table: a rarely-changing NORTH STAR and a SHORT-TERM hypothesis (rotated every
+short_term_max_age_days or on regime change). Current ones mirror to
+data/hypotheses/*.md; every retired one archives, dated, to
+data/hypotheses/archive/ (the user-facing log). The ONLY trading influence is
+nodes/hypothesis.py emitting the stored active hypothesis's stances as
+SignalEvents into the ensemble — weighted, attribution-measured, governor-
+gated like any node — plus a ≤max_watchlist universe merge. AI never sizes or
+places anything; generation is post-close/CLI only, strict-JSON validated,
+discard-on-garbage (D14 posture). Feature is off by default
+(hypothesis.enabled + ai.enabled required).
+
+STEERING: strategic choices (hypothesis adoption, north-star changes, node
+promotions, watchlist adds, risk suggestions) queue in the `steering` table
+with options + an AI recommendation and a TTL. Trading NEVER blocks on them
+(user directive: autonomous as long as there's money). Tiered expiry defaults:
+hypothesis_adopt/watchlist_add auto-adopt the recommendation; north_star_change
+/node_promotion/risk_suggestion keep the status quo (so nothing top-level or
+risk-touching drifts silently; promotions still effectively need a human,
+without ever blocking). Bootstrap exception: the FIRST north star auto-adopts
+(no status quo exists). Risk suggestions apply through config.apply_override —
+the same validated path as the GUI (refactored out of app.py) — so dangerous
+values are rejected regardless of who triggers the apply.
+
+GUI: "Risk & Budget" tab relabeled "Config" (data-p unchanged). Portfolio
+value chart: `equity_intraday` throttled marks (from /api/status) merged with
+daily scan marks via /api/portfolio_value (intraday supersedes the daily row's
+synthetic 16:00 stamp for days it covers); time axis, $ gridlines, 1D/1W/1M/ALL.
+Steering panel on Overview with countdown + "what happens if I do nothing".
+New Model tab: /api/model aggregates every node (base weight × learned
+multiplier = effective weight in the current regime, scorecard, 7d signal
+count) rendered as an SVG flow network (data → nodes → ensemble → governor →
+broker) — the model's learned shape at a glance. Vanilla JS/SVG per D2.

@@ -250,3 +250,19 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 - Remaining backlog unchanged: EDGAR point-in-time earnings, Alpaca adapter
   (deliberate builds). Still outstanding (human): launchd persistence —
   scripts/install_service.sh never run; server is a plain nohup process.
+
+## 2026-07-09 (later) — V4: hypothesis + steering + model observatory (D34)
+- [x] Hypothesis layer: `hypotheses` table, data/hypotheses/ file mirror +
+  dated archive/, AI generation (post-close/CLI, strict JSON, budget-ledgered),
+  deterministic nodes/hypothesis.py feeding the ensemble, bounded watchlist
+  merge into the scan universe. Off by default (hypothesis.enabled).
+- [x] Steering: non-blocking strategic-choice queue with tiered expiry
+  defaults (adopt vs status-quo), GUI panel with countdown, /api/steering,
+  cycle-start + on-read sweeps, `specforge hypothesis` CLI, post-close
+  maintenance job. config.apply_override refactor = one validated override
+  path for GUI + steering.
+- [x] GUI: Config tab rename, portfolio-value chart (intraday marks +
+  1D/1W/1M/ALL), Model tab (/api/model + SVG network of effective weights and
+  measured edge). 50 offline tests + Playwright smoke green.
+- NOT yet enabled live: hypothesis.enabled stays false until the operator
+  flips it (needs AI key set in Config tab first).

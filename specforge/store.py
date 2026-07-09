@@ -85,6 +85,31 @@ CREATE TABLE IF NOT EXISTS approvals(               -- human approval queue
   status TEXT DEFAULT 'pending',                    -- pending|approved|rejected|expired
   decided_at TEXT
 );
+CREATE TABLE IF NOT EXISTS hypotheses(              -- AI hypothesis layer (V4/D34)
+  id TEXT PRIMARY KEY, tier TEXT,                   -- north_star | short_term
+  status TEXT,                                      -- proposed | active | retired
+  created_at TEXT, activated_at TEXT, retired_at TEXT,
+  thesis TEXT,                                      -- markdown, human-readable
+  stances TEXT,                                     -- JSON [{symbol,direction,conviction,horizon_days,rationale}]
+  watchlist TEXT,                                   -- JSON [symbols beyond config universe]
+  invalidation TEXT,                                -- what would falsify this
+  regime TEXT,                                      -- regime at generation time
+  source TEXT,                                      -- ai | human
+  parent_id TEXT                                    -- hypothesis it replaced
+);
+CREATE TABLE IF NOT EXISTS steering(                -- non-blocking strategic choices (V4/D34)
+  id TEXT PRIMARY KEY, kind TEXT, created_at TEXT, expires_at TEXT,
+  title TEXT, context TEXT,                         -- markdown shown to the human
+  options TEXT,                                     -- JSON [{key,label,detail}]
+  recommended TEXT,                                 -- option key the AI recommends
+  default_on_expiry TEXT,                           -- adopt | status_quo
+  status TEXT DEFAULT 'pending',                    -- pending | decided | expired
+  payload TEXT,                                     -- JSON kind-specific apply data
+  decided_key TEXT, decided_at TEXT, decided_via TEXT  -- gui | expiry
+);
+CREATE TABLE IF NOT EXISTS equity_intraday(         -- throttled live marks (V4)
+  ts TEXT, equity REAL, cash REAL, source TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_audit_cycle ON audit(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_orders_dup ON orders(symbol, side, created_at);
 CREATE INDEX IF NOT EXISTS idx_trades_analog ON trades(source, regime, score_bucket);
@@ -388,6 +413,102 @@ class Store:
         self.db.execute("UPDATE approvals SET status=?, decided_at=? WHERE intent_id=?",
                         (status, _now(), intent_id))
         self.db.commit()
+
+    # ---------- hypotheses (V4/D34) ----------
+    def save_hypothesis(self, h: dict) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO hypotheses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (h["id"], h["tier"], h.get("status", "proposed"), h.get("created_at", _now()),
+             h.get("activated_at"), h.get("retired_at"), h.get("thesis", ""),
+             json.dumps(h.get("stances", [])), json.dumps(h.get("watchlist", [])),
+             h.get("invalidation", ""), h.get("regime", ""),
+             h.get("source", "ai"), h.get("parent_id", "")))
+        self.db.commit()
+
+    def get_hypothesis(self, hid: str) -> Optional[dict]:
+        r = self.db.execute("SELECT * FROM hypotheses WHERE id=?", (hid,)).fetchone()
+        return dict(r) if r else None
+
+    def active_hypothesis(self, tier: str, as_of: str | None = None) -> Optional[dict]:
+        """Point-in-time read (ROADMAP rule 3): only a hypothesis activated on
+        or before as_of exists for a scan at as_of — backtests can't see the
+        future, and live just passes today."""
+        q = "SELECT * FROM hypotheses WHERE tier=? AND status='active'"
+        args: list = [tier]
+        if as_of:
+            # 'localtime' for the same reason as orders_today: activated_at
+            # carries a tz offset and bare date() would shift evening
+            # activations to the next UTC day
+            q += " AND date(activated_at,'localtime') <= ?"; args.append(as_of)
+        q += " ORDER BY activated_at DESC LIMIT 1"
+        r = self.db.execute(q, args).fetchone()
+        return dict(r) if r else None
+
+    def hypotheses(self, tier: str | None = None, limit: int = 50) -> list[dict]:
+        q, args = "SELECT * FROM hypotheses", []
+        if tier:
+            q += " WHERE tier=?"; args.append(tier)
+        q += " ORDER BY created_at DESC LIMIT ?"; args.append(limit)
+        return [dict(r) for r in self.db.execute(q, args)]
+
+    def update_hypothesis(self, hid: str, **fields) -> None:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE hypotheses SET {sets} WHERE id=?",
+                        (*fields.values(), hid))
+        self.db.commit()
+
+    # ---------- steering (V4/D34) ----------
+    def save_steering(self, s: dict) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO steering VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (s["id"], s["kind"], s.get("created_at", _now()), s["expires_at"],
+             s.get("title", ""), s.get("context", ""),
+             json.dumps(s.get("options", [])), s.get("recommended", ""),
+             s.get("default_on_expiry", "status_quo"), s.get("status", "pending"),
+             json.dumps(s.get("payload", {})),
+             s.get("decided_key"), s.get("decided_at"), s.get("decided_via")))
+        self.db.commit()
+
+    def get_steering(self, sid: str) -> Optional[dict]:
+        r = self.db.execute("SELECT * FROM steering WHERE id=?", (sid,)).fetchone()
+        return dict(r) if r else None
+
+    def steering_requests(self, status: str | None = None, limit: int = 50) -> list[dict]:
+        q, args = "SELECT * FROM steering", []
+        if status:
+            q += " WHERE status=?"; args.append(status)
+        q += " ORDER BY created_at DESC LIMIT ?"; args.append(limit)
+        return [dict(r) for r in self.db.execute(q, args)]
+
+    def update_steering(self, sid: str, **fields) -> None:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE steering SET {sets} WHERE id=?",
+                        (*fields.values(), sid))
+        self.db.commit()
+
+    # ---------- intraday equity marks (V4) ----------
+    def record_intraday_mark(self, equity: float, cash: float, source: str,
+                             min_gap_min: int = 5) -> bool:
+        """Throttled: skip if the last mark for this source is younger than
+        min_gap_min. Returns True if a mark was written."""
+        r = self.db.execute("SELECT MAX(ts) m FROM equity_intraday WHERE source=?",
+                            (source,)).fetchone()
+        now = datetime.now().astimezone()
+        if r["m"]:
+            try:
+                if (now - datetime.fromisoformat(r["m"])).total_seconds() < min_gap_min * 60:
+                    return False
+            except ValueError:
+                pass
+        self.db.execute("INSERT INTO equity_intraday VALUES(?,?,?,?)",
+                        (now.isoformat(timespec="seconds"), equity, cash, source))
+        self.db.commit()
+        return True
+
+    def intraday_marks(self, source: str, since_ts: str = "") -> list[dict]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM equity_intraday WHERE source=? AND ts>=? ORDER BY ts ASC",
+            (source, since_ts))]
 
     # ---------- ai ledger ----------
     def ai_spend_today(self) -> float:

@@ -30,6 +30,19 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     # 1. data
     symbols = list(cfg.get("universe", "symbols", default=[]))
+    # hypothesis watchlist merge (V4/D34): the active short-term hypothesis may
+    # add a bounded set of symbols to this cycle's scan universe. In-memory
+    # config mutation only — the file/override universe is untouched.
+    if cfg.get("hypothesis", "enabled", default=False):
+        from . import hypothesis as hypo_mod
+        extra = [s for s in hypo_mod.watchlist(
+                     store, as_of=as_of,
+                     cap=cfg.get("hypothesis", "max_watchlist", default=8))
+                 if s not in symbols]
+        if extra:
+            symbols = symbols + extra
+            cfg.data["universe"]["symbols"] = symbols
+            store.audit("hypothesis_watchlist_merged", {"added": extra}, cycle_id)
     aux = [cfg.get("universe", "vix_symbol", default="^VIX")]
     if refresh_data:
         data_mod.refresh(store, symbols + aux, log=log)
@@ -49,6 +62,13 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     reg = regime_mod.classify(ctx, cfg)
     store.audit("regime", {"regime": reg.regime, "mult": reg.deployment_multiplier,
                            "evidence": reg.evidence}, cycle_id)
+
+    # steering expiry sweep (V4/D34): cheap + deterministic. An auto-adopt
+    # tier request past its TTL activates here, so this very cycle trades on
+    # it — trading never waits on a human.
+    if cfg.get("hypothesis", "enabled", default=False):
+        from . import steering as steering_mod
+        steering_mod.sweep(cfg, store, now_iso=now_iso)
 
     executor = Executor(cfg, store, broker, governor)
 

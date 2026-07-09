@@ -133,3 +133,20 @@ def load_config(mode: str | None = None, overrides: dict | None = None) -> Confi
     cfg = Config(merged)
     cfg.validate()
     return cfg
+
+
+OVERRIDES_KEY = "config_overrides"
+
+
+def apply_override(store, mode: str, path: list[str], value, via: str = "gui") -> None:
+    """The ONE validated write path for runtime config overrides (GUI and
+    steering both route here). Validates the merged result BEFORE persisting —
+    no caller can sneak a dangerous value past the governor."""
+    ov = store.kv_get(OVERRIDES_KEY, {}) or {}
+    cur = ov
+    for k in path[:-1]:
+        cur = cur.setdefault(k, {})
+    cur[path[-1]] = value
+    load_config(mode, overrides=ov)          # raises ConfigError on danger
+    store.kv_set(OVERRIDES_KEY, ov)
+    store.audit("config_override", {"path": path, "value": value, "via": via})

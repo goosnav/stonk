@@ -107,6 +107,9 @@ nodes:
   congress_trades: {enabled: false, weight: 0.05, status: experimental, horizon_days: 60}
   insider:         {enabled: false, weight: 0.05, status: experimental, horizon_days: 40}
   options_vol:     {enabled: false, weight: 0.05, status: experimental, horizon_days: 30}
+  # deterministic reader of the ACTIVE short-term hypothesis (V4/D28); the AI
+  # generation step is separate + post-close. Needs hypothesis.enabled too.
+  hypothesis:      {enabled: false, weight: 0.40, status: experimental, horizon_days: 10}
 
 ensemble:
   min_final_score: 0.15            # below this: no trade (saying "no" is a feature)
@@ -123,6 +126,16 @@ sizing:
   vol_target_pct: 0.01             # per-position daily vol target (fraction of equity)
   atr_stop_multiple: 1.8
   time_stop_days_default: 20
+
+# V4/D28 hypothesis layer. Master switch; generation additionally requires
+# ai.enabled (the node degrades to silence with no active hypothesis).
+hypothesis:
+  enabled: false
+  short_term_max_age_days: 5      # regen when the active one is older
+  regen_on_regime_change: true
+  north_star_review_days: 30
+  max_watchlist: 8                # symbols the hypothesis may add to the scan
+  steering_ttl_hours: 24          # steering request lifetime before expiry default
 
 ai:
   enabled: false

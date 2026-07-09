@@ -167,6 +167,13 @@ def cmd_reset_kill(args, cfg, store):
     print(f"kill switch '{args.name}' cleared")
 
 
+def cmd_hypothesis(args, cfg, store):
+    """Manual hypothesis upkeep (V4/D34): sweep + bootstrap/rotate/review via
+    steering. Same code path the post-close scheduler runs."""
+    from .steering import maintain
+    print(json.dumps(maintain(cfg, store), indent=2, default=str))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="specforge")
     p.add_argument("--mode", default=None, help="config overlay: paper|live")
@@ -188,6 +195,7 @@ def main(argv=None):
     s = sub.add_parser("approve"); s.add_argument("intent_id")
     s = sub.add_parser("reject"); s.add_argument("intent_id")
     s = sub.add_parser("reset-kill"); s.add_argument("name")
+    sub.add_parser("hypothesis")
     sub.add_parser("bridge-dump")
     s = sub.add_parser("bridge-report")
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")

@@ -59,6 +59,8 @@ Post-close job: mark-to-market equity curve, close matured trade records,
 | `backtest.py` | Walk-forward daily sim, costs, SPY baseline, writes analog trades used by forecast.py | — |
 | `attribution.py` | Fill→node linkage, scorecards, Bayesian-shrunk bounded weight updates, pruning | — |
 | `ai.py` | OpenRouter-compatible client, reserve-then-commit budget ledger, cache | — |
+| `hypothesis.py` | V4/D34: two-tier AI hypotheses (north star + short term), file mirror + dated archive, strict-JSON generation, staleness | — |
+| `steering.py` | V4/D34: non-blocking strategic-choice queue, tiered expiry defaults, validated apply paths, post-close maintenance | — |
 | `montecarlo.py` | Portfolio path simulation (AGENTS.md §25) for GUI/risk | — |
 | `app.py` | FastAPI: dashboard page + JSON API + APScheduler startup | — |
 | `cli.py` | `specforge scan|paper|backtest|status|serve|...` | — |
