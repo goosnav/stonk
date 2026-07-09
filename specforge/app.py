@@ -534,8 +534,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         completed cycle's candidates with governor verdicts + reasons, plus
         every working (resting/relayed/awaiting-approval) order."""
         src = "live" if mode == "live" else "paper"
-        rows = store.audit_rows(limit=400)
-        last = next((r for r in rows if r["event_type"] == "cycle_end"), None)
+        r = store.db.execute("SELECT * FROM audit WHERE event_type='cycle_end' "
+                             "ORDER BY id DESC LIMIT 1").fetchone()
+        last = dict(r) if r else None
         out = {"cycle": None, "considered": [], "working": [], "exits": {}}
         if last:
             summ = json.loads(last["payload"] or "{}")
