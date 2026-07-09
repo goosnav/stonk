@@ -95,7 +95,17 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                             c.get("universe", "vix_symbol", default="^VIX")])
         reg = regime_mod.classify(ctx, c)
         sched = c.get("schedule", default={}) or {}
-        return {"strip": strip, "regime": reg.regime,
+        # structured trend inputs for the indicator tiles (D35) — the same
+        # numbers regime.classify uses, not a parallel calculation
+        bench = c.get("universe", "benchmark", default="SPY")
+        closes = ctx.closes(bench)
+        trend = {}
+        if len(closes) >= 200:
+            trend = {"bench": bench, "px": round(float(closes.iloc[-1]), 2),
+                     "sma50": round(float(closes.rolling(50).mean().iloc[-1]), 2),
+                     "sma200": round(float(closes.rolling(200).mean().iloc[-1]), 2)}
+        return {"strip": strip, "regime": reg.regime, "trend": trend,
+                "vix": ctx.vix(),
                 "regime_evidence": reg.evidence,
                 "deployment_multiplier": reg.deployment_multiplier,
                 "breadth_above_50sma": ctx.breadth_above_sma(50),
@@ -466,6 +476,41 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                "short_term": store.active_hypothesis("short_term"),
                "history": store.hypotheses(limit=20)}
         return out
+
+    @app.get("/api/today")
+    def today():
+        """D35: 'what did the system DO today' digest — scans, candidates,
+        order outcomes, top veto reasons — plus the latest AI reads (news
+        synopsis + active hypothesis). All from audit/orders/kv: real data or
+        empty, never invented."""
+        day = datetime.now().astimezone().date().isoformat()
+        rows = store.db.execute(
+            "SELECT event_type, payload FROM audit "
+            "WHERE date(ts,'localtime')=? AND event_type IN "
+            "('cycle_end','risk_decision') ORDER BY id DESC LIMIT 2000",
+            (day,)).fetchall()
+        scans, candidates, veto_reasons = 0, 0, {}
+        for r in rows:
+            p = json.loads(r["payload"] or "{}")
+            if r["event_type"] == "cycle_end":
+                scans += 1
+                candidates += p.get("candidates", 0)
+            elif p.get("verdict") == "REJECTED":
+                for reason in p.get("reasons", [])[:1]:   # first reason = the blocker
+                    key = reason.split("(")[0].split(":")[0].strip()[:60]
+                    veto_reasons[key] = veto_reasons.get(key, 0) + 1
+        by_status = {}
+        for o in store.orders_today(mode="live" if mode == "live" else "paper"):
+            by_status[o["status"]] = by_status.get(o["status"], 0) + 1
+        st = store.active_hypothesis("short_term")
+        return {
+            "date": day, "scans": scans, "candidates": candidates,
+            "orders": by_status,
+            "top_vetoes": sorted(veto_reasons.items(), key=lambda x: -x[1])[:4],
+            "news": store.kv_get("news_synopsis"),
+            "hypothesis": ((st["thesis"] or "").strip().splitlines()[0][:160]
+                           if st else None),
+        }
 
     @app.get("/api/model")
     def model():

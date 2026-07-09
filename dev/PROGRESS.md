@@ -266,3 +266,12 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   measured edge). 50 offline tests + Playwright smoke green.
 - NOT yet enabled live: hypothesis.enabled stays false until the operator
   flips it (needs AI key set in Config tab first).
+
+## 2026-07-09 (evening) — D35 dynamism + observability
+- [x] Live-quote overlay in run_cycle (root cause of resting orders); hourly
+  live scans; max_daily_new_positions 6. Backtest path untouched (verified:
+  52 offline tests green incl. new limit-pricing regression).
+- [x] Today panel (/api/today: scans/candidates/orders/veto reasons + AI
+  reads), indicator tiles, news synopsis kv, true-orange restyle.
+- Operator TODO for returns: set AI key (Config tab), enable ai + hypothesis
+  + news_sentiment + hypothesis node — decision diversity is the next lever.

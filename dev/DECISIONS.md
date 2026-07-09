@@ -337,3 +337,29 @@ New Model tab: /api/model aggregates every node (base weight × learned
 multiplier = effective weight in the current regime, scorecard, 7d signal
 count) rendered as an SVG flow network (data → nodes → ensemble → governor →
 broker) — the model's learned shape at a glance. Vanilla JS/SVG per D2.
+
+## D35. Dynamism pass: live pricing, hourly cycles, decision observability (2026-07-09, user)
+User pain: one trade, zero movement, tokens burned invisibly. ROOT CAUSE was
+not timidity — scans priced limit orders off the LAST DAILY CLOSE (ctx.close),
+so live orders rested unfilled all day (the GE order). Fixes, in order of
+expected APR impact, none of which dilute edge quality (min_final_score and
+the flat-edge nodes stay untouched — "dynamic" must not mean RNG):
+1. run_cycle now overlays LIVE quotes (QuoteService: stooq/yfinance, ~15min
+   delayed — still beats yesterday) onto entry limit pricing, exit stop
+   checks (stops fire intraday now), and paper broker marks. Injectable
+   (live_quotes param) for tests; backtests stay lookahead-clean
+   (refresh_data=False + no injection ⇒ old behavior, verified).
+2. live.yaml: hourly scans (7/day, 09:35–15:30) — more decision points and
+   faster reconcile of resting orders; max_daily_new_positions 3→6 (it was
+   the binding constraint at 7 cycles/day; per-cycle budget, single-position
+   cap, deployment cap, kill switches all unchanged).
+3. Observability = the product answer to "zero movement": /api/today digest
+   (scans, candidates, order outcomes, top veto reasons — from audit/orders,
+   real or empty, never invented) rendered as the Today panel on Overview;
+   news_sentiment now stores a per-run synopsis (kv news_synopsis, incl.
+   already-priced passes — they explain no-trades) shown as "AI READ" with
+   age label; active hypothesis one-liner alongside.
+4. Indicator tiles on Overview (SPY vs 50/200sma, VIX zone, breadth,
+   deployment) — computed from the same numbers regime.classify uses.
+5. GUI: --amber #ffb000 → true orange #ff7a1a (user request).
+No margin/borrowing anywhere (buys still capped by cash/budget/deployment).

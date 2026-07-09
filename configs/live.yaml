@@ -3,6 +3,11 @@
 mode: live
 broker: robinhood_mcp        # falls back to robinhood_bridge if OAuth is blocked
 live_trading_enabled: true
+# D35 dynamism: hourly cycles = more decision points, faster reconcile of
+# resting orders, intraday stop checks (engine prices off live quotes now,
+# not yesterday's close). Cost: a few extra stooq/yfinance calls per hour.
+schedule:
+  scans: ["09:35", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
 # advanced_override justified: on a $50 probation account the standard
 # percentage caps produce sub-$5 orders (below exchange/engine minimums).
 # The DOLLAR amounts stay tiny; revert to defaults as equity grows past ~$500.
@@ -16,6 +21,9 @@ risk:
   # the real bound on bleed rate, not an idle-cash floor.
   max_account_deployment: 0.98
   min_cash_reserve: 0.02
+  # D35: with 7 cycles/day, 3 new positions/day was the binding constraint on
+  # deployment. 6 keeps single-position and per-cycle caps as the real bounds.
+  max_daily_new_positions: 6
   # AUTONOMOUS by default (user directive): the engine trades on its own within
   # the tiny dollar caps above + kill switches. To watch/gate instead, set
   # `all` (every order waits) or `threshold` here or in the GUI Risk tab.

@@ -7,7 +7,7 @@
 <style>
   /* CONTROL_CENTER_V3 — terminal grade. Zero radius, hairline grid, mono. */
   :root { --bg:#0a0a0a; --panel:#111214; --line:#2a2d33; --text:#e6e6e3;
-          --dim:#8a8f98; --amber:#ffb000; --green:#00d964; --red:#ff4b4b;
+          --dim:#8a8f98; --amber:#ff7a1a; --green:#00d964; --red:#ff4b4b;
           --cyan:#4bd8ff; }
   * { box-sizing:border-box; border-radius:0 !important; }
   body { margin:0; background:var(--bg); color:var(--text);
@@ -131,6 +131,11 @@
     <h2>Account</h2>
     <p class="explain">Live snapshot of the account this engine controls. Cycle budget = the most it may deploy in the next scan (worst-case loss cap per time step).</p>
     <div class="cards" id="acct"></div>
+  </section>
+  <section class="wide">
+    <h2>Today</h2>
+    <p class="explain">What the engine actually did today and what its AI reads say — straight from the audit log, orders table, and the last sentiment/hypothesis run. Empty means nothing ran, never invented data.</p>
+    <div id="todaybox">—</div>
   </section>
   <section class="wide" id="steersec" style="display:none">
     <h2>Steering — strategic choices</h2>
@@ -350,10 +355,41 @@ async function refreshMarket(){
     `<span class="tick" title="source: ${q.source} · as of ${q.as_of}">
        <span class="dim">${s.replace('^','')}</span><b>${q.price}</b>
        <span class="${cls(q.change_pct)}">${q.change_pct==null?'':pct(q.change_pct)}</span></span>`).join('');
+  const t=m.trend||{}, vix=m.vix, br=m.breadth_above_50sma;
+  const tile=(label,val,ok,sub)=>`<div style="border:1px solid var(--line);padding:6px 8px;min-width:104px">
+    <div class="dim" style="font-size:10px">${label}</div>
+    <div style="color:${ok==null?'var(--text)':ok?'var(--green)':'var(--red)'};font-size:15px"><b>${val}</b></div>
+    <div class="dim" style="font-size:10px">${sub||''}</div></div>`;
+  const tiles = [
+    t.px ? tile(`${t.bench} vs 50sma`, t.px>t.sma50?'ABOVE':'BELOW', t.px>t.sma50, `${t.px} / ${t.sma50}`) : '',
+    t.px ? tile(`${t.bench} vs 200sma`, t.px>t.sma200?'ABOVE':'BELOW', t.px>t.sma200, `${t.px} / ${t.sma200}`) : '',
+    vix!=null ? tile('VIX', vix.toFixed(1), vix<20, vix<20?'calm':vix<28?'elevated':'stressed') : '',
+    br!=null ? tile('breadth >50sma', pct(br,0), br>0.5, 'of universe') : '',
+    tile('deployment', '×'+m.deployment_multiplier, m.deployment_multiplier>0, m.regime),
+  ].join('');
   $('regimebox').innerHTML = `<span class="badge ${m.regime}">${m.regime}</span>
-    <b> ×${m.deployment_multiplier}</b> deployment<br>
-    <span class="dim" style="font-size:11.5px">${(m.regime_evidence||[]).join(' · ')}</span>
-    <br><span class="dim" style="font-size:11.5px">breadth &gt;50sma: ${m.breadth_above_50sma==null?'—':pct(m.breadth_above_50sma,0)}</span>`;
+    <b> ×${m.deployment_multiplier}</b> deployment
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${tiles}</div>
+    <div class="dim" style="font-size:10.5px;margin-top:6px">${(m.regime_evidence||[]).join(' · ')}</div>`;
+}
+async function refreshToday(){
+  const t=await api('/api/today');
+  const o=t.orders||{};
+  const ord=Object.keys(o).length?Object.entries(o).map(([k,v])=>
+    `<span class="${k==='filled'?'pos':k==='vetoed'||k==='rejected'?'neg':''}">${v} ${k}</span>`).join(' · '):'no orders yet';
+  const vetoes=(t.top_vetoes||[]).map(([r,n])=>`${r} ×${n}`).join(' · ');
+  let ai='';
+  if(t.hypothesis) ai+=`<div style="margin-top:6px"><span class="badge">HYPOTHESIS</span> ${t.hypothesis}</div>`;
+  if(t.news&&t.news.items){
+    const age=Math.round((Date.now()-+new Date(t.news.ts))/36e5);
+    ai+=`<div style="margin-top:6px"><span class="badge">AI READ</span> <span class="dim">${age}h ago</span> `+
+      t.news.items.slice(0,5).map(i=>`<div style="margin:2px 0 0 6px">
+        <b class="${i.sentiment>0?'pos':i.sentiment<0?'neg':''}">${i.symbol} ${i.sentiment>0?'+':''}${i.sentiment}</b>
+        <span class="dim">[${i.catalyst}${i.already_priced?' · priced in':''}]</span> ${i.summary}</div>`).join('')+`</div>`;
+  }
+  if(!ai) ai=`<div class="dim" style="margin-top:6px">no AI reads yet — enable AI + a key in Config, sentiment/hypothesis appear here after their next run</div>`;
+  $('todaybox').innerHTML=`<b>${t.scans}</b> scans · <b>${t.candidates}</b> candidates → ${ord}`+
+    (vetoes?`<div class="dim" style="font-size:11px;margin-top:4px">top vetoes: ${vetoes}</div>`:'')+ai;
 }
 
 /* ---------- health = single source of truth for the status bar ---------- */
@@ -765,12 +801,13 @@ function refreshAll(){
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
+  guard(refreshToday,'todaybox');
 }
 refreshAll();
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
-  refreshCosts();refreshAudit();refreshSteering();},60000);
+  refreshCosts();refreshAudit();refreshSteering();refreshToday();},60000);
 </script>
 </body>
 </html>

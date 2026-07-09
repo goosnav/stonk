@@ -23,7 +23,8 @@ from .store import Store
 
 
 def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
-              refresh_data: bool = True, registry=None, log=print) -> dict:
+              refresh_data: bool = True, registry=None, log=print,
+              live_quotes: dict | None = None) -> dict:
     cycle_id = new_id()
     source = "live" if cfg.mode == "live" else "paper"
     store.audit("cycle_start", {"as_of": as_of, "mode": cfg.mode}, cycle_id)
@@ -48,10 +49,25 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         data_mod.refresh(store, symbols + aux, log=log)
     ctx = MarketContext(store, cfg, as_of, offline=not refresh_data)
 
+    # 1.5 live prices (D35). Without these, limit prices come from the LAST
+    # DAILY CLOSE — live orders rest unfilled all day (the GE order, D26).
+    # Stooq/yfinance quotes are ~15min delayed; that still beats yesterday.
+    # Backtests (refresh_data=False, no injection) stay lookahead-clean.
+    live_px = dict(live_quotes or {})
+    if refresh_data and not live_px:
+        try:
+            from .quotes import QuoteService
+            live_px = {s: q["price"] for s, q in
+                       QuoteService(cfg).get(symbols).items() if q.get("price")}
+        except Exception as e:                 # noqa: BLE001 — quotes are garnish
+            store.audit("live_quotes_failed", {"error": str(e)[:200]}, cycle_id)
+    if live_px:
+        store.audit("live_quotes", {"n": len(live_px)}, cycle_id)
+
     # 2. account + broker
     broker = broker or make_broker(cfg, store)
     if hasattr(broker, "set_quotes"):          # paper broker has no live feed
-        broker.set_quotes(ctx.prices())
+        broker.set_quotes({**ctx.prices(), **live_px})
     account = broker.get_account()
 
     # 3. safety rails up front. Logical clock = as_of date + real time-of-day:
@@ -83,7 +99,8 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         store.audit("position_mismatch", mismatches, cycle_id)
         for pid in mismatches.get("engine_only_ids", []):
             store.close_position(pid)
-    exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime, mode=source)
+    exits = _check_exits(ctx, store, executor, account, cycle_id, reg.regime,
+                         mode=source, live_px=live_px)
 
     # 5. human-approved intents from the queue
     approvals = executor.process_approval_queue(account, ctx, cycle_id, reg.regime)
@@ -130,7 +147,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                                  "regime_mult": reg.deployment_multiplier}, cycle_id)
     entry_results = {}
     for cand, notional in targets:
-        price = ctx.close(cand.symbol)
+        price = live_px.get(cand.symbol) or ctx.close(cand.symbol)
         if not price:
             continue
         status = executor.execute_entry(
@@ -178,14 +195,18 @@ def _position_mismatch(store: Store, account, mode: str = 'paper') -> dict:
 
 
 def _check_exits(ctx: MarketContext, store: Store, executor: Executor,
-                 account, cycle_id: str, regime: str, mode: str = 'paper') -> dict:
+                 account, cycle_id: str, regime: str, mode: str = 'paper',
+                 live_px: dict | None = None) -> dict:
     """Stop-loss and time-stop exits (AGENTS.md §28 MVP subset; score-decay and
-    regime exits arrive with attribution in Phase 5)."""
+    regime exits arrive with attribution in Phase 5). live_px (D35) lets stops
+    fire on intraday prices instead of waiting for the next daily bar."""
+    live_px = live_px or {}
     results = {}
     as_of_dt = datetime.strptime(ctx.as_of, "%Y-%m-%d")
     for pos in store.open_positions(mode=mode):
         is_option = pos["asset_type"] == "option"
-        price = _option_mark(ctx, pos) if is_option else ctx.close(pos["symbol"])
+        price = (_option_mark(ctx, pos) if is_option
+                 else live_px.get(pos["symbol"]) or ctx.close(pos["symbol"]))
         if price is None:
             continue
         reason = None

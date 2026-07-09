@@ -235,6 +235,40 @@ def test_portfolio_value_and_steering_endpoints(cfg, store):
     assert client.post(f"/api/steering/{r2['id']}", json={"choice": "adopt"}).status_code == 400
 
 
+def test_live_quotes_price_orders_not_stale_close(cfg, store):
+    """D35 root cause: limits must price off live quotes when provided, not
+    yesterday's daily close (stale limits = resting unfilled orders)."""
+    as_of = store.latest_bar_date("AAA")     # synth data ends before today
+    ctx = MarketContext(store, cfg, as_of=as_of)
+    live = {s: round(ctx.close(s) * 1.03, 4) for s in ["AAA", "BBB", "CCC"]}
+    summary = run_cycle(cfg, store, as_of=as_of, refresh_data=False,
+                        live_quotes=live)
+    buys = [o for o in store.orders_today("buy", day=as_of)
+            if o["status"] in ("filled", "reviewed", "placed")]
+    assert buys, f"no buys placed: {summary['entries']}"
+    off = cfg.get("execution", "limit_offset_pct", default=0.001)
+    for o in buys:
+        assert abs(o["limit_price"] - live[o["symbol"]] * (1 + off)) < 0.01, \
+            f"{o['symbol']} limit {o['limit_price']} not from live px {live[o['symbol']]}"
+
+
+def test_today_digest_endpoint(cfg, store):
+    """D35: the Today panel is real audit/orders/kv data — scans, candidates,
+    order outcomes, and the AI reads when present."""
+    from fastapi.testclient import TestClient
+
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    run_cycle(cfg, store, refresh_data=False)
+    store.kv_set("news_synopsis", {"ts": "2026-07-09T10:00:00-07:00", "items": [
+        {"symbol": "AAA", "sentiment": 0.6, "catalyst": "earnings",
+         "summary": "beat", "already_priced": False}]})
+    t = client.get("/api/today").json()
+    assert t["scans"] >= 1 and isinstance(t["orders"], dict)
+    assert t["news"]["items"][0]["symbol"] == "AAA"
+    assert t["hypothesis"] is None                      # none active → honest null
+
+
 def test_model_endpoint(cfg, store):
     """V4: the model view exposes every configured node with effective weight
     = base × learned multiplier, plus regime and hypothesis link."""

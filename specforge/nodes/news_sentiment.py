@@ -69,7 +69,8 @@ class Node(SignalNode):
             return []
         as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")
         events = []
-        for sym in ctx.universe:
+        synopsis = []               # D35: homepage "AI read" — every classified
+        for sym in ctx.universe:    # result, incl. the ones that DON'T trade
             if sym.startswith("^"):
                 continue
             heads = self._headlines(ctx, sym)
@@ -87,6 +88,11 @@ class Node(SignalNode):
                 sentiment = max(-1.0, min(1.0, float(result["sentiment"])))
                 confidence = max(0.0, min(1.0, float(result["confidence"])))
                 horizon = int(result.get("horizon_days", self.horizon_days))
+                synopsis.append({
+                    "symbol": sym, "sentiment": round(sentiment, 2),
+                    "catalyst": str(result.get("catalyst", "?"))[:20],
+                    "summary": str(result.get("summary", ""))[:140],
+                    "already_priced": bool(result.get("already_priced"))})
                 if result.get("already_priced"):
                     continue
             except (KeyError, TypeError, ValueError):
@@ -105,4 +111,8 @@ class Node(SignalNode):
                 evidence=[f"{result.get('catalyst','?')}: "
                           f"{str(result.get('summary',''))[:120]}"],
                 data_as_of=as_of, node_id=self.id, node_version=self.version))
+        if synopsis:
+            ctx.store.kv_set("news_synopsis", {
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "items": synopsis[:12]})
         return events
