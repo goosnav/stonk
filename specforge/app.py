@@ -149,13 +149,14 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        # Liveness probe: no broker/network calls, safe to poll every second.
+        """Truth aggregator (CONTROL_CENTER_V3): mode, real broker
+        connectivity, heartbeat, market clock, and — always — WHY we are not
+        trading whenever we aren't. Broker probe is kv-cached 60s."""
+        from .health import system_health
         sched = getattr(app.state, "scheduler", None)
         jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
-        return {"ok": True, "mode": mode, "scheduler_running": bool(sched and sched.running),
-                "next_runs": jobs,
-                # local DB count only — keeps this endpoint broker-call-free (D32)
-                "pending_approvals": len(store.pending_approvals())}
+        return system_health(fresh_cfg(), store, next_runs=jobs,
+                             scheduler_alive=bool(sched and sched.running))
 
     @app.get("/api/version")
     def version():
@@ -430,6 +431,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         cfg = current_config(store, mode)
         try:
             summary = run_cycle(cfg, store)
+            from .health import write_heartbeat
+            write_heartbeat(store, summary["cycle_id"], cfg.mode, source="serve")
             print(f"[scheduler] scan done: {summary['cycle_id']} "
                   f"entries={summary['entries']} exits={summary['exits']}")
             if summary.get("kill_switches"):

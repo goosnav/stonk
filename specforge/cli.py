@@ -36,8 +36,18 @@ def cmd_data(args, cfg, store):
 
 def cmd_scan(args, cfg, store):
     from .engine import run_cycle
+    from .health import write_heartbeat
     summary = run_cycle(cfg, store, as_of=args.as_of,
                         refresh_data=not args.no_refresh)
+    write_heartbeat(store, summary["cycle_id"], cfg.mode, source="cron")
+    if getattr(args, "post_close", False):
+        # cron run-model equivalent of the serve post-close job (attribution)
+        from .attribution import propose_promotions, update_weights
+        update_weights(cfg, store)
+        props = propose_promotions(cfg, store)
+        if props:
+            store.kv_set("promotion_proposals", props)
+            store.audit("promotion_proposals", props)
     print(json.dumps(summary, indent=2))
 
 
@@ -98,6 +108,47 @@ def cmd_reject(args, cfg, store):
     print(f"rejected {args.intent_id}")
 
 
+def cmd_tui(args, cfg, store):
+    """Terminal live view (no server needed): status, positions, audit tail.
+    Doubles as the is-it-alive probe. Ctrl-C exits."""
+    import time
+    from .health import system_health
+    G, R, A, D, X = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+    try:
+        while True:
+            h = system_health(cfg, store)
+            eq = store.equity_curve("live" if cfg.mode == "live" else "paper")
+            lines = ["\033[2J\033[H\033[1mSPECFORGE " + cfg.mode.upper() + X]
+            b = h["broker"]
+            tag = (G + "[" + b["adapter"] + " OK]" + X) if b["connected"] \
+                else (R + "[" + b["adapter"] + " DOWN: " + (b.get("detail") or "")[:60] + "]" + X)
+            hb = h["engine"]["heartbeat_age_s"]
+            hb_s = "never" if hb is None else f"{hb}s ago"
+            lines.append(f"{tag}  market:{h['market']['session']} {h['market']['et']}"
+                         f"  heartbeat:{hb_s}  approvals:{h['pending_approvals']}")
+            rd = h["readiness"]
+            lines.append((G + "TRADING" + X) if rd["trading"] else
+                         (A + "NOT TRADING:" + X + " " + "; ".join(rd["reasons"])))
+            if eq:
+                lines.append(f"equity ${eq[-1]['equity']:,.2f}  cash ${eq[-1]['cash']:,.2f}"
+                             f"  (marked {eq[-1]['d']})")
+            pos = store.open_positions(mode="live" if cfg.mode == "live" else "paper")
+            lines.append(D + f"-- positions ({len(pos)}) --" + X)
+            for p in pos[:10]:
+                lines.append(f"  {p['symbol']:<6} qty {p['qty']:<12} avg {p['avg_cost']}")
+            lines.append(D + "-- last events --" + X)
+            for r in store.audit_rows(limit=8):
+                lines.append(D + f"  {r['ts'][5:19]} {r['event_type']:<24}" + X
+                             + (r["payload"] or "")[:70])
+            nxt = h["engine"]["next_runs"]
+            if nxt:
+                lines.append(D + "next: " + "; ".join(str(v) for v in nxt.values())[:100] + X)
+            print("\n".join(lines), flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
 def cmd_bridge_dump(args, cfg, store):
     from .broker.bridge import bridge_dump
     print(json.dumps(bridge_dump(store, cfg), indent=2, default=str))
@@ -125,6 +176,9 @@ def main(argv=None):
     s = sub.add_parser("scan")
     s.add_argument("--as-of", default=None)
     s.add_argument("--no-refresh", action="store_true")
+    s.add_argument("--post-close", action="store_true", dest="post_close",
+                   help="also run attribution/weight updates (cron run-model)")
+    s = sub.add_parser("tui"); s.add_argument("--interval", type=int, default=5)
     sub.add_parser("status")
     s = sub.add_parser("backtest")
     s.add_argument("--years", type=int, default=10)

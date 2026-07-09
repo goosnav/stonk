@@ -110,8 +110,22 @@ def test_commit_reports_snapshots_dev_reports(store, tmp_path):
 
 
 def test_health_endpoint(cfg, store):
+    """V3 truth contract: reasons NEVER empty when not trading; broker honest;
+    heartbeat tracked; never throws."""
     from fastapi.testclient import TestClient
     from specforge.app import create_app
-    body = TestClient(create_app(cfg, store, with_scheduler=False)).get("/api/health").json()
-    assert body["ok"] is True and body["scheduler_running"] is False
-    assert body["pending_approvals"] == 0  # D32: fresh store has empty queue
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    body = client.get("/api/health").json()
+    assert body["mode"] == "paper"
+    assert body["broker"]["adapter"] == "paper" and body["broker"]["connected"]
+    assert "SIMULATION" in body["broker"]["detail"]
+    assert body["readiness"]["trading"] is False
+    assert any("PAPER" in r for r in body["readiness"]["reasons"])       # sim labeled
+    assert any("heartbeat" in r for r in body["readiness"]["reasons"])   # never ran
+    assert body["pending_approvals"] == 0
+    # heartbeat write clears the never-ran reason
+    from specforge.health import write_heartbeat
+    write_heartbeat(store, "cyc1", "paper", source="cron")
+    body2 = client.get("/api/health").json()
+    assert not any("heartbeat" in r for r in body2["readiness"]["reasons"])
+    assert body2["engine"]["heartbeat_source"] == "cron"
