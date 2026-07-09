@@ -44,6 +44,9 @@ class Governor:
         self.r = cfg.get("risk", default={})
         # logical clock: backtester injects historical timestamps; live = real now
         self.now_iso = now_iso or datetime.now().astimezone().isoformat()
+        # orders in the shared DB are tagged by mode (D26): daily caps and the
+        # duplicate cooldown must count only same-mode orders
+        self.mode = "live" if cfg.mode == "live" else "paper"
 
     @property
     def today(self) -> str:
@@ -115,7 +118,7 @@ class Governor:
                                   f"{(1 - eq/peak):.1%} below peak {peak:.2f}",
                       auto_clear_days=cooldown)
         # broker-level bounces only; governor vetoes carry status 'vetoed'
-        rejected_today = len([o for o in self.store.orders_today(day=self.today)
+        rejected_today = len([o for o in self.store.orders_today(day=self.today, mode=self.mode)
                               if o["status"] == "rejected"])
         if rejected_today > self.r.get("max_rejected_orders_per_day", 5):
             self.trip("rejected_orders", f"{rejected_today} rejected orders today")
@@ -172,7 +175,8 @@ class Governor:
             return rj(f"stale data: age={data_age_days} days")
         if self.store.recent_order_exists(
                 intent.symbol, intent.side,
-                self.r.get("duplicate_order_cooldown_min", 60), now_iso=self.now_iso):
+                self.r.get("duplicate_order_cooldown_min", 60),
+                now_iso=self.now_iso, mode=self.mode):
             return rj("duplicate: same symbol+side within cooldown")
         if intent.asset_type == "option":
             if not self.options_unlocked(account):
@@ -194,7 +198,7 @@ class Governor:
         # per-DAY cap, not per-cycle (live mode runs 3 scan cycles a day).
         # This cycle's earlier fills are already recorded in orders, so the
         # DB count alone is the complete number — don't add cycle.new_positions.
-        buys_today = len([o for o in self.store.orders_today("buy", day=self.today)
+        buys_today = len([o for o in self.store.orders_today("buy", day=self.today, mode=self.mode)
                           if o["status"] in ("filled", "placed", "reviewed")])
         if buys_today + 1 > self.r.get("max_daily_new_positions", 3):
             return rj(f"max_daily_new_positions reached ({buys_today} placed today)")

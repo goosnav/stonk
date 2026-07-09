@@ -23,6 +23,16 @@ from .store import Store
 STATIC = Path(__file__).resolve().parent.parent / "static"
 OVERRIDES_KEY = "config_overrides"
 
+# Known AI providers → OpenAI-compatible base URL. All four speak the same
+# chat-completions shape (Anthropic via its OpenAI-compat endpoint), so only the
+# base_url + key change; ai.py's request code is provider-agnostic. 'custom'
+# lets the user paste any other OpenAI-compatible base_url.
+AI_PROVIDERS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+}
+
 
 def current_config(store: Store, mode: str):
     return load_config(mode, overrides=store.kv_get(OVERRIDES_KEY, {}))
@@ -363,6 +373,37 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 raise HTTPException(400, f"ai key not editable via GUI: {k}")
             _set_override(["ai", k], v)
         return {"ok": True}
+
+    @app.get("/api/ai/provider")
+    def get_ai_provider():
+        """Current provider + whether a key is set. NEVER returns the key —
+        only a masked last-4 hint (it is a secret)."""
+        import os
+        base = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1")
+        key = os.environ.get("AI_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+        provider = next((p for p, u in AI_PROVIDERS.items() if u == base), "custom")
+        return {"provider": provider, "base_url": base, "key_set": bool(key),
+                "key_hint": ("…" + key[-4:]) if len(key) >= 4 else "",
+                "providers": AI_PROVIDERS}
+
+    @app.post("/api/ai/provider")
+    def set_ai_provider(body: dict):
+        """Persist provider base_url (+ optional new key) to .env and apply live.
+        A blank api_key keeps the current one (so you can switch provider without
+        re-typing the key)."""
+        from .config import set_env_var
+        provider = body.get("provider", "custom")
+        base_url = (AI_PROVIDERS.get(provider) or body.get("base_url", "") or "").strip()
+        if not base_url.startswith(("http://", "https://")):
+            raise HTTPException(400, "base_url must be a valid http(s) URL")
+        set_env_var("AI_BASE_URL", base_url)
+        key = (body.get("api_key") or "").strip()
+        if key:
+            set_env_var("AI_API_KEY", key)
+        # audit records the provider/base_url but NEVER the key value
+        store.audit("ai_provider_set", {"provider": provider, "base_url": base_url,
+                                        "key_changed": bool(key), "via": "gui"})
+        return {"ok": True, "provider": provider, "base_url": base_url}
 
     @app.post("/api/approvals/{intent_id}")
     def decide(intent_id: str, body: dict):

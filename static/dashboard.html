@@ -209,11 +209,28 @@
     <button onclick="saveRisk()">Save risk settings</button>
   </section>
   <section>
+    <h2>AI provider &amp; key</h2>
+    <p class="explain">The key is stored in <code>.env</code> (gitignored, never committed) and applied to the running server immediately — the next scan uses it. It is never sent back to this page; only a masked hint is shown. All providers use the OpenAI-compatible chat API.</p>
+    <table class="kv"><tbody>
+      <tr><td>provider</td><td>
+        <select id="ai_provider" onchange="onProviderChange()">
+          <option value="openrouter">OpenRouter</option>
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="custom">Custom (OpenAI-compatible)</option>
+        </select></td></tr>
+      <tr><td>base URL</td><td><input type="text" id="ai_base_url" placeholder="https://…/v1"></td></tr>
+      <tr><td>API key</td><td><input type="password" id="ai_key" autocomplete="off" placeholder="leave blank to keep current"></td></tr>
+      <tr><td>current key</td><td id="ai_key_status">—</td></tr>
+    </tbody></table>
+    <button onclick="saveProvider()">Save provider &amp; key</button>
+  </section>
+  <section>
     <h2>AI &amp; cost meter</h2>
     <p class="explain">AI only enriches signals — it can never place trades or bypass the governor. The ledger reserves a task's full cost up front and skips work when the daily budget is spent.</p>
     <table class="kv"><tbody id="ai">
       <tr><td>AI enabled</td><td><input type="checkbox" id="ai_enabled"></td></tr>
-      <tr><td>model (OpenRouter id)</td><td><input type="text" id="ai_model"></td></tr>
+      <tr><td>model (provider id)</td><td><input type="text" id="ai_model"></td></tr>
       <tr><td>daily budget $</td><td><input type="number" step="0.25" id="ai_budget"></td></tr>
       <tr><td>spend today</td><td id="ai_today">—</td></tr>
       <tr><td>estimated $/day (enabled AI nodes)</td><td id="ai_est">—</td></tr>
@@ -523,6 +540,27 @@ async function saveAI(){
     daily_budget_usd:parseFloat($('ai_budget').value)});
   toast('AI settings saved');refreshCosts();
 }
+let AI_PROVIDERS={};
+function onProviderChange(){
+  const p=$('ai_provider').value, base=$('ai_base_url');
+  if(p==='custom'){ base.disabled=false; }
+  else { base.value=AI_PROVIDERS[p]||base.value; base.disabled=true; }
+}
+async function refreshProvider(){
+  const p=await api('/api/ai/provider');
+  AI_PROVIDERS=p.providers||{};
+  $('ai_provider').value=p.provider;
+  $('ai_base_url').value=p.base_url||'';
+  $('ai_base_url').disabled = p.provider!=='custom';
+  $('ai_key_status').textContent = p.key_set ? ('set ('+p.key_hint+')') : 'not set';
+}
+async function saveProvider(){
+  const body={provider:$('ai_provider').value, base_url:$('ai_base_url').value};
+  const k=$('ai_key').value.trim(); if(k) body.api_key=k;
+  await post('/api/ai/provider',body);
+  $('ai_key').value='';
+  toast('provider & key saved (next scan uses it)'); refreshProvider();
+}
 
 /* ---------- charts / activity ---------- */
 async function refreshCurve(){
@@ -586,7 +624,7 @@ function refreshAll(){
   guard(refreshStatus,'acct'); guard(refreshBroker,'brokerbox');
   guard(refreshCandidates,'candidates'); guard(refreshApprovals,'approvals');
   guard(refreshTrades,'trades'); guard(refreshNodes,'nodes');
-  guard(refreshRisk,'risk'); guard(refreshCosts,'ai');
+  guard(refreshRisk,'risk'); guard(refreshCosts,'ai'); guard(refreshProvider,'ai');
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
 }

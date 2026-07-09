@@ -31,7 +31,10 @@ class AIClient:
     def __init__(self, cfg, store: Store):
         self.cfg = cfg.get("ai", default={}) or {}
         self.store = store
-        self.api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        # AI_API_KEY is the provider-agnostic key the GUI writes; keep
+        # OPENROUTER_API_KEY as a fallback so existing .env files still work.
+        self.api_key = (os.environ.get("AI_API_KEY")
+                        or os.environ.get("OPENROUTER_API_KEY", ""))
         self.base_url = os.environ.get("AI_BASE_URL",
                                        self.cfg.get("base_url",
                                                     "https://openrouter.ai/api/v1"))

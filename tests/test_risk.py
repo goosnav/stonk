@@ -201,7 +201,7 @@ def test_approve_after_expiry_refused(store):
     import pytest as _pt
     store.db.execute(
         "INSERT INTO orders VALUES('i1','c1','','AAA','equity','buy',1,10.0,10.0,"
-        "'k1','pending_approval',NULL,NULL,'2026-01-01T10:00:00-07:00','')")
+        "'k1','pending_approval',NULL,NULL,'2026-01-01T10:00:00-07:00','','paper')")
     store.queue_approval("i1", "2026-01-01T11:00:00-07:00")   # long past
     with _pt.raises(ValueError, match="expired"):
         store.decide_approval("i1", "approved")

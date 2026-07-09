@@ -282,7 +282,23 @@ stack, amber/green tags, SIM prefix on every simulated $, per-panel FEED
 ERROR guards, no emoji). FIRST AUTONOMOUS LIVE TRADE at 10:50 ET: BUY
 0.033319 GE @ $359.86 avg (RH order 6a4fb551…, market order per fractional
 rule D12), sized by the governor to the $12 neutral-regime cycle budget.
-KNOWN GAP: orders table isn't mode-tagged (positions are, D23) — paper
-CAT/AMD orders from the same morning blocked live CAT/AMD entries via the
-duplicate cooldown (conservative direction, still wrong; fix = mode column on
-orders + filter in recent_order_exists/orders_today).
+CLOSED GAP (D26 follow-up): orders table is now mode-tagged, mirroring
+positions (D23). `mode` column added + ALTER-migrated; the migration backfills
+pre-existing rows to 'live' only when they carry a broker_order_id (paper fills
+never do), so the resting live GE order above stays visible to live-mode
+reconcile. Executor stamps self.mode at record_order; Governor filters by mode
+in recent_order_exists and orders_today (duplicate cooldown + daily caps);
+reconcile and the approval-queue placement query filter by mode too. Regression:
+tests/test_pipeline.py::test_paper_orders_invisible_to_live_mode.
+
+## D27. GUI API-key + provider management (2026-07-09)
+The AI enrichment key was env-only (OPENROUTER_API_KEY in .env), no GUI path.
+Added a provider picker (OpenRouter / OpenAI / Anthropic / custom) + key field
+to the Risk/Config page. All four providers speak the OpenAI chat-completions
+shape (Anthropic via its OpenAI-compatible endpoint), so only base_url + key
+change — the httpx call in ai.py is untouched. The key persists to ROOT/.env
+(gitignored, chmod 600) via config.set_env_var and is applied to os.environ
+live, so the next scan's fresh AIClient picks it up without a restart. ai.py
+now reads AI_API_KEY first, falling back to OPENROUTER_API_KEY for back-compat.
+Secrets never touch the DB and are never echoed back: GET returns only
+{key_set, last-4 hint}; the audit logs provider/base_url but not the key.

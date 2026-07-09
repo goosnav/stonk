@@ -67,7 +67,7 @@ class Executor:
             # 'rejected', so routine vetoes never trip the rejected-order storm
             # kill switch (that switch exists for broker bounces)
             intent.status = "vetoed"
-            self.store.record_order(intent)
+            self.store.record_order(intent, self.mode)
             return "rejected"
 
         # governor may have shrunk the size
@@ -77,7 +77,7 @@ class Executor:
 
         if decision.verdict == "REQUIRES_HUMAN_APPROVAL":
             intent.status = "pending_approval"
-            if not self.store.record_order(intent):
+            if not self.store.record_order(intent, self.mode):
                 return "duplicate"
             expires = (datetime.fromisoformat(self.now_iso) + timedelta(
                 hours=self.cfg.get("risk", "approval_timeout_hours", default=24))).isoformat()
@@ -86,7 +86,7 @@ class Executor:
                                                  "notional": intent.notional}, cycle_id)
             return "pending_approval"
 
-        if not self.store.record_order(intent):
+        if not self.store.record_order(intent, self.mode):
             self.store.audit("duplicate_order_blocked",
                              {"key": intent.idempotency_key}, cycle_id)
             return "duplicate"
@@ -142,7 +142,7 @@ class Executor:
             option_symbol=position.get("option_symbol"))
         intent = OrderIntent.make(cand, qty=position["qty"], limit_price=limit,
                                   now_iso=self.now_iso)
-        if not self.store.record_order(intent):
+        if not self.store.record_order(intent, self.mode):
             return "duplicate"
         status = self._review_and_place(intent, None, None, cycle_id, regime)
         if status == "filled":
@@ -181,7 +181,8 @@ class Executor:
             return {}
         results = {}
         rows = [dict(r) for r in self.store.db.execute(
-            "SELECT * FROM orders WHERE status IN ('placed','pending_relay','relayed')")]
+            "SELECT * FROM orders WHERE status IN ('placed','pending_relay','relayed') "
+            "AND mode=?", (self.mode,))]
         for o in rows:
             intent = OrderIntent(
                 id=o["id"], candidate_id=o["candidate_id"], symbol=o["symbol"],
@@ -228,7 +229,8 @@ class Executor:
                 self.store.audit("approval_expired", {"intent": row["intent_id"]}, cycle_id)
         approved = [dict(r) for r in self.store.db.execute(
             "SELECT o.* FROM orders o JOIN approvals a ON a.intent_id=o.id "
-            "WHERE a.status='approved' AND o.status='pending_approval'")]
+            "WHERE a.status='approved' AND o.status='pending_approval' AND o.mode=?",
+            (self.mode,))]
         for o in approved:
             intent = OrderIntent(
                 id=o["id"], candidate_id=o["candidate_id"], symbol=o["symbol"],
