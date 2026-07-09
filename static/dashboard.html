@@ -154,8 +154,8 @@
     <div id="regimebox">—</div>
   </section>
   <section class="wide">
-    <h2>Portfolio value <span id="pv_now" style="float:right"></span></h2>
-    <p class="explain">Total account value (cash + positions). Daily scan marks plus throttled intraday marks. Source: <span id="curvesrc">…</span>.</p>
+    <h2>Net P&amp;L — trading only <span id="pv_now" style="float:right"></span></h2>
+    <p class="explain">Realized (closed trades) + unrealized (open positions vs marks). Deposits and withdrawals NEVER move this line — it is the honest "is the strategy making money" chart. Source: <span id="curvesrc">…</span>.</p>
     <div id="pv_ranges" style="margin:4px 0 6px">
       <button data-r="1D">1D</button><button data-r="1W">1W</button>
       <button data-r="1M" class="on">1M</button><button data-r="ALL">ALL</button>
@@ -182,8 +182,16 @@
 <!-- ============ TRADING ============ -->
 <div class="page" data-page="trading" style="display:none">
   <section class="wide">
+    <h2>Decisions — what the engine is doing</h2>
+    <p class="explain">Every move the last scan considered, the governor's verdict on each, and every order currently working at the broker. This is the raw decision trail, not a summary.</p>
+    <div id="working">—</div>
+    <table id="decisions" style="margin-top:8px"><thead><tr><th>sym</th><th>score</th><th>size</th>
+      <th>verdict</th><th>result</th><th>why</th></tr></thead><tbody></tbody></table>
+    <div class="dim" id="dec_cycle" style="font-size:10.5px;margin-top:4px"></div>
+  </section>
+  <section class="wide">
     <h2>Open positions</h2>
-    <p class="explain">Marked with live quotes when available (source + age shown). Stops and time stops are enforced by the engine at each scan, not intraday.</p>
+    <p class="explain">Marked with live quotes when available (source + age shown). Stops and time stops are checked against live quotes at every scan (hourly in live mode).</p>
     <table id="positions"><thead><tr><th>symbol</th><th>qty</th><th>avg cost</th><th>mark</th><th>src</th><th>P&amp;L %</th><th>P&amp;L $</th><th>value</th></tr></thead><tbody></tbody></table>
   </section>
   <section class="wide">
@@ -245,9 +253,12 @@
     <p class="explain">AI only enriches signals — it can never place trades or bypass the governor. The ledger reserves a task's full cost up front and skips work when the daily budget is spent.</p>
     <table class="kv"><tbody id="ai">
       <tr><td>AI enabled</td><td><input type="checkbox" id="ai_enabled"></td></tr>
-      <tr><td>model (provider id)</td><td><input type="text" id="ai_model"></td></tr>
+      <tr><td>default model</td><td><input type="text" id="ai_model"></td></tr>
+      <tr><td>news / bulk model (cheap, high volume)</td><td><input type="text" id="ai_model_news" placeholder="deepseek/deepseek-chat-v3-0324"></td></tr>
+      <tr><td>strategy model (flagship reasoner; try x-ai/grok-4 for the X angle)</td><td><input type="text" id="ai_model_hypo" placeholder="anthropic/claude-sonnet-4.5"></td></tr>
       <tr><td>daily budget $</td><td><input type="number" step="0.25" id="ai_budget"></td></tr>
-      <tr><td>spend today</td><td id="ai_today">—</td></tr>
+      <tr><td>monthly ceiling $ (all AI)</td><td><input type="number" step="1" id="ai_month_budget"></td></tr>
+      <tr><td>spend today / this month</td><td id="ai_today">—</td></tr>
       <tr><td>estimated $/day (enabled AI nodes)</td><td id="ai_est">—</td></tr>
       <tr><td>trading friction (round trip)</td><td id="friction">—</td></tr>
     </tbody></table>
@@ -437,6 +448,7 @@ async function refreshStatus(){
   const sim$ = v => (SIM?'<span class="tag sim" style="font-size:9px">SIM</span> ':'')+fmt$(v);
   $('acct').innerHTML = [
     ['equity', sim$(s.equity)], ['cash', sim$(s.cash)],
+    ['net P&L (trading)', `<span class="${cls(s.net_pnl)}">${s.net_pnl==null?'—':fmt$(s.net_pnl)}</span>`],
     ['day P&L', `<span class="${cls(s.day_pnl)}">${s.day_pnl==null?'—':fmt$(s.day_pnl)}</span>`],
     ['drawdown', pct(s.drawdown_from_peak)],
     ['cycle budget', fmt$(s.cycle_budget)],
@@ -589,16 +601,25 @@ async function saveRisk(){
 async function refreshCosts(){
   const c = await api('/api/costs');
   $('ai_enabled').checked=c.ai_enabled;$('ai_model').value=c.ai_model||'';
+  $('ai_model_news').value=(c.ai_models||{}).headline_classification||'';
+  $('ai_model_hypo').value=(c.ai_models||{}).hypothesis||'';
   $('ai_budget').value=c.ai_daily_budget_usd??1;
-  $('ai_today').textContent=fmt$(c.ai_spend_today);
+  $('ai_month_budget').value=c.ai_monthly_budget_usd??30;
+  const hypCap=(c.ai_purpose_monthly_caps||{}).hypothesis;
+  $('ai_today').innerHTML=`${fmt$(c.ai_spend_today)} / <b>${fmt$(c.ai_spend_month)}</b>`+
+    `<span class="dim"> (strategy ${fmt$(c.ai_spend_month_hypothesis)}${hypCap?' of $'+hypCap+' cap':''})</span>`;
   $('ai_est').textContent=fmt$(c.estimated_daily_total)+
     (Object.keys(c.estimated_daily_by_node||{}).length?
      ' ('+Object.entries(c.estimated_daily_by_node).map(([k,v])=>`${k} ${fmt$(v)}`).join(', ')+')':'');
   $('friction').textContent=c.friction_round_trip_bps+' bps';
 }
 async function saveAI(){
+  const models={};
+  if($('ai_model_news').value.trim()) models.headline_classification=$('ai_model_news').value.trim();
+  if($('ai_model_hypo').value.trim()) models.hypothesis=$('ai_model_hypo').value.trim();
   await post('/api/ai',{enabled:$('ai_enabled').checked,model:$('ai_model').value,
-    daily_budget_usd:parseFloat($('ai_budget').value)});
+    daily_budget_usd:parseFloat($('ai_budget').value),
+    monthly_budget_usd:parseFloat($('ai_month_budget').value), models});
   toast('AI settings saved');refreshCosts();
 }
 let AI_PROVIDERS={};
@@ -630,37 +651,67 @@ document.querySelectorAll('#pv_ranges button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('#pv_ranges button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on'); refreshCurve();
 });
-function tchart(canvas, pts){
+function tchart(canvas, pts, opts){
   /* time-aware line chart: $ gridlines + time ticks. pts=[{t,equity}] asc */
+  opts=opts||{};
   const c=canvas,x=c.getContext('2d'),W=c.width=c.offsetWidth,H=c.height;
   x.clearRect(0,0,W,H);
   if(pts.length<2){x.fillStyle='#7d8799';x.font='11px monospace';
     x.fillText(pts.length?'one mark so far — chart appears with the next':'no marks yet',8,H/2);return;}
-  const L=46,R=6,T=8,B=18, ts=pts.map(p=>+new Date(p.t)), vs=pts.map(p=>p.equity);
-  const t0=ts[0],t1=ts[ts.length-1]||t0+1, lo=Math.min(...vs), hi=Math.max(...vs);
+  const L=52,R=6,T=8,B=18, ts=pts.map(p=>+new Date(p.t)), vs=pts.map(p=>p.equity);
+  const t0=ts[0],t1=ts[ts.length-1]||t0+1;
+  let lo=Math.min(...vs), hi=Math.max(...vs);
+  if(opts.zero){lo=Math.min(lo,0);hi=Math.max(hi,0);}   // P&L: always show 0
   const pad=(hi-lo)||Math.abs(hi)*0.01||1, vlo=lo-pad*0.08, vhi=hi+pad*0.08;
   const X=t=>L+(t-t0)/((t1-t0)||1)*(W-L-R), Y=v=>T+(1-(v-vlo)/(vhi-vlo))*(H-T-B);
+  const fmt=v=>(opts.dollar&&v<0?'-$'+Math.abs(v).toFixed(Math.abs(v)<100?2:0)
+                :'$'+v.toFixed(Math.abs(v)<100?2:0));
   x.strokeStyle='#232630';x.fillStyle='#7d8799';x.font='10px monospace';
   for(let i=0;i<=3;i++){const v=vlo+(vhi-vlo)*i/3,py=Y(v);
     x.beginPath();x.moveTo(L,py);x.lineTo(W-R,py);x.stroke();
-    x.fillText('$'+v.toFixed(v<100?2:0),2,py+3);}
+    x.fillText(fmt(v),2,py+3);}
+  if(opts.zero && vlo<0 && vhi>0){                      // dashed zero line
+    x.save();x.setLineDash([4,4]);x.strokeStyle='#4a4f5c';
+    x.beginPath();x.moveTo(L,Y(0));x.lineTo(W-R,Y(0));x.stroke();x.restore();}
   const spanD=(t1-t0)/864e5;
   for(let i=0;i<=2;i++){const t=t0+(t1-t0)*i/2,d=new Date(t);
     const lbl=spanD<2?d.toTimeString().slice(0,5):d.toISOString().slice(5,10);
     x.fillText(lbl,Math.min(X(t),W-34),H-5);}
-  x.beginPath();x.strokeStyle='#5aa2f7';x.lineWidth=2;
+  const lc=opts.color||'#5aa2f7';
+  x.beginPath();x.strokeStyle=lc;x.lineWidth=2;
   pts.forEach((p,i)=>{i?x.lineTo(X(ts[i]),Y(vs[i])):x.moveTo(X(ts[i]),Y(vs[i]));});
   x.stroke();
   const lastX=X(ts[ts.length-1]),lastY=Y(vs[vs.length-1]);
-  x.fillStyle='#5aa2f7';x.beginPath();x.arc(lastX,lastY,2.5,0,7);x.fill();
+  x.fillStyle=lc;x.beginPath();x.arc(lastX,lastY,2.5,0,7);x.fill();
+}
+async function refreshDecisions(){
+  const d=await api('/api/decisions');
+  $('working').innerHTML=(d.working||[]).length
+    ? '<b>WORKING NOW:</b> '+d.working.map(w=>`<span class="badge" style="margin-right:6px">
+        ${w.side.toUpperCase()} ${w.symbol} ${w.qty}@${w.limit_price} · ${w.status}</span>`).join('')
+    : '<span class="dim">no orders working at the broker right now</span>';
+  const V={APPROVED:'pos',REJECTED:'neg',REQUIRES_HUMAN_APPROVAL:''};
+  $('decisions').tBodies[0].innerHTML=(d.considered||[]).map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
+    <td><b>${c.symbol}</b></td><td>${c.score}</td><td>${c.notional?fmt$(c.notional):'—'}</td>
+    <td class="${V[c.verdict]??''}">${c.verdict||'not sized'}</td>
+    <td>${c.result||'—'}</td>
+    <td class="dim" style="max-width:420px">${(c.reasons||[]).join('; ')||(c.thesis||'').slice(0,90)}</td></tr>`).join('')
+    ||'<tr><td colspan=6 class="dim">no candidates in the last scan</td></tr>';
+  const cy=d.cycle;
+  $('dec_cycle').textContent=cy?`cycle ${cy.id.slice(0,8)} · ${cy.ts} · regime ${cy.regime} · budget ${cy.budget_used}/${cy.budget}`+
+    (Object.keys(d.exits||{}).length?` · exits: ${JSON.stringify(d.exits)}`:''):'no scans yet';
 }
 async function refreshCurve(){
-  const pv=await api('/api/portfolio_value?range='+PV_RANGE);
+  // D36: the main chart is NET TRADING P&L — deposits/withdrawals never move it
+  const [pl, pv] = await Promise.all([
+    api('/api/pnl?range='+PV_RANGE), api('/api/portfolio_value?range='+PV_RANGE)]);
   $('curvesrc').textContent = SIM ? 'SIMULATION account' : 'LIVE account';
-  if(pv.current!=null){_equityNow=pv.current;
-    const first=pv.points[0]?.equity, chg=first?(pv.current/first-1):0;
-    $('pv_now').innerHTML=`${fmt$(pv.current)} <span style="color:${chg>=0?'var(--green)':'var(--red)'}">${(chg*100).toFixed(2)}% ${PV_RANGE}</span>`;}
-  tchart($('curve'), pv.points);
+  if(pv.current!=null) _equityNow=pv.current;
+  const cur=pl.current??0, first=pl.points[0]?.pnl??cur, chg=cur-first;
+  $('pv_now').innerHTML=`<span class="${cls(cur)}">${fmt$(cur)} net P&amp;L</span>
+    <span class="dim" style="font-size:11px">${chg>=0?'+':''}${chg.toFixed(2)} ${PV_RANGE} · equity ${fmt$(pv.current??0)}</span>`;
+  tchart($('curve'), pl.points.map(p=>({t:p.t, equity:p.pnl})),
+         {color: cur>=first?'var(--green)':'var(--red)', zero:true, dollar:true});
 }
 function steerCountdown(exp){
   const ms=+new Date(exp)-Date.now();
@@ -746,7 +797,7 @@ async function refreshModel(){
   $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
     (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
   const nodes=m.nodes;
-  const rowH=n=>Math.max(26, Math.min(64, 20+n.effective_weight*90));
+  const rowH=n=>Math.max(34, Math.min(64, 24+n.effective_weight*90));
   let y=14; const pos={};
   nodes.forEach(n=>{pos[n.id]={y, h:rowH(n)}; y+=rowH(n)+10;});
   const H=Math.max(y+8, 240), NX=170, NW=178, EX=430, GX=560, BX=676;
@@ -801,13 +852,13 @@ function refreshAll(){
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
-  guard(refreshToday,'todaybox');
+  guard(refreshToday,'todaybox'); guard(refreshDecisions,'decisions');
 }
 refreshAll();
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
-  refreshCosts();refreshAudit();refreshSteering();refreshToday();},60000);
+  refreshCosts();refreshAudit();refreshSteering();refreshToday();refreshDecisions();},60000);
 </script>
 </body>
 </html>

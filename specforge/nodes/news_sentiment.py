@@ -29,7 +29,7 @@ Respond with ONLY this JSON shape:
 sentiment: net directional implication for the stock over horizon_days.
 already_priced: true if the market clearly reacted already."""
 
-MAX_HEADLINES = 8
+MAX_HEADLINES = 14   # D36: bulk model is cheap — read more, miss less
 FRESH_HOURS = 48
 MIN_ABS_SCORE = 0.25
 

@@ -275,3 +275,10 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   reads), indicator tiles, news synopsis kv, true-orange restyle.
 - Operator TODO for returns: set AI key (Config tab), enable ai + hypothesis
   + news_sentiment + hypothesis node — decision diversity is the next lever.
+
+## 2026-07-09 (night) — D36 P&L truth + decisions feed + AI routing
+- [x] Net P&L main chart (deposit-independent), pnl-stamped intraday marks,
+  honest day P&L. Decisions feed on Trading tab (verdicts+reasons+working
+  orders). Per-purpose AI models with monthly ($30) + strategy ($20) caps.
+  Found + fixed the $1.8/cycle budget override that strangled today's trading.
+  55 offline tests + GUI smoke green.

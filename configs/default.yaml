@@ -140,12 +140,25 @@ hypothesis:
 ai:
   enabled: false
   base_url: https://openrouter.ai/api/v1
-  model: deepseek/deepseek-chat-v3-0324
+  model: deepseek/deepseek-chat-v3-0324   # default when a purpose has no route
+  # D36 per-purpose routing: bulk classification stays CHEAP; the strategy
+  # layer gets a flagship reasoner. Any OpenRouter id works (x-ai/grok-4 too —
+  # closer to the X firehose if you want that angle on news or hypothesis).
+  models:
+    headline_classification: deepseek/deepseek-chat-v3-0324
+    hypothesis: anthropic/claude-sonnet-4.5
+  reasoning_effort:                # passthrough; reasoning models think,
+    hypothesis: medium             # the rest silently ignore it
   daily_budget_usd: 1.00
+  monthly_budget_usd: 30.00        # hard ceiling, all purposes (user band $10-50)
+  purpose_monthly_caps:
+    hypothesis: 20.00              # flagship strategy calls capped separately
   # price table per 1M tokens, editable; used by the reserve-then-commit ledger
   prices:
     deepseek/deepseek-chat-v3-0324: {input: 0.25, output: 0.85}
     qwen/qwen-2.5-72b-instruct:     {input: 0.35, output: 0.40}
     anthropic/claude-haiku-4.5:     {input: 1.00, output: 5.00}
+    anthropic/claude-sonnet-4.5:    {input: 3.00, output: 15.00}
+    x-ai/grok-4:                    {input: 3.00, output: 15.00}
   cache_ttl_hours: 24
   est_tokens_per_headline: 220     # pre-flight cost estimate basis

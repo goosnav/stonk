@@ -269,6 +269,43 @@ def test_today_digest_endpoint(cfg, store):
     assert t["hypothesis"] is None                      # none active → honest null
 
 
+def test_pnl_series_is_deposit_independent(cfg, store):
+    """D36: the P&L chart never moves on deposits — only realized trades and
+    marked unrealized P&L feed it."""
+    from datetime import date, timedelta as td
+
+    from fastapi.testclient import TestClient
+
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    y = (date.today() - td(days=1)).isoformat()
+    store.record_trade({"symbol": "AAA", "entry_date": y, "exit_date": y,
+                        "entry_price": 100, "exit_price": 105, "qty": 1,
+                        "pnl": 5.0, "ret": 0.05, "source": "paper"})
+    # deposit-like equity jump: mark equity way up but pnl only +2 unrealized
+    store.record_intraday_mark(5000.0, 4000.0, "paper", pnl=7.0)
+    pl = client.get("/api/pnl?range=1W").json()
+    assert pl["current"] == 7.0                          # 5 realized + 2 unrealized
+    assert [p["pnl"] for p in pl["points"]] == [5.0, 7.0]
+    assert all(p["pnl"] < 100 for p in pl["points"])     # the 5000 never leaks in
+
+
+def test_decisions_endpoint(cfg, store):
+    """D36: the decisions feed shows every considered move with the governor's
+    verdict and any working orders."""
+    from fastapi.testclient import TestClient
+
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    run_cycle(cfg, store, refresh_data=False)
+    d = client.get("/api/decisions").json()
+    assert d["cycle"]["regime"]
+    assert d["considered"], "cycle produced candidates but decisions shows none"
+    row = d["considered"][0]
+    assert {"symbol", "score", "verdict", "reasons", "result"} <= set(row)
+    assert isinstance(d["working"], list)
+
+
 def test_model_endpoint(cfg, store):
     """V4: the model view exposes every configured node with effective weight
     = base × learned multiplier, plus regime and hypothesis link."""

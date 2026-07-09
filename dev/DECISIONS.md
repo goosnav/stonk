@@ -363,3 +363,32 @@ the flat-edge nodes stay untouched — "dynamic" must not mean RNG):
    deployment) — computed from the same numbers regime.classify uses.
 5. GUI: --amber #ffb000 → true orange #ff7a1a (user request).
 No margin/borrowing anywhere (buys still capped by cash/budget/deployment).
+
+## D36. Net P&L truth, decisions feed, per-purpose AI routing (2026-07-09, user)
+1. NET P&L replaces portfolio value as the main chart. Equity deltas lie the
+   moment a deposit lands (the user's $50 top-up rendered as "growth" and a
+   fake +$49.97 day P&L). P&L is now computed ONLY from trading: realized
+   (SUM trades.pnl) + unrealized (open positions vs live marks), stamped onto
+   equity_intraday marks (new pnl column, ALTER-migrated). /api/pnl serves the
+   series; day P&L in /api/status is pnl-mark-based, deposit-proof. Portfolio
+   value stays available via /api/portfolio_value.
+2. DECISIONS FEED (/api/decisions + Trading tab panel): every candidate the
+   last cycle considered with the governor's verdict + reasons + result, plus
+   all working orders (resting/relayed/pending approval). Answers "what is the
+   agent deciding and what's queued" from candidates/audit/orders — raw trail,
+   nothing invented.
+3. PER-PURPOSE AI ROUTING (ai.models): bulk headline classification stays on
+   a cheap model (MAX_HEADLINES 8→14 — read more, it's pennies); the
+   hypothesis/strategy layer routes to a flagship reasoner
+   (anthropic/claude-sonnet-4.5 default; x-ai/grok-4 one config field away)
+   with reasoning-effort passthrough. Budgets: daily (existing) + NEW monthly
+   ceiling (default $30, user band $10-50) + per-purpose monthly caps
+   (hypothesis $20). All enforced in reserve-then-commit BEFORE any call.
+   Full agentic tool-loop deliberately deferred: flagship + reasoning +
+   curated context first; add tools when measured results demand them.
+4. OPERATOR FIX: runtime GUI override had time_step_budget_abs_cap=3 →
+   $1.80/cycle → "time-step budget exhausted ×25" → 1 fill from 296
+   candidates today. Raised to 50 (+ max_daily_new_positions 6) via the
+   validated override path, audit-logged. The Today panel's veto digest is
+   what surfaced this — observability paying for itself same-day.
+5. Model tab: min node-box height 34px (two text lines no longer overlap).

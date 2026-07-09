@@ -108,8 +108,9 @@ CREATE TABLE IF NOT EXISTS steering(                -- non-blocking strategic ch
   decided_key TEXT, decided_at TEXT, decided_via TEXT  -- gui | expiry
 );
 CREATE TABLE IF NOT EXISTS equity_intraday(         -- throttled live marks (V4)
-  ts TEXT, equity REAL, cash REAL, source TEXT
-);
+  ts TEXT, equity REAL, cash REAL, source TEXT,
+  pnl REAL                                          -- realized+unrealized (D36):
+);                                                  -- deposit-independent P&L
 CREATE INDEX IF NOT EXISTS idx_audit_cycle ON audit(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_orders_dup ON orders(symbol, side, created_at);
 CREATE INDEX IF NOT EXISTS idx_trades_analog ON trades(source, regime, score_bucket);
@@ -148,6 +149,11 @@ class Store:
             self.db.execute("ALTER TABLE orders ADD COLUMN mode TEXT DEFAULT 'paper'")
             self.db.execute("UPDATE orders SET mode='live' "
                             "WHERE broker_order_id IS NOT NULL AND broker_order_id != ''")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass    # column already there
+        try:    # D36: deposit-independent P&L on intraday marks
+            self.db.execute("ALTER TABLE equity_intraday ADD COLUMN pnl REAL")
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
@@ -488,9 +494,11 @@ class Store:
 
     # ---------- intraday equity marks (V4) ----------
     def record_intraday_mark(self, equity: float, cash: float, source: str,
+                             pnl: float | None = None,
                              min_gap_min: int = 5) -> bool:
         """Throttled: skip if the last mark for this source is younger than
-        min_gap_min. Returns True if a mark was written."""
+        min_gap_min. pnl = realized+unrealized trading P&L at mark time —
+        deposit-independent (D36). Returns True if a mark was written."""
         r = self.db.execute("SELECT MAX(ts) m FROM equity_intraday WHERE source=?",
                             (source,)).fetchone()
         now = datetime.now().astimezone()
@@ -500,8 +508,8 @@ class Store:
                     return False
             except ValueError:
                 pass
-        self.db.execute("INSERT INTO equity_intraday VALUES(?,?,?,?)",
-                        (now.isoformat(timespec="seconds"), equity, cash, source))
+        self.db.execute("INSERT INTO equity_intraday VALUES(?,?,?,?,?)",
+                        (now.isoformat(timespec="seconds"), equity, cash, source, pnl))
         self.db.commit()
         return True
 
@@ -515,6 +523,15 @@ class Store:
         r = self.db.execute("SELECT COALESCE(SUM(cost_usd),0) s FROM ai_ledger "
                             "WHERE day=date('now','localtime')").fetchone()
         return r["s"]
+
+    def ai_spend_month(self, purpose: str | None = None) -> float:
+        """Calendar-month spend, optionally per purpose (D36 monthly caps)."""
+        q = ("SELECT COALESCE(SUM(cost_usd),0) s FROM ai_ledger "
+             "WHERE day LIKE strftime('%Y-%m', 'now', 'localtime') || '%'")
+        args: list = []
+        if purpose:
+            q += " AND purpose=?"; args.append(purpose)
+        return self.db.execute(q, args).fetchone()["s"]
 
     def ai_log(self, model: str, purpose: str, node_id: str, in_tok: int, out_tok: int,
                cost: float, cache_hit: bool, ok: bool) -> None:

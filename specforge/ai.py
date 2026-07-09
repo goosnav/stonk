@@ -50,17 +50,32 @@ class AIClient:
             return False
         return True
 
-    def _prices(self) -> dict:
-        return (self.cfg.get("prices") or {}).get(self.model,
+    def model_for(self, purpose: str) -> str:
+        """Per-purpose model routing (D36): cheap classifier for news, a
+        flagship reasoner for hypothesis, anything OpenRouter serves (incl.
+        x-ai/grok-*). Falls back to the default model."""
+        return (self.cfg.get("models") or {}).get(purpose) or self.model
+
+    def _prices(self, model: str | None = None) -> dict:
+        return (self.cfg.get("prices") or {}).get(model or self.model,
                                                   {"input": 1.0, "output": 3.0})
 
-    def estimate_cost(self, in_tokens: int, out_tokens: int) -> float:
-        p = self._prices()
+    def estimate_cost(self, in_tokens: int, out_tokens: int,
+                      model: str | None = None) -> float:
+        p = self._prices(model)
         return in_tokens / 1e6 * p.get("input", 1.0) + out_tokens / 1e6 * p.get("output", 3.0)
 
-    def reserve(self, est_cost: float) -> bool:
-        budget = float(self.cfg.get("daily_budget_usd", 1.0))
-        if self.store.ai_spend_today() + self._reserved + est_cost > budget:
+    def reserve(self, est_cost: float, purpose: str = "") -> bool:
+        """Daily budget AND monthly ceiling AND per-purpose monthly cap (D36:
+        user band $10-50/mo total; flagship strategy calls capped separately)."""
+        if self.store.ai_spend_today() + self._reserved + est_cost \
+                > float(self.cfg.get("daily_budget_usd", 1.0)):
+            return False
+        if self.store.ai_spend_month() + self._reserved + est_cost \
+                > float(self.cfg.get("monthly_budget_usd", 30.0)):
+            return False
+        cap = (self.cfg.get("purpose_monthly_caps") or {}).get(purpose)
+        if cap and self.store.ai_spend_month(purpose) + est_cost > float(cap):
             return False
         self._reserved += est_cost
         return True
@@ -75,39 +90,44 @@ class AIClient:
         to deterministic behavior (budget exhausted, disabled, or parse fail)."""
         if not self.available():
             return None
+        model = self.model_for(purpose)
         cache_key = "ai_cache_" + hashlib.sha256(
-            f"{self.model}|{system}|{user}".encode()).hexdigest()[:24]
+            f"{model}|{system}|{user}".encode()).hexdigest()[:24]
         cached = self.store.kv_get(cache_key)
         ttl = timedelta(hours=self.cfg.get("cache_ttl_hours", 24))
         if cached and cached["at"] > (datetime.now() - ttl).isoformat():
-            self.store.ai_log(self.model, purpose, node_id, 0, 0, 0.0,
+            self.store.ai_log(model, purpose, node_id, 0, 0, 0.0,
                               cache_hit=True, ok=True)
             return cached["data"]
 
         est_in = len(system + user) // 3            # ~3 chars/token, conservative
-        est_cost = self.estimate_cost(est_in, max_out_tokens)
-        if not self.reserve(est_cost):
+        est_cost = self.estimate_cost(est_in, max_out_tokens, model)
+        if not self.reserve(est_cost, purpose):
             self.store.audit("ai_budget_skip", {"purpose": purpose,
                                                 "est_cost": round(est_cost, 5)})
             return None
         try:
+            req = {"model": model, "max_tokens": max_out_tokens,
+                   "response_format": {"type": "json_object"},
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}]}
+            effort = (self.cfg.get("reasoning_effort") or {}).get(purpose)
+            if effort:                     # OpenRouter passthrough; reasoning
+                req["reasoning"] = {"effort": effort}   # models think, rest ignore
             r = httpx.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "max_tokens": max_out_tokens,
-                      "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": system},
-                                   {"role": "user", "content": user}]},
-                timeout=60)
+                json=req, timeout=120)
             r.raise_for_status()
             body = r.json()
             usage = body.get("usage", {})
             cost = self.estimate_cost(usage.get("prompt_tokens", est_in),
-                                      usage.get("completion_tokens", max_out_tokens))
+                                      usage.get("completion_tokens", max_out_tokens),
+                                      model)
             text = body["choices"][0]["message"]["content"]
             data = _parse_json_block(text)
             ok = data is not None
-            self.store.ai_log(self.model, purpose, node_id,
+            self.store.ai_log(model, purpose, node_id,
                               usage.get("prompt_tokens", 0),
                               usage.get("completion_tokens", 0),
                               round(cost, 6), cache_hit=False, ok=ok)
@@ -118,7 +138,7 @@ class AIClient:
                                           "data": data})
             return data
         except Exception as e:                      # noqa: BLE001
-            self.store.ai_log(self.model, purpose, node_id, 0, 0, 0.0,
+            self.store.ai_log(model, purpose, node_id, 0, 0, 0.0,
                               cache_hit=False, ok=False)
             self.store.audit("ai_error", {"purpose": purpose, "error": str(e)})
             return None

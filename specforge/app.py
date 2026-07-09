@@ -203,16 +203,33 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         reset_d = store.kv_get("dd_peak_reset_d", "") or ""
         peak = max([r["equity"] for r in curve if r["d"] >= reset_d],
                    default=acct.equity)
-        day_pnl = None
-        if len(curve) >= 2:
-            day_pnl = round(acct.equity - curve[-2]["equity"], 2)
+        # D36: P&L is trading-only (realized from closed trades + unrealized on
+        # open positions) — NEVER equity deltas, which deposits distort.
+        src = "live" if c.mode == "live" else "paper"
+        pos_marked = _positions_marked(acct, prices)
+        realized = store.db.execute(
+            "SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE source=?",
+            (src,)).fetchone()["s"]
+        unrealized = round(sum(p["pnl_usd"] for p in pos_marked), 2)
+        net_pnl = round(realized + unrealized, 2)
+        today_d = datetime.now().astimezone().date().isoformat()
+        prev = store.db.execute(
+            "SELECT pnl FROM equity_intraday WHERE source=? AND pnl IS NOT NULL "
+            "AND ts < ? ORDER BY ts DESC LIMIT 1", (src, today_d)).fetchone()
+        if prev:
+            day_pnl = round(net_pnl - prev["pnl"], 2)
+        else:                                  # no prior marks: realized-only basis
+            r_prev = store.db.execute(
+                "SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE source=? "
+                "AND exit_date < ?", (src, today_d)).fetchone()["s"]
+            day_pnl = round(net_pnl - r_prev, 2)
         if acct.equity > 0:                    # intraday mark (V4), throttled in store
-            store.record_intraday_mark(acct.equity, acct.cash,
-                                       "live" if c.mode == "live" else "paper")
+            store.record_intraday_mark(acct.equity, acct.cash, src, pnl=net_pnl)
         return {
             "mode": c.mode, "broker": c.get("broker"),
             "equity": round(acct.equity, 2), "cash": round(acct.cash, 2),
-            "day_pnl": day_pnl,
+            "day_pnl": day_pnl, "net_pnl": net_pnl,
+            "realized_pnl": round(realized, 2), "unrealized_pnl": unrealized,
             "drawdown_from_peak": round(1 - acct.equity / peak, 4) if peak else 0,
             "regime": reg.regime, "regime_evidence": reg.evidence,
             "deployment_multiplier": reg.deployment_multiplier,
@@ -220,7 +237,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "options_unlocked": gov.options_unlocked(acct),
             "cycle_budget": round(gov.cycle_budget(acct, reg.deployment_multiplier), 2),
             "approval_mode": c.get("risk", "approval_mode"),
-            "positions": _positions_marked(acct, prices),
+            "positions": pos_marked,
             "projection": portfolio_projection(store, c.mode),
             "ai_spend_today": round(store.ai_spend_today(), 4),
             "schedule": c.get("schedule", default={}),
@@ -336,7 +353,12 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         return {
             "ai_enabled": bool(ai_cfg.get("enabled")),
             "ai_model": ai_cfg.get("model"),
+            "ai_models": ai_cfg.get("models", {}),
             "ai_daily_budget_usd": ai_cfg.get("daily_budget_usd"),
+            "ai_monthly_budget_usd": ai_cfg.get("monthly_budget_usd"),
+            "ai_purpose_monthly_caps": ai_cfg.get("purpose_monthly_caps", {}),
+            "ai_spend_month": round(store.ai_spend_month(), 4),
+            "ai_spend_month_hypothesis": round(store.ai_spend_month("hypothesis"), 4),
             "ai_spend_today": round(store.ai_spend_today(), 4),
             "estimated_daily_by_node": est,
             "estimated_daily_total": round(sum(est.values()), 3),
@@ -392,8 +414,14 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     @app.post("/api/ai")
     def set_ai(body: dict):
-        allowed = {"enabled", "model", "daily_budget_usd"}
+        allowed = {"enabled", "model", "daily_budget_usd", "monthly_budget_usd"}
         for k, v in body.items():
+            if k == "models" and isinstance(v, dict):   # per-purpose routing (D36)
+                for purpose, model_id in v.items():
+                    if purpose not in ("headline_classification", "hypothesis"):
+                        raise HTTPException(400, f"unknown ai purpose: {purpose}")
+                    _set_override(["ai", "models", purpose], str(model_id))
+                continue
             if k not in allowed:
                 raise HTTPException(400, f"ai key not editable via GUI: {k}")
             _set_override(["ai", k], v)
@@ -475,6 +503,73 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         out = {"north_star": store.active_hypothesis("north_star"),
                "short_term": store.active_hypothesis("short_term"),
                "history": store.hypotheses(limit=20)}
+        return out
+
+    @app.get("/api/pnl")
+    def pnl(range: str = "1M"):
+        """Net trading P&L series (D36): cumulative realized (closed trades) +
+        marked unrealized going forward. Deposit/withdrawal-independent by
+        construction — never derived from equity deltas."""
+        src = "live" if mode == "live" else "paper"
+        days = {"1D": 1, "1W": 7, "1M": 31, "ALL": 36500}.get(range, 31)
+        since = datetime.now().astimezone() - timedelta(days=days)
+        marks = [m for m in store.intraday_marks(src, since_ts=since.isoformat())
+                 if m.get("pnl") is not None]
+        intra_days = {m["ts"][:10] for m in marks}
+        cum, daily = 0.0, []
+        for r in store.db.execute("SELECT exit_date d, SUM(pnl) p FROM trades "
+                                  "WHERE source=? GROUP BY exit_date ORDER BY d",
+                                  (src,)):
+            cum += r["p"]
+            if r["d"] >= since.date().isoformat() and r["d"] not in intra_days:
+                daily.append({"t": r["d"] + "T16:00:00", "pnl": round(cum, 2)})
+        pts = sorted(daily + [{"t": m["ts"][:19], "pnl": m["pnl"]} for m in marks],
+                     key=lambda p: p["t"])
+        return {"points": pts, "range": range, "source": src,
+                "current": pts[-1]["pnl"] if pts else 0.0}
+
+    @app.get("/api/decisions")
+    def decisions():
+        """D36: what the engine is considering and what's queued — the last
+        completed cycle's candidates with governor verdicts + reasons, plus
+        every working (resting/relayed/awaiting-approval) order."""
+        src = "live" if mode == "live" else "paper"
+        rows = store.audit_rows(limit=400)
+        last = next((r for r in rows if r["event_type"] == "cycle_end"), None)
+        out = {"cycle": None, "considered": [], "working": [], "exits": {}}
+        if last:
+            summ = json.loads(last["payload"] or "{}")
+            out["cycle"] = {"id": last["cycle_id"], "ts": last["ts"],
+                            "as_of": summ.get("as_of"), "regime": summ.get("regime"),
+                            "budget": summ.get("budget"),
+                            "budget_used": summ.get("budget_used")}
+            out["exits"] = summ.get("exits", {})
+            verdicts = {}
+            for r in store.audit_rows(cycle_id=last["cycle_id"], limit=500):
+                if r["event_type"] == "risk_decision":
+                    p = json.loads(r["payload"] or "{}")
+                    verdicts[p.get("symbol")] = p
+            entries = summ.get("entries", {})
+            for c in store.db.execute(
+                    "SELECT symbol, final_score, payload FROM candidates "
+                    "WHERE cycle_id=? ORDER BY final_score DESC",
+                    (last["cycle_id"],)):
+                pl = json.loads(c["payload"] or "{}")
+                v = verdicts.get(c["symbol"], {})
+                out["considered"].append({
+                    "symbol": c["symbol"], "score": round(c["final_score"], 3),
+                    "thesis": (pl.get("thesis") or "")[:200],
+                    "notional": pl.get("target_notional"),
+                    "expected_return": pl.get("expected_return"),
+                    "ci": [pl.get("ci_low"), pl.get("ci_high")],
+                    "verdict": v.get("verdict"),
+                    "reasons": v.get("reasons", []),
+                    "result": entries.get(c["symbol"])})
+        out["working"] = [dict(r) for r in store.db.execute(
+            "SELECT symbol, side, qty, limit_price, notional, status, created_at "
+            "FROM orders WHERE mode=? AND status IN "
+            "('placed','pending_relay','relayed','pending_approval') "
+            "ORDER BY created_at DESC", (src,))]
         return out
 
     @app.get("/api/today")

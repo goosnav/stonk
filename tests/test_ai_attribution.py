@@ -94,3 +94,28 @@ def test_regime_conditioned_multipliers(cfg, store):
     # neutral has no cell -> global multiplier path
     assert s_node_weight("momentum", cfg, store, "neutral") == \
         base * store.get_weight_multiplier("momentum")
+
+
+def test_per_purpose_model_routing_and_monthly_caps(cfg, store, monkeypatch):
+    """D36: purpose→model routing; monthly ceiling and per-purpose cap block
+    reservations even when the daily budget has room."""
+    cfg.data["ai"] = {
+        "enabled": True, "daily_budget_usd": 100.0, "monthly_budget_usd": 10.0,
+        "purpose_monthly_caps": {"hypothesis": 2.0},
+        "model": "cheap", "models": {"hypothesis": "flagship"},
+        "prices": {"cheap": {"input": 1, "output": 1},
+                   "flagship": {"input": 100, "output": 100}}}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    ai = AIClient(cfg, store)
+    assert ai.model_for("hypothesis") == "flagship"
+    assert ai.model_for("headline_classification") == "cheap"   # falls to default
+    # per-purpose monthly cap: $1.9 spent on hypothesis this month → $0.2 more refused
+    store.ai_log("flagship", "hypothesis", "hypothesis", 0, 0, 1.9,
+                 cache_hit=False, ok=True)
+    assert not ai.reserve(0.2, "hypothesis")
+    assert ai.reserve(0.05, "hypothesis"); ai._release(0.05)
+    # monthly ceiling: total month spend 9.9 → 0.2 refused for ANY purpose
+    store.ai_log("cheap", "other", "n", 0, 0, 8.0, cache_hit=False, ok=True)
+    assert store.ai_spend_month() == 9.9
+    assert not ai.reserve(0.2, "other")
+    assert ai.reserve(0.05, "other")
