@@ -208,3 +208,19 @@ def test_approve_after_expiry_refused(store):
     a = store.db.execute("SELECT status FROM approvals WHERE intent_id='i1'").fetchone()
     o = store.db.execute("SELECT status FROM orders WHERE id='i1'").fetchone()
     assert a["status"] == "expired" and o["status"] == "expired"
+
+
+def test_cash_reserve_and_deployment_stricter_wins(cfg, store):
+    """min_cash_reserve and max_account_deployment both bind; stricter applies."""
+    from specforge.models import Position
+    # keep >= 50% cash beats deploy <= 90%: on $1000, max deploy = $500
+    cfg.data["risk"]["max_account_deployment"] = 0.90
+    cfg.data["risk"]["min_cash_reserve"] = 0.50
+    gov = Governor(cfg, store)
+    held = [Position(symbol="X", asset_type="equity", qty=4.8, avg_cost=100,
+                     opened_at="2026-01-01")]   # $480 deployed
+    c = make_candidate("AAA", notional=100)
+    d = gov.review(make_intent(c), c, acct(equity=1000, cash=520, positions=held),
+                   CycleState(10000), 1)
+    assert d.verdict == "APPROVED_WITH_SIZE_REDUCTION"
+    assert d.approved_notional == pytest.approx(20, abs=0.5)   # only $20 room to $500

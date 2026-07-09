@@ -218,9 +218,13 @@ class Governor:
             notional = min(notional, room)
             reasons.append(f"reduced to single-position cap room ${room:.2f}")
 
-        # total deployment / cash reserve
+        # total deployment / cash reserve. Two knobs express the same limit
+        # from opposite ends (deploy ≤ X  vs  keep ≥ Y cash); honor whichever
+        # is stricter so neither is a silent no-op.
         deployed = sum(p.cost_basis for p in account.positions)
-        max_deploy = account.equity * self.r.get("max_account_deployment", 0.70)
+        deploy_frac = min(self.r.get("max_account_deployment", 0.70),
+                          1.0 - self.r.get("min_cash_reserve", 0.0))
+        max_deploy = account.equity * deploy_frac
         if deployed + notional > max_deploy:
             room = max_deploy - deployed
             if room < MIN_ORDER_NOTIONAL:
