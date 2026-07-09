@@ -244,3 +244,18 @@ Also: data/server.log was accidentally committed in the D28 commit
 (7d3029c) and showed as perpetually modified; removed from tracking and
 added data/*.log to .gitignore. Runtime logs are machine-local state like
 the DB, not repo history.
+
+## D33 (2026-07-08): guarded restart script (scripts/restart_live.sh)
+Every scheduled session that lands a server-affecting commit repeats the
+same manual dance: check ET clock, kill the nohup pid, restart, curl
+health. That toil is error-prone in the one way that matters — a restart
+during market hours would disturb the live broker session and can miss a
+scheduled scan. New scripts/restart_live.sh encodes the whole procedure:
+refuses on weekdays 09:30-16:30 ET (--force to override), kills the
+existing "specforge --mode live serve" process, restarts via nohup into
+data/server.log, and polls /api/health up to 15s before declaring success.
+Holidays aren't checked — a holiday refusal is merely over-cautious, never
+harmful. Alternative considered: fold this into install_service.sh /
+launchd (which restarts on crash) — but launchd was a human decision never
+taken, and this script is useful either way (launchd restart ≠ deliberate
+"pick up new code now" restart).

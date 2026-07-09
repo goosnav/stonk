@@ -235,3 +235,18 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
 - Remaining backlog unchanged: EDGAR point-in-time earnings, Alpaca adapter
   (deliberate builds). Still outstanding (human): launchd persistence —
   scripts/install_service.sh never run; server is a plain nohup process.
+
+## Sprint D progress (2026-07-08 ~20:05 PT, scheduled session #8)
+- Daily check: /api/health OK, zero errors, all 3 scans + post_close ran
+  today; 7 intents pending_approval (in TTL), 12 expired per D25.
+- Ops: restarted live server at 23:04 ET (outside market hours) onto
+  D31/D32 — health now reports pending_approvals:7, confirming D32 live;
+  D31 log-noise fix also picked up.
+- [x] D33: scripts/restart_live.sh — guarded restart (refuses during NYSE
+  hours, --force override, kills old pid, nohup restart, health-poll
+  verify). Removes the per-session manual restart dance and the risk of an
+  accidental in-hours restart. Verified end-to-end (script itself performed
+  a second clean restart). 31 tests green. See DECISIONS.md D33.
+- Remaining backlog unchanged: EDGAR point-in-time earnings, Alpaca adapter
+  (deliberate builds). Still outstanding (human): launchd persistence —
+  scripts/install_service.sh never run; server is a plain nohup process.
