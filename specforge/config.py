@@ -27,6 +27,28 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def set_env_var(key: str, value: str) -> None:
+    """Upsert one KEY=value into ROOT/.env AND apply it to os.environ live.
+    This is the persistent secret store (.env is gitignored, chmod 600). Live
+    apply means the next AIClient() — built fresh each scan — picks it up
+    without a server restart. Callers must never log `value`."""
+    env = ROOT / ".env"
+    lines = env.read_text().splitlines() if env.exists() else []
+    prefix = f"{key}="
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(prefix):
+            lines[i] = f"{key}={value}"
+            break
+    else:
+        lines.append(f"{key}={value}")
+    env.write_text("\n".join(lines) + "\n")
+    try:
+        env.chmod(0o600)                # secrets live here — keep it owner-only
+    except OSError:
+        pass
+    os.environ[key] = value
+
 # (path, predicate, message) — governor-level sanity on config itself
 _DANGEROUS = [
     (("risk", "kill_switch_drawdown"), lambda v: v > 0.5, "kill_switch_drawdown > 50%"),

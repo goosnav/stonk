@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS orders(
   id TEXT PRIMARY KEY, candidate_id TEXT, cycle_id TEXT, symbol TEXT,
   asset_type TEXT, side TEXT, qty REAL, limit_price REAL, notional REAL,
   idempotency_key TEXT UNIQUE, status TEXT, broker_order_id TEXT,
-  option_symbol TEXT, created_at TEXT, updated_at TEXT
+  option_symbol TEXT, created_at TEXT, updated_at TEXT,
+  mode TEXT DEFAULT 'paper'                           -- paper|live (shared DB)
 );
 CREATE TABLE IF NOT EXISTS fills(
   order_id TEXT, symbol TEXT, side TEXT, qty REAL, price REAL, fees REAL,
@@ -111,6 +112,17 @@ class Store:
         # migration for DBs created before positions.mode existed
         try:
             self.db.execute("ALTER TABLE positions ADD COLUMN mode TEXT DEFAULT 'paper'")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass    # column already there
+        # same migration for orders (D26): the only pre-migration rows that must
+        # be 'live' are those that reached a live broker — those carry a
+        # broker_order_id (paper fills never do), so backfill from that. Getting
+        # this right keeps a resting live order visible to live-mode reconcile.
+        try:
+            self.db.execute("ALTER TABLE orders ADD COLUMN mode TEXT DEFAULT 'paper'")
+            self.db.execute("UPDATE orders SET mode='live' "
+                            "WHERE broker_order_id IS NOT NULL AND broker_order_id != ''")
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
@@ -199,14 +211,14 @@ class Store:
         self.db.commit()
 
     # ---------- orders / fills ----------
-    def record_order(self, o) -> bool:
+    def record_order(self, o, mode: str = "paper") -> bool:
         """False if idempotency key already exists (duplicate)."""
         try:
             self.db.execute(
-                "INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (o.id, o.candidate_id, "", o.symbol, o.asset_type, o.side, o.qty,
                  o.limit_price, o.notional, o.idempotency_key, o.status,
-                 o.broker_order_id, o.option_symbol, o.created_at, _now()))
+                 o.broker_order_id, o.option_symbol, o.created_at, _now(), mode))
             self.db.commit()
             return True
         except sqlite3.IntegrityError:
@@ -218,30 +230,38 @@ class Store:
                         (*fields.values(), _now(), order_id))
         self.db.commit()
 
-    def orders_today(self, side: str | None = None, day: str | None = None) -> list[dict]:
-        """day: ISO date; defaults to the real today (backtester passes as_of)."""
+    def orders_today(self, side: str | None = None, day: str | None = None,
+                     mode: str | None = None) -> list[dict]:
+        """day: ISO date; defaults to the real today (backtester passes as_of).
+        mode: paper|live — paper and live share this DB, so daily caps must
+        count only same-mode orders (D26)."""
         day = day or date.today().isoformat()
         # 'localtime': created_at carries a tz offset; bare date() would shift
         # evening orders to the next UTC day and break daily caps after ~5pm PT
         q, args = "SELECT * FROM orders WHERE date(created_at,'localtime')=?", [day]
         if side:
             q += " AND side=?"; args.append(side)
+        if mode:
+            q += " AND mode=?"; args.append(mode)
         return [dict(r) for r in self.db.execute(q, args)]
 
     def recent_order_exists(self, symbol: str, side: str, cooldown_min: int,
-                            now_iso: str | None = None) -> bool:
+                            now_iso: str | None = None,
+                            mode: str | None = None) -> bool:
         now = now_iso or datetime.now().astimezone().isoformat()
         # coarse indexed prefilter on the raw string (ISO dates compare fine at
         # day granularity), then exact datetime() check on the survivors —
         # datetime() on both sides because created_at is ISO-with-tz while
         # datetime() yields space-separated UTC (raw compare would misorder)
         coarse = (datetime.fromisoformat(now) - timedelta(days=2)).date().isoformat()
-        r = self.db.execute(
-            "SELECT COUNT(*) c FROM orders WHERE symbol=? AND side=? "
-            "AND created_at >= ? "
-            "AND status NOT IN ('rejected','vetoed','expired','cancelled') "
-            "AND datetime(created_at) >= datetime(?, ?)",
-            (symbol, side, coarse, now, f"-{cooldown_min} minutes")).fetchone()
+        q = ("SELECT COUNT(*) c FROM orders WHERE symbol=? AND side=? "
+             "AND created_at >= ? "
+             "AND status NOT IN ('rejected','vetoed','expired','cancelled') "
+             "AND datetime(created_at) >= datetime(?, ?)")
+        args = [symbol, side, coarse, now, f"-{cooldown_min} minutes"]
+        if mode:                              # D26: don't let a paper order block a live entry
+            q += " AND mode=?"; args.append(mode)
+        r = self.db.execute(q, args).fetchone()
         return r["c"] > 0
 
     def record_fill(self, f) -> None:
