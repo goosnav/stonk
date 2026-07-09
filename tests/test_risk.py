@@ -100,12 +100,23 @@ def test_max_open_positions(gov):
     assert d.verdict == "REJECTED"
 
 
-def test_approval_threshold(gov):
-    # 10% of equity = $100 → $150 order queues for human approval
+def test_approval_modes(cfg, store):
+    # default is auto → even a big order trades without confirmation
     c = make_candidate(notional=150)
-    d = gov.review(make_intent(c), c, acct(equity=1000, cash=1000),
-                   CycleState(10000), 1)
-    assert d.verdict == "REQUIRES_HUMAN_APPROVAL"
+    auto_gov = Governor(cfg, store)
+    assert auto_gov.review(make_intent(c), c, acct(equity=1000, cash=1000),
+                           CycleState(10000), 1).verdict != "REQUIRES_HUMAN_APPROVAL"
+    # threshold → 10% of equity = $100, so a $150 order queues for approval
+    cfg.data["risk"]["approval_mode"] = "threshold"
+    thr_gov = Governor(cfg, store)
+    assert thr_gov.review(make_intent(c), c, acct(equity=1000, cash=1000),
+                          CycleState(10000), 1).verdict == "REQUIRES_HUMAN_APPROVAL"
+    # all → even a tiny order waits
+    cfg.data["risk"]["approval_mode"] = "all"
+    all_gov = Governor(cfg, store)
+    small = make_candidate(notional=5)
+    assert all_gov.review(make_intent(small), small, acct(equity=1000, cash=1000),
+                          CycleState(10000), 1).verdict == "REQUIRES_HUMAN_APPROVAL"
 
 
 def test_options_locked_at_small_scale(gov):

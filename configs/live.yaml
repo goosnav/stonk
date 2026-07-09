@@ -11,12 +11,16 @@ risk:
   time_step_budget_pct: 0.40     # $20/cycle on $50 — still an absolute pittance
   time_step_budget_abs_cap: 50   # hard ceiling regardless of account growth
   max_single_equity_position: 0.30   # $15 max position on $50
-  # probation day one: EVERY order waits for your approve click in the GUI.
-  # After you've watched a clean fill + reconcile, switch to `threshold`
-  # (GUI → Risk & Budget) for autonomous small orders.
-  approval_mode: all
-  # Approved intents are placed at their ORIGINAL limit/qty on the next cycle
-  # (execution.process_approval_queue re-runs broker review, not pricing).
-  # Default 24h TTL would let a live order fire at yesterday's price — cap it
-  # so intents queued at the 09:45 scan die after the 15:30 scan same day.
+  # "any money in the account is fair game" (user directive): let the engine
+  # deploy nearly the whole balance. The per-cycle budget + kill switches stay
+  # the real bound on bleed rate, not an idle-cash floor.
+  max_account_deployment: 0.98
+  min_cash_reserve: 0.02
+  # AUTONOMOUS by default (user directive): the engine trades on its own within
+  # the tiny dollar caps above + kill switches. To watch/gate instead, set
+  # `all` (every order waits) or `threshold` here or in the GUI Risk tab.
+  approval_mode: auto
+  # If you switch to a gated mode: approved intents place at their ORIGINAL
+  # limit/qty next cycle, so cap the TTL short — a stale intent must not fire
+  # at yesterday's price.
   approval_timeout_hours: 6

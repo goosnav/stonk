@@ -19,6 +19,18 @@ fi
 MODE="${1:-paper}"
 [ -x "$ROOT/.venv/bin/specforge" ] || { echo "run ./run.sh once first (.venv missing)"; exit 1; }
 
+# Live installs must pass the triple gate NOW, or the service would boot but
+# refuse every order — fail loudly instead of pretending it's trading.
+if [ "$MODE" = "live" ]; then
+  GATE=$("$ROOT/.venv/bin/python" -c "from specforge.config import load_config; ok,why=load_config('live').live_trading_allowed(); print('OK' if ok else 'BLOCKED: '+why)" 2>&1)
+  if [ "$GATE" != "OK" ]; then
+    echo "live gate not open — $GATE"
+    echo "fix: set LIVE_TRADING_ENABLED=true and RH_ACCOUNT_WHITELIST in .env, then retry"
+    exit 1
+  fi
+  echo "live gate OK — installing AUTONOMOUS live trader (approval_mode from configs/live.yaml)"
+fi
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"

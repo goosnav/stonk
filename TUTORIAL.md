@@ -87,14 +87,25 @@ Gate checklist (all must be true — the engine enforces the mechanical ones):
 - [ ] You funded the Robinhood **Agentic** account with money you can lose
 - [ ] `.env`: `LIVE_TRADING_ENABLED=true`, `RH_ACCOUNT_WHITELIST=<acct#>`
 
-Then:
+Then, to trade **autonomously** (the default):
 
 ```bash
-.venv/bin/specforge --mode live serve
+.venv/bin/specforge --mode live serve            # runs now, scans on schedule
+# or run it as a background service that starts at login + auto-restarts:
+./scripts/install_service.sh live
 ```
 
-- Live config (`configs/live.yaml`) starts with `broker: robinhood_mcp` and a
-  **$50 hard budget per scan cycle**. Raise it only after probation.
+- **Autonomous by default**: `approval_mode: auto` in `configs/live.yaml` means
+  the engine places every risk-approved order itself — no confirm click. The
+  time-step budget ($20/cycle, $50 hard cap), position caps, and kill switches
+  are the bound, not a human. To gate trades instead, set `approval_mode` to
+  `threshold` (only big orders wait) or `all` (every order waits) in
+  `configs/live.yaml` or live from the GUI **Risk & Budget** tab.
+- "Any money in the account is fair game": live is configured to deploy up to
+  98% of the balance. Kill switches (daily/weekly loss, drawdown) still halt it.
+- Live config uses `broker: robinhood_mcp` (your verified connection) and a
+  **$50 hard budget per scan cycle**. Raise `time_step_budget_abs_cap` as the
+  account grows.
 - First run opens Robinhood's OAuth page in your browser (tokens cached in
   `~/.specforge/`, chmod 600).
 - **If OAuth fails** with a registration/allowlist error, Robinhood doesn't

@@ -259,3 +259,15 @@ harmful. Alternative considered: fold this into install_service.sh /
 launchd (which restarts on crash) — but launchd was a human decision never
 taken, and this script is useful either way (launchd restart ≠ deliberate
 "pick up new code now" restart).
+
+## D25. Autonomous trading is the DEFAULT (2026-07-06, user directive)
+User: "I need this system to run automatically… the default should be that the
+agent trades as it wants to." Flipped `approval_mode` default threshold→`auto`
+in default.yaml AND live.yaml (was day-one `all`). auto = governor never
+returns REQUIRES_HUMAN_APPROVAL; the engine places every risk-approved order
+itself. Still fully configurable (auto|threshold|all) via config or GUI Risk
+tab — the confirm-trade feature is preserved, just off by default. Also, per
+"any money in the account is fair game", live max_account_deployment 0.70→0.98
+/ min_cash_reserve 0.30→0.02. The real bound is unchanged: time-step budget
+($20/cycle, $50 abs cap) + position caps + kill switches. install_service.sh
+live now hard-checks the triple gate before installing the autonomous service.

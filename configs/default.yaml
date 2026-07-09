@@ -48,13 +48,16 @@ risk:
   stale_data_max_age_days: 4       # refuse to trade on bars older than this
   duplicate_order_cooldown_min: 60 # same symbol+side within window = duplicate
 
-  # Approval policy (autonomous by default; big bets need a human)
-  approval_mode: threshold         # auto | threshold | all
-  # "Big bets" queue for approval. Set above max_single_equity_position (8%) so
-  # routine cap-respecting entries run autonomously; only oversized/override
-  # orders (or future option plays above it) need a human.
-  approval_notional_threshold_pct: 0.10
-  approval_timeout_hours: 24       # unapproved intents expire
+  # Approval policy — CONFIRM-TRADE FEATURE. Default is fully autonomous: the
+  # engine places every risk-approved order itself (bounded by the time-step
+  # budget + all caps + kill switches below). Change to gate trades:
+  #   auto      → trade freely, no human confirmation (DEFAULT)
+  #   threshold → only orders above approval_notional_threshold_pct wait for you
+  #   all       → every order waits for your approve click in the GUI
+  # Editable live from the GUI (Risk & Budget tab) or here.
+  approval_mode: auto              # auto | threshold | all
+  approval_notional_threshold_pct: 0.10   # only used when approval_mode=threshold
+  approval_timeout_hours: 24       # queued (un-auto) intents expire after this
 
   # Options (node auto-unlocks by account scale)
   options_enabled: auto            # auto | true | false
