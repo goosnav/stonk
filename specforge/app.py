@@ -388,7 +388,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     @app.post("/api/scan")
     def manual_scan():
         from .engine import run_cycle
+        from .health import write_heartbeat
         summary = run_cycle(fresh_cfg(), store)
+        write_heartbeat(store, summary["cycle_id"], mode, source="serve")
         return summary
 
     # ---------------- scheduler ----------------

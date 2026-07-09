@@ -144,7 +144,7 @@
   </section>
   <section class="wide">
     <h2>Equity curve</h2>
-    <p class="explain">Marked once per scan cycle. Source: <span id="curvesrc">paper</span> account.</p>
+    <p class="explain">Marked once per scan cycle. Source: <span id="curvesrc">…</span>. Early live marks can dip while an order is in flight (cash reserved, position not yet reported).</p>
     <canvas id="curve" height="130"></canvas>
   </section>
   <section>
@@ -527,6 +527,7 @@ async function saveAI(){
 /* ---------- charts / activity ---------- */
 async function refreshCurve(){
   const rows=await api('/api/equity_curve');
+  $('curvesrc').textContent = SIM ? 'SIMULATION account' : 'LIVE account';
   if(rows.length){_equityNow=rows[rows.length-1].equity;}
   line($('curve'),[{data:rows.map(r=>r.equity),color:'#5aa2f7',w:2}]);
 }

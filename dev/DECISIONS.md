@@ -271,3 +271,18 @@ tab — the confirm-trade feature is preserved, just off by default. Also, per
 / min_cash_reserve 0.30→0.02. The real bound is unchanged: time-step budget
 ($20/cycle, $50 abs cap) + position caps + kill switches. install_service.sh
 live now hard-checks the triple gate before installing the autonomous service.
+
+## D26. Control Center v3: truth layer + terminal UI + FIRST LIVE TRADE (2026-07-09)
+User: no fake information, fail gracefully, explain the run model, Bloomberg-
+weight UI. Shipped: specforge/health.py system_health() (mode, real broker
+probe, heartbeat, market clock, readiness with ALWAYS-populated reasons);
+heartbeats from serve/cron/manual-scan; `specforge tui`; scripts/
+install_cron.sh (launchd ping run-model); terminal restyle (zero radius, mono
+stack, amber/green tags, SIM prefix on every simulated $, per-panel FEED
+ERROR guards, no emoji). FIRST AUTONOMOUS LIVE TRADE at 10:50 ET: BUY
+0.033319 GE @ $359.86 avg (RH order 6a4fb551…, market order per fractional
+rule D12), sized by the governor to the $12 neutral-regime cycle budget.
+KNOWN GAP: orders table isn't mode-tagged (positions are, D23) — paper
+CAT/AMD orders from the same morning blocked live CAT/AMD entries via the
+duplicate cooldown (conservative direction, still wrong; fix = mode column on
+orders + filter in recent_order_exists/orders_today).
