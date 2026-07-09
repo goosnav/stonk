@@ -5,92 +5,115 @@
 <title>SpecForge Control Center</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { --bg:#0b0e14; --panel:#12161f; --panel2:#171c27; --border:#262d3b;
-          --text:#d3dae6; --dim:#7d8799; --green:#41c56f; --red:#f0555f;
-          --amber:#e0a83c; --blue:#5aa2f7; --purple:#a883f0; }
-  * { box-sizing:border-box; }
+  /* CONTROL_CENTER_V3 — terminal grade. Zero radius, hairline grid, mono. */
+  :root { --bg:#0a0a0a; --panel:#111214; --line:#2a2d33; --text:#e6e6e3;
+          --dim:#8a8f98; --amber:#ffb000; --green:#00d964; --red:#ff4b4b;
+          --cyan:#4bd8ff; }
+  * { box-sizing:border-box; border-radius:0 !important; }
   body { margin:0; background:var(--bg); color:var(--text);
-         font:13.5px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .mono { font-family:"SF Mono", Menlo, monospace; }
-  /* top bar */
-  #top { display:flex; align-items:center; gap:14px; padding:10px 18px;
-         border-bottom:1px solid var(--border); background:var(--panel);
+         font:12.5px/1.45 "IBM Plex Mono","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+         font-variant-numeric: tabular-nums; }
+  .mono { font-family:inherit; }
+  /* status bar */
+  #top { display:flex; gap:10px; align-items:center; padding:6px 12px;
+         border-bottom:1px solid var(--line); background:var(--panel);
          position:sticky; top:0; z-index:5; flex-wrap:wrap; }
-  #brand { font-weight:700; font-size:16px; color:var(--blue); white-space:nowrap; }
-  .chip { padding:3px 10px; border:1px solid var(--border); border-radius:14px;
-          font-size:12px; white-space:nowrap; }
-  .tick { display:flex; gap:4px; align-items:baseline; cursor:default; }
+  #brand { font-weight:700; letter-spacing:.12em; }
+  .tag { display:inline-block; padding:1px 7px; border:1px solid var(--line);
+         font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+         white-space:nowrap; }
+  .tag.live { background:var(--green); color:#000; border-color:var(--green); font-weight:700; }
+  .tag.sim  { background:var(--amber); color:#000; border-color:var(--amber); font-weight:700; }
+  .tag.down { background:var(--red); color:#000; border-color:var(--red); font-weight:700; }
+  .tag.ok   { color:var(--green); border-color:var(--green); }
+  .tag.warn { color:var(--amber); border-color:var(--amber); }
+  .tag.err  { color:var(--red); border-color:var(--red); }
+  #readiness { width:100%; font-size:11px; color:var(--amber); }
+  #readiness.trading { color:var(--green); }
+  .tick { display:flex; gap:5px; align-items:baseline; cursor:default; font-size:12px; }
   .tick b { font-weight:600; }
-  #countdown { margin-left:auto; color:var(--dim); font-size:12px; }
-  button { background:#1d2432; color:var(--text); border:1px solid var(--border);
-           border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit;
-           font-size:12.5px; }
-  button:hover { border-color:var(--blue); }
-  button.primary { background:var(--blue); color:#0b0e14; font-weight:600; }
+  #countdown { margin-left:auto; color:var(--dim); font-size:11px; }
+  button { background:transparent; color:var(--cyan); border:1px solid var(--line);
+           padding:3px 10px; cursor:pointer; font:inherit; font-size:11px;
+           text-transform:uppercase; letter-spacing:.06em; }
+  button:hover { background:var(--cyan); color:#000; }
+  button:focus-visible { outline:2px solid var(--amber); outline-offset:1px; }
+  button.primary { color:var(--green); border-color:var(--green); }
+  button.primary:hover { background:var(--green); color:#000; }
   button.ok { color:var(--green); } button.no { color:var(--red); }
-  /* alert rail */
-  #alerts { padding:0 18px; }
-  .alert { margin:8px 0; padding:8px 12px; border-radius:8px; font-size:12.5px;
-           border:1px solid var(--red); background:#2a1215; color:#ffb3b8;
-           display:flex; gap:10px; align-items:center; }
-  .alert.warn { border-color:var(--amber); background:#2a2210; color:#f0d9a0; }
+  button.no:hover { background:var(--red); color:#000; }
+  /* alerts */
+  #alerts { padding:0 12px; }
+  .alert { margin:6px 0; padding:5px 10px; border:1px solid var(--red);
+           color:var(--red); font-size:11.5px; display:flex; gap:10px;
+           align-items:center; }
+  .alert.warn { border-color:var(--amber); color:var(--amber); }
   /* tabs */
-  #tabs { display:flex; gap:2px; padding:10px 18px 0; }
-  #tabs div { padding:8px 16px; cursor:pointer; border:1px solid transparent;
-              border-bottom:none; border-radius:8px 8px 0 0; color:var(--dim); }
-  #tabs div.on { background:var(--panel); border-color:var(--border);
-                 color:var(--text); font-weight:600; }
-  main { padding:14px 18px 40px; display:grid; grid-template-columns:1fr 1fr;
-         gap:14px; }
+  #tabs { display:flex; gap:0; padding:8px 12px 0; }
+  #tabs div { padding:5px 14px; cursor:pointer; border:1px solid transparent;
+              border-bottom:none; color:var(--dim); font-size:11px;
+              text-transform:uppercase; letter-spacing:.08em; }
+  #tabs div.on { background:var(--panel); border-color:var(--line);
+                 color:var(--amber); font-weight:700; }
+  /* grid of panels with hairline gaps */
+  main { padding:8px 12px 40px; display:grid; grid-template-columns:1fr 1fr;
+         gap:8px; }
   .page { display:contents; }
-  section { background:var(--panel); border:1px solid var(--border);
-            border-radius:10px; padding:14px; min-width:0; }
+  section { background:var(--panel); border:1px solid var(--line); padding:10px 12px;
+            min-width:0; }
   section.wide { grid-column:1 / -1; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
-       color:var(--blue); margin:0 0 2px; }
-  .explain { color:var(--dim); font-size:11.5px; margin:0 0 10px; }
-  table { width:100%; border-collapse:collapse; font-size:12.5px; }
-  th { text-align:left; color:var(--dim); font-weight:500; font-size:10.5px;
-       text-transform:uppercase; letter-spacing:.05em; padding:4px 8px 4px 0;
-       border-bottom:1px solid var(--border); }
-  td { padding:6px 8px 6px 0; border-bottom:1px solid #1b2130; vertical-align:top; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.12em;
+       color:var(--amber); margin:0 0 2px; font-weight:700; }
+  .explain { color:var(--dim); font-size:11px; margin:0 0 8px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { text-align:left; color:var(--dim); font-weight:400; font-size:10px;
+       text-transform:uppercase; letter-spacing:.08em; padding:3px 8px 3px 0;
+       border-bottom:1px solid var(--line); }
+  td { padding:3px 8px 3px 0; border-bottom:1px solid #1a1c20; vertical-align:top; }
+  tr:hover td { background:#16181c; }
   .pos { color:var(--green); } .neg { color:var(--red); } .dim { color:var(--dim); }
-  .badge { padding:1px 8px; border-radius:10px; font-size:10.5px;
-           border:1px solid var(--border); text-transform:uppercase;
-           letter-spacing:.04em; }
+  .feed-error { color:var(--red); font-size:11.5px; }
+  .badge { padding:0 6px; border:1px solid var(--line); font-size:10px;
+           text-transform:uppercase; letter-spacing:.05em; }
   .badge.risk_on { color:var(--green); border-color:var(--green); }
   .badge.neutral { color:var(--amber); border-color:var(--amber); }
   .badge.risk_off,.badge.stress { color:var(--red); border-color:var(--red); }
   .badge.production { color:var(--green); border-color:var(--green); }
   .badge.probation { color:var(--amber); border-color:var(--amber); }
-  .badge.experimental { color:var(--purple); border-color:var(--purple); }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
-           gap:10px; }
-  .card { background:var(--panel2); border:1px solid var(--border);
-          border-radius:8px; padding:10px 12px; }
-  .card b { display:block; font-size:19px; font-weight:650; }
-  .card span { color:var(--dim); font-size:10.5px; text-transform:uppercase;
-               letter-spacing:.06em; }
+  .badge.experimental { color:var(--cyan); border-color:var(--cyan); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+           gap:1px; background:var(--line); border:1px solid var(--line); }
+  .card { background:var(--panel); padding:8px 10px; }
+  .card b { display:block; font-size:17px; font-weight:700; }
+  .card span { color:var(--dim); font-size:10px; text-transform:uppercase;
+               letter-spacing:.08em; }
   input[type=number], input[type=text], select {
-    background:#0b0e14; color:var(--text); border:1px solid var(--border);
-    border-radius:5px; padding:4px 7px; width:90px; font:inherit; font-size:12px; }
+    background:#0a0a0a; color:var(--text); border:1px solid var(--line);
+    padding:2px 6px; width:90px; font:inherit; font-size:11.5px; }
   input[type=text] { width:230px; }
-  canvas { width:100%; height:130px; }
-  .proj .apr { font-size:26px; font-weight:700; }
-  #toast { position:fixed; bottom:16px; right:16px; background:#1d2432;
-           border:1px solid var(--border); padding:10px 14px; border-radius:8px;
+  input:focus-visible, select:focus-visible { outline:2px solid var(--amber); }
+  canvas { width:100%; height:120px; }
+  .proj .apr { font-size:24px; font-weight:700; }
+  #toast { position:fixed; bottom:12px; right:12px; background:#000;
+           border:1px solid var(--amber); color:var(--amber); padding:8px 12px;
            display:none; max-width:440px; white-space:pre-wrap; z-index:10;
-           font-size:12.5px; }
+           font-size:11.5px; }
   .kv td:first-child { color:var(--dim); width:56%; }
+  pre.ops { background:#0a0a0a; border:1px solid var(--line); padding:8px;
+            font-size:11px; overflow-x:auto; margin:4px 0; color:var(--cyan); }
 </style>
 </head>
 <body>
 <div id="top">
-  <span id="brand">⚒ SpecForge</span>
-  <span class="chip" id="modechip">—</span>
-  <span id="strip" style="display:flex;gap:14px;flex-wrap:wrap"></span>
+  <span id="brand">SPECFORGE</span>
+  <span id="modetag" class="tag">…</span>
+  <span id="brokertag" class="tag">…</span>
+  <span id="markettag" class="tag">…</span>
+  <span id="enginetag" class="tag">…</span>
+  <span id="strip" style="display:flex;gap:12px;flex-wrap:wrap"></span>
   <span id="countdown">—</span>
-  <button class="primary" onclick="scanNow()">▶ Scan now</button>
+  <button class="primary" onclick="scanNow()">Scan now</button>
+  <div id="readiness">…</div>
 </div>
 <div id="alerts"></div>
 <div id="tabs">
@@ -129,6 +152,11 @@
     <p class="explain">2,000 simulated paths of the current holdings (green p95 / blue median / red p5).</p>
     <canvas id="mc" height="130"></canvas>
     <div class="explain" id="mcnote">—</div>
+  </section>
+  <section class="wide">
+    <h2>Ops — how this system runs</h2>
+    <p class="explain">Two supported run models. Both write the same heartbeat, so the ENGINE tag above always tells you if anything is actually alive.</p>
+    <div id="opsbox">—</div>
   </section>
   <section>
     <h2>Broker connection</h2>
@@ -286,12 +314,51 @@ async function refreshMarket(){
     <br><span class="dim" style="font-size:11.5px">breadth &gt;50sma: ${m.breadth_above_50sma==null?'—':pct(m.breadth_above_50sma,0)}</span>`;
 }
 
+/* ---------- health = single source of truth for the status bar ---------- */
+let SIM = true;   // set from /api/health; prefixes every $ value in paper mode
+async function refreshHealth(){
+  const h = await api('/api/health');
+  SIM = h.mode !== 'live';
+  const mt = $('modetag');
+  mt.textContent = SIM ? 'SIMULATION' : 'LIVE $';
+  mt.className = 'tag ' + (SIM ? 'sim' : 'live');
+  const b = h.broker||{}, bt = $('brokertag');
+  if(b.connected){ bt.textContent = b.adapter.toUpperCase()+' CONNECTED'; bt.className='tag ok'; }
+  else { bt.textContent = b.adapter.toUpperCase()+' DOWN: '+(b.detail||'?').slice(0,48); bt.className='tag down'; }
+  bt.title = b.detail||'';
+  const m = h.market||{};
+  $('markettag').textContent = 'MKT '+(m.session||'?').toUpperCase()+' '+(m.et||'');
+  $('markettag').className = 'tag ' + (m.open ? 'ok' : 'warn');
+  const age = h.engine && h.engine.heartbeat_age_s, et = $('enginetag');
+  if(age==null){ et.textContent='ENGINE NEVER RAN'; et.className='tag err'; }
+  else if(age > 6*3600){ et.textContent='ENGINE DEAD '+Math.round(age/3600)+'H'; et.className='tag down'; }
+  else { et.textContent='ENGINE '+(age<120?age+'S':Math.round(age/60)+'M')+' AGO ('+(h.engine.heartbeat_source||'?')+')'; et.className='tag ok'; }
+  const rd = h.readiness||{}, r = $('readiness');
+  r.className = rd.trading ? 'trading' : '';
+  r.id = 'readiness';
+  r.textContent = rd.trading ? '● TRADING — autonomous within budget and kill switches'
+    : 'NOT TRADING — ' + (rd.reasons||['unknown']).join('  |  ');
+  /* OPS panel */
+  const src = h.engine && h.engine.heartbeat_source;
+  const runs = h.engine && h.engine.next_runs || {};
+  $('opsbox').innerHTML = `<table class="kv"><tbody>
+    <tr><td>active run model</td><td>${src ? (src==='serve'?'DAEMON (resident server + scheduler)':'CRON (launchd pings, no resident process)') : '<span class="neg">none detected — nothing has scanned yet</span>'}</td></tr>
+    <tr><td>scheduler in this server</td><td>${h.engine&&h.engine.scheduler_alive?'alive':'not running'}</td></tr>
+    <tr><td>next scheduled runs</td><td class="dim">${Object.values(runs).join('<br>')||'—'}</td></tr>
+    </tbody></table>
+    <div class="explain">OPTION A — daemon (default): survives via launchd, GUI always on.</div>
+    <pre class="ops">./scripts/install_service.sh live      # login start + crash restart</pre>
+    <div class="explain">OPTION B — cron pings: no resident process; launchd runs one scan per schedule slot (missed jobs run on wake). GUI only when you start it manually.</div>
+    <pre class="ops">./scripts/install_cron.sh live         # install scan pings
+.venv/bin/specforge tui                # watch it from any terminal</pre>`;
+}
+
 /* ---------- overview ---------- */
 async function refreshStatus(){
   const s = await api('/api/status');
-  $('modechip').textContent = `${s.mode} · ${s.broker}` + (s.options_unlocked?' · options ✓':'');
+  const sim$ = v => (SIM?'<span class="tag sim" style="font-size:9px">SIM</span> ':'')+fmt$(v);
   $('acct').innerHTML = [
-    ['equity', fmt$(s.equity)], ['cash', fmt$(s.cash)],
+    ['equity', sim$(s.equity)], ['cash', sim$(s.cash)],
     ['day P&L', `<span class="${cls(s.day_pnl)}">${s.day_pnl==null?'—':fmt$(s.day_pnl)}</span>`],
     ['drawdown', pct(s.drawdown_from_peak)],
     ['cycle budget', fmt$(s.cycle_budget)],
@@ -300,10 +367,10 @@ async function refreshStatus(){
   /* alerts */
   const alerts=[];
   for(const [k,v] of Object.entries(s.kill_switches||{}))
-    alerts.push(`<div class="alert">⛔ kill switch <b>${k}</b>: ${v.reason}
+    alerts.push(`<div class="alert">[KILL] kill switch <b>${k}</b>: ${v.reason}
       <button onclick="post('/api/kill/${k}/reset',{}).then(refreshAll)">reset</button></div>`);
   const pend = window._pendApprovals||0;
-  if(pend) alerts.push(`<div class="alert warn">✋ ${pend} order(s) waiting for approval — Trading tab</div>`);
+  if(pend) alerts.push(`<div class="alert warn">[HOLD] ${pend} order(s) waiting for approval — Trading tab</div>`);
   $('alerts').innerHTML = alerts.join('');
   /* positions (Trading tab) */
   $('positions').tBodies[0].innerHTML = (s.positions||[]).map(p=>`<tr>
@@ -333,7 +400,7 @@ async function refreshBroker(){
     p.accounts.map(a=>`${a.account_number} ${a.agentic_allowed?'✓ agentic':'✗ not agentic'}`).join('<br>')}</td></tr>
     <tr><td>whitelisted</td><td class="mono">${p.whitelist||'<span class="neg">EMPTY — set RH_ACCOUNT_WHITELIST in .env</span>'}</td></tr>`;
   html += `</tbody></table>
-    <button class="primary" onclick="connectRH()">🔗 Connect Robinhood</button>
+    <button class="primary" onclick="connectRH()">Connect Robinhood</button>
     <span class="explain"> opens Robinhood's OAuth login in your browser; if it errors with a registration/allowlist message, use the bridge (scripts/bridge_prompt.md).</span>`;
   $('brokerbox').innerHTML = html;
 }
@@ -382,7 +449,7 @@ async function refreshNodes(){
   $('nodes').tBodies[0].innerHTML = nodes.map(n=>`<tr>
     <td><input type="checkbox" ${n.enabled?'checked':''}
          onchange="post('/api/nodes/${n.id}',{enabled:this.checked}).then(refreshNodes)"></td>
-    <td><b>${n.id}</b>${n.ai?' 🤖':''}</td>
+    <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
     <td class="dim" style="font-size:11.5px;max-width:340px">${NODE_DESC[n.id]||''}</td>
     <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}${n.degraded?` <span class="neg" title="${String(n.degraded).replace(/"/g,'&quot;')}">⚠ degraded</span>`:''}</td>
     <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
@@ -505,11 +572,25 @@ async function scanNow(){
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
-function refreshAll(){refreshMarket();refreshStatus();refreshBroker();refreshCandidates();
-  refreshApprovals();refreshTrades();refreshNodes();refreshRisk();refreshCosts();
-  refreshCurve();refreshMC();refreshAudit();refreshFreshness();}
+// fail gracefully: a dead feed renders an explicit error in its panel,
+// never a stale silent value
+async function guard(fn, panelId){
+  try { await fn(); }
+  catch(e){ const el=document.getElementById(panelId);
+    if(el) el.innerHTML = '<span class="feed-error">-- FEED ERROR: '
+      + String(e.message||e).slice(0,120) + ' --</span>'; }
+}
+function refreshAll(){
+  guard(refreshHealth,'readiness'); guard(refreshMarket,'strip');
+  guard(refreshStatus,'acct'); guard(refreshBroker,'brokerbox');
+  guard(refreshCandidates,'candidates'); guard(refreshApprovals,'approvals');
+  guard(refreshTrades,'trades'); guard(refreshNodes,'nodes');
+  guard(refreshRisk,'risk'); guard(refreshCosts,'ai');
+  guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
+  guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
+}
 refreshAll();
-setInterval(()=>{refreshStatus();refreshApprovals();},10000);
+setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
   refreshCosts();refreshAudit();},60000);
