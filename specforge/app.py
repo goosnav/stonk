@@ -241,6 +241,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         return {
             "mode": c.mode, "broker": c.get("broker"),
             "equity": round(acct.equity, 2), "cash": round(acct.cash, 2),
+            "buying_power": round(acct.buying_power, 2),
             "day_pnl": day_pnl, "net_pnl": net_pnl,
             "realized_pnl": round(realized, 2), "unrealized_pnl": unrealized,
             "drawdown_from_peak": round(1 - acct.equity / peak, 4) if peak else 0,
@@ -547,8 +548,10 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         completed cycle's candidates with governor verdicts + reasons, plus
         every working (resting/relayed/awaiting-approval) order."""
         src = "live" if mode == "live" else "paper"
-        r = store.db.execute("SELECT * FROM audit WHERE event_type='cycle_end' "
-                             "ORDER BY id DESC LIMIT 1").fetchone()
+        r = store.db.execute(
+            "SELECT * FROM audit WHERE event_type='cycle_end' "
+            "AND json_extract(payload,'$.mode')=? ORDER BY id DESC LIMIT 1",
+            (src,)).fetchone()
         last = dict(r) if r else None
         out = {"cycle": None, "considered": [], "working": [], "exits": {}}
         if last:
@@ -680,9 +683,12 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         c = fresh_cfg()
         sched = getattr(app.state, "scheduler", None)
         jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
-        return {"state": store.kv_get("engine_state")
-                or {"phase": "never_ran", "detail": "no cycle has run yet",
-                    "at": None, "trace": []},
+        state = store.kv_get("engine_state") or {}
+        if state.get("mode") != mode:
+            state = {"phase": "awaiting_cycle",
+                     "detail": f"no {mode} cycle in this process yet; scheduler is armed",
+                     "at": None, "trace": [], "mode": mode}
+        return {"state": state,
                 "market": _market_clock(),
                 "interval_minutes": c.get("schedule", "scan_interval_minutes"),
                 "scan_times": c.get("schedule", "scans", default=[]),
@@ -742,8 +748,6 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 return
             from .health import write_heartbeat
             write_heartbeat(store, summary["cycle_id"], cfg.mode, source="serve")
-            print(f"[scheduler] scan done: {summary['cycle_id']} "
-                  f"entries={summary['entries']} exits={summary['exits']}")
             if summary.get("kill_switches"):
                 _notify("Stonk Terminal kill switch",
                         f"active: {', '.join(summary['kill_switches'])} — "
@@ -848,12 +852,15 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 from datetime import datetime as _dt
                 store.kv_set("engine_state", {
                     "phase": "sleeping", "cycle_id": None, "trace": [],
+                    "mode": mode,
                     "detail": f"market {mkt['session']} ({mkt['et']}) — engine "
                               f"alive, cycles resume at the next open",
                     "at": _dt.now().astimezone().isoformat(timespec="seconds")})
 
-        sched.add_job(interval_job, IntervalTrigger(minutes=int(iv)),
-                      misfire_grace_time=120, id="scan_interval")
+        sched.add_job(
+            interval_job, IntervalTrigger(minutes=int(iv)),
+            next_run_time=datetime.now().astimezone() + timedelta(seconds=3),
+            misfire_grace_time=120, id="scan_interval")
 
     def _on_missed(event):
         """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped

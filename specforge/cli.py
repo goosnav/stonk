@@ -5,7 +5,8 @@ Commands:
   scan       run one full scan cycle (paper unless --mode live)
   status     account, kill switches, projection, pending approvals
   backtest   walk-forward backtest (--years N) → report + analog trades
-  serve      start the GUI (FastAPI on --port)
+  tui        quiet terminal dashboard; attaches to or runs the daemon
+  serve      start the quiet GUI/headless server (FastAPI on --port)
   approve/reject <intent_id>   decide a queued order
   reset-kill <name>            clear a manual kill switch after review
 """
@@ -86,7 +87,9 @@ def cmd_serve(args, cfg, store):
     import uvicorn
     from .app import create_app
     store.audit("service_starting", {"mode": cfg.mode, "port": args.port})
-    uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port)
+    uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port,
+                log_level="info" if args.verbose else "warning",
+                access_log=args.verbose)
 
 
 def cmd_approve(args, cfg, store):
@@ -109,45 +112,162 @@ def cmd_reject(args, cfg, store):
     print(f"rejected {args.intent_id}")
 
 
+def _console_api(port: int, path: str, timeout: int = 20):
+    from urllib.request import urlopen
+    with urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as response:
+        return json.load(response)
+
+
+def _console_server(args, cfg, store):
+    """Attach to the local server, or quietly start it in this TUI process."""
+    try:
+        version = _console_api(args.port, "/api/version", timeout=2)
+        if version.get("mode") != cfg.mode:
+            raise RuntimeError(f"port {args.port} is serving {version.get('mode')} mode; "
+                               f"requested {cfg.mode}")
+        return None
+    except RuntimeError:
+        raise
+    except Exception:                         # no server: TUI becomes the daemon
+        import threading
+        import time
+        import uvicorn
+        from .app import create_app
+        server = uvicorn.Server(uvicorn.Config(
+            create_app(cfg, store), host="127.0.0.1", port=args.port,
+            log_level="warning", access_log=False))
+        threading.Thread(target=server.run, daemon=True).start()
+        for _ in range(100):
+            try:
+                _console_api(args.port, "/api/version", timeout=1)
+                return server
+            except Exception:
+                time.sleep(0.1)
+        raise RuntimeError(f"headless server did not start on port {args.port}")
+
+
+def _money(value) -> str:
+    return "—" if value is None else f"${value:,.2f}"
+
+
+def _pct(value) -> str:
+    return "—" if value is None else f"{value:+.2%}"
+
+
+def _console_frame(port: int, color: bool) -> str:
+    from datetime import datetime
+    h = _console_api(port, "/api/health")
+    s = _console_api(port, "/api/status")
+    e = _console_api(port, "/api/engine")
+    today = _console_api(port, "/api/today")
+    decisions = _console_api(port, "/api/decisions")
+
+    G, R, A, D, B, X = (("\033[32m", "\033[31m", "\033[33m", "\033[2m",
+                          "\033[1m", "\033[0m") if color else ("",) * 6)
+    rd, broker, engine = h["readiness"], h["broker"], h["engine"]
+    hb = engine.get("heartbeat_age_s")
+    heartbeat = "never" if hb is None else (f"{hb}s" if hb < 120 else f"{hb//60}m")
+    phase = (e.get("state") or {}).get("phase", "unknown")
+    deployment = 1 - s["cash"] / s["equity"] if s.get("equity") else 0
+    state = G + "TRADING" + X if rd["trading"] else A + "PAUSED" + X
+
+    lines = [f"{B}STONK TERMINAL · {s['mode'].upper()} · "
+             f"{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}{X}",
+             f"{state}  broker:{broker['adapter']} "
+             f"{'OK' if broker['connected'] else 'DOWN'}  "
+             f"market:{h['market']['session']} {h['market']['et']}  "
+             f"engine:{phase}  last-scan:{heartbeat} ago",
+             f"{B}ACCOUNT{X}  equity {_money(s['equity'])}  cash {_money(s['cash'])}  "
+             f"buying-power {_money(s.get('buying_power'))}  deployed {deployment:.1%}",
+             f"P&L  day {_money(s.get('day_pnl'))}  total {_money(s.get('net_pnl'))}  "
+             f"realized {_money(s.get('realized_pnl'))}  unrealized {_money(s.get('unrealized_pnl'))}  "
+             f"drawdown {s.get('drawdown_from_peak', 0):.2%}",
+             f"REGIME {s['regime']} ×{s['deployment_multiplier']}  "
+             f"cycle risk ceiling {_money(s['cycle_budget'])}  approvals {h['pending_approvals']}"]
+
+    if not rd["trading"]:
+        lines.append(R + "WHY PAUSED  " + " | ".join(rd.get("reasons") or ["unknown"]) + X)
+
+    lines += ["", B + f"POSITIONS ({len(s['positions'])})" + X,
+              D + "SYMBOL       QTY          AVG       LAST      VALUE       P&L" + X]
+    for p in s["positions"][:12]:
+        pnl_color = G if p["pnl_usd"] >= 0 else R
+        lines.append(f"{p['symbol']:<10} {p['qty']:>10.6f}  {p['avg_cost']:>9.2f}  "
+                     f"{p['last']:>9.2f}  {p['value']:>9.2f}  "
+                     f"{pnl_color}{p['pnl_usd']:>+8.2f} ({p['pnl_pct']:+.2%}){X}")
+    if not s["positions"]:
+        lines.append(D + "no open positions" + X)
+
+    working = decisions.get("working") or []
+    lines += ["", B + f"WORKING ORDERS ({len(working)})" + X]
+    for o in working[:8]:
+        lines.append(f"{o['symbol']:<8} {o['side']:<4} {_money(o['notional']):>10}  "
+                     f"{o['status']:<16} qty {o['qty']:.6f}")
+    if not working:
+        lines.append(D + "none" + X)
+
+    cycle = decisions.get("cycle") or {}
+    considered = decisions.get("considered") or []
+    lines += ["", B + "ENGINE / LAST CYCLE" + X,
+              f"{(e.get('state') or {}).get('detail', '—')}"]
+    if cycle:
+        lines.append(f"cycle {cycle.get('id')}  candidates {len(considered)}  "
+                     f"budget {_money(cycle.get('budget_used'))}/{_money(cycle.get('budget'))}")
+    for c in considered[:5]:
+        verdict = c.get("result") or c.get("verdict") or "not_selected"
+        lines.append(f"{c['symbol']:<6} score {c['score']:.3f}  {verdict:<18} "
+                     f"{(c.get('thesis') or '')[:75]}")
+
+    switches = s.get("kill_switches") or {}
+    lines += ["", B + "RISK / RECOVERY" + X]
+    if not switches:
+        lines.append(G + "no kill switches active" + X)
+    for name, item in switches.items():
+        recovery = (f"auto-resets {item.get('clear_at') or item.get('clear_on')}"
+                    if item.get("auto_clear") else f"MANUAL: stonk reset-kill {name}")
+        lines.append(f"{R}{name}{X}: {item.get('reason')} · {recovery}")
+
+    news = (today.get("news") or {}).get("items") or []
+    fundamentals = (today.get("fundamentals") or {}).get("items") or []
+    lines += ["", B + "AI COMMENTARY" + X]
+    if today.get("hypothesis"):
+        lines.append("hypothesis: " + today["hypothesis"])
+    for item in news[:3]:
+        lines.append(f"news {item['symbol']:<5} {item.get('sentiment', 0):+0.2f}  "
+                     f"{item.get('summary', '')[:100]}")
+    for item in fundamentals[:2]:
+        lines.append(f"fund {item['symbol']:<5} {item.get('direction', '?'):<7}  "
+                     f"{item.get('summary', '')[:100]}")
+    if not news and not fundamentals and not today.get("hypothesis"):
+        lines.append(D + "AI disabled, over budget, or no current commentary" + X)
+
+    lines += ["", D + "Ctrl-C exits · --once prints one agent-friendly snapshot · "
+              "verbose diagnostics stay in logs/audit-live.jsonl" + X]
+    return "\n".join(lines)
+
+
 def cmd_tui(args, cfg, store):
-    """Terminal live view (no server needed): status, positions, audit tail.
-    Doubles as the is-it-alive probe. Ctrl-C exits."""
+    """Quiet operator console. Attaches to a server or becomes the daemon."""
     import time
-    from .health import system_health
-    G, R, A, D, X = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+    server = _console_server(args, cfg, store)
+    color = bool(sys.stdout.isatty() and not args.no_color and not args.once)
     try:
         while True:
-            h = system_health(cfg, store)
-            eq = store.equity_curve("live" if cfg.mode == "live" else "paper")
-            lines = ["\033[2J\033[H\033[1mSTONK TERMINAL " + cfg.mode.upper() + X]
-            b = h["broker"]
-            tag = (G + "[" + b["adapter"] + " OK]" + X) if b["connected"] \
-                else (R + "[" + b["adapter"] + " DOWN: " + (b.get("detail") or "")[:60] + "]" + X)
-            hb = h["engine"]["heartbeat_age_s"]
-            hb_s = "never" if hb is None else f"{hb}s ago"
-            lines.append(f"{tag}  market:{h['market']['session']} {h['market']['et']}"
-                         f"  heartbeat:{hb_s}  approvals:{h['pending_approvals']}")
-            rd = h["readiness"]
-            lines.append((G + "TRADING" + X) if rd["trading"] else
-                         (A + "NOT TRADING:" + X + " " + "; ".join(rd["reasons"])))
-            if eq:
-                lines.append(f"equity ${eq[-1]['equity']:,.2f}  cash ${eq[-1]['cash']:,.2f}"
-                             f"  (marked {eq[-1]['d']})")
-            pos = store.open_positions(mode="live" if cfg.mode == "live" else "paper")
-            lines.append(D + f"-- positions ({len(pos)}) --" + X)
-            for p in pos[:10]:
-                lines.append(f"  {p['symbol']:<6} qty {p['qty']:<12} avg {p['avg_cost']}")
-            lines.append(D + "-- last events --" + X)
-            for r in store.audit_rows(limit=8):
-                lines.append(D + f"  {r['ts'][5:19]} {r['event_type']:<24}" + X
-                             + (r["payload"] or "")[:70])
-            nxt = h["engine"]["next_runs"]
-            if nxt:
-                lines.append(D + "next: " + "; ".join(str(v) for v in nxt.values())[:100] + X)
-            print("\n".join(lines), flush=True)
+            try:
+                frame = _console_frame(args.port, color)
+            except Exception as e:                 # transient feed/API errors heal
+                frame = ("STONK TERMINAL · CONSOLE DEGRADED\n"
+                         f"{type(e).__name__}: {e}\nretrying in {args.interval}s; "
+                         "autonomous server remains running")
+            print(("\033[2J\033[H" if color else "") + frame, flush=True)
+            if args.once:
+                break
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print("\nbye")
+        pass
+    finally:
+        if server is not None:
+            server.should_exit = True
 
 
 def cmd_bridge_dump(args, cfg, store):
@@ -186,13 +306,20 @@ def main(argv=None):
     s.add_argument("--no-refresh", action="store_true")
     s.add_argument("--post-close", action="store_true", dest="post_close",
                    help="also run attribution/weight updates (cron run-model)")
-    s = sub.add_parser("tui"); s.add_argument("--interval", type=int, default=5)
+    s = sub.add_parser("tui")
+    s.add_argument("--interval", type=int, default=5)
+    s.add_argument("--port", type=int, default=8420)
+    s.add_argument("--once", action="store_true",
+                   help="print one stable snapshot for agents/scripts, then exit")
+    s.add_argument("--no-color", action="store_true")
     sub.add_parser("status")
     s = sub.add_parser("backtest")
     s.add_argument("--years", type=int, default=10)
     s.add_argument("--tag", default="default")
     s.add_argument("--save-analogs", action="store_true", default=True)
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8420)
+    s.add_argument("--verbose", action="store_true",
+                   help="stream HTTP access logs (default is quiet; audit stays on disk)")
     s = sub.add_parser("approve"); s.add_argument("intent_id")
     s = sub.add_parser("reject"); s.add_argument("intent_id")
     s = sub.add_parser("reset-kill"); s.add_argument("name")
@@ -202,6 +329,11 @@ def main(argv=None):
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")
 
     args = p.parse_args(argv)
+    if args.cmd == "tui" and args.mode is None:
+        try:
+            args.mode = _console_api(args.port, "/api/version", timeout=1).get("mode")
+        except Exception:
+            pass
     cfg = load_config(args.mode)
     configure_file_logging(cfg.mode)
     store = _store(cfg)

@@ -30,7 +30,8 @@ _CYCLE_LOCK = threading.Lock()
 
 
 def _stamp(store: Store, phase: str, detail: str = "",
-           cycle_id: str | None = None, trace: list | None = None) -> None:
+           cycle_id: str | None = None, trace: list | None = None,
+           mode: str | None = None) -> None:
     """D39 live visibility: the GUI Engine tab polls kv['engine_state'] to show
     exactly where the state machine is. `trace` accumulates this cycle's
     phase timeline (written whole each stamp — it's tiny)."""
@@ -39,7 +40,7 @@ def _stamp(store: Store, phase: str, detail: str = "",
         trace.append({"phase": phase, "detail": detail, "at": now})
     store.kv_set("engine_state", {"phase": phase, "detail": detail,
                                   "cycle_id": cycle_id, "at": now,
-                                  "trace": trace or []})
+                                  "trace": trace or [], "mode": mode})
 
 
 def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
@@ -66,7 +67,7 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # backtests spin hundreds of cycles — don't churn the live-visibility kv
     def st(phase: str, detail: str = ""):
         if refresh_data:
-            _stamp(store, phase, detail, cycle_id, trace)
+            _stamp(store, phase, detail, cycle_id, trace, source)
 
     # 1. data
     symbols = list(cfg.get("universe", "symbols", default=[]))
@@ -251,7 +252,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                                    pnl=round(realized + unreal, 2))
 
     summary = {
-        "cycle_id": cycle_id, "as_of": ctx.as_of, "regime": reg.regime,
+        "cycle_id": cycle_id, "mode": source, "as_of": ctx.as_of,
+        "regime": reg.regime,
         "kill_switches": sorted(switches), "signals": len(events),
         "candidates": len(candidates), "entries": entry_results,
         "exits": exits, "reconciled": reconciled,

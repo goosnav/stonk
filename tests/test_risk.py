@@ -251,3 +251,28 @@ def test_option_intent_notional_includes_contract_multiplier():
     c = make_candidate("AAA", notional=200, asset_type="option")
     intent = OrderIntent.make(c, qty=2, limit_price=1.0)
     assert intent.notional == 200
+
+
+def test_operational_kill_cooldown_does_not_extend_forever(cfg, store):
+    start = "2026-07-10T10:00:00-07:00"
+    g1 = Governor(cfg, store, now_iso=start)
+    g1.trip("rejected_orders", "broker storm", auto_clear_minutes=30)
+    original = g1.active_switches()["rejected_orders"]
+
+    # The same condition on another cycle must preserve the first clear time.
+    g2 = Governor(cfg, store, now_iso="2026-07-10T10:20:00-07:00")
+    g2.trip("rejected_orders", "broker storm", auto_clear_minutes=30)
+    assert g2.active_switches()["rejected_orders"]["clear_at"] == original["clear_at"]
+
+    g3 = Governor(cfg, store, now_iso="2026-07-10T10:31:00-07:00")
+    assert "rejected_orders" not in g3.active_switches()
+    assert store.kv_get("rejected_orders_reset_ts") == g3.now_iso
+    assert any(a["event_type"] == "kill_switch_auto_cleared" for a in store.audit_rows())
+
+
+def test_only_explicit_major_switch_requires_human(cfg, store):
+    g = Governor(cfg, store, now_iso="2026-07-10T10:00:00-07:00")
+    g.trip("position_mismatch", "broker and engine disagree")
+    item = g.active_switches()["position_mismatch"]
+    assert item["severity"] == "major" and item["requires_human"] is True
+    assert "auto_clear" not in item

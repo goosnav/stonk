@@ -129,9 +129,22 @@ class Node(SignalNode):
             return []
         as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")
         events, synopsis = [], []
+        refreshes = 0
+        max_refreshes = int(self.cfg.get("max_refreshes_per_cycle", 4))
         for sym in ctx.universe:
             if sym.startswith("^") or sym in ETFISH:
                 continue
+            key = f"fund_view_{sym}"
+            cached = ctx.store.kv_get(key)
+            days = self.cfg.get("refresh_days", REFRESH_DAYS)
+            fresh = cached and cached.get("at", "") >= \
+                (datetime.now() - timedelta(days=days)).isoformat()
+            if not fresh:
+                if refreshes >= max_refreshes:
+                    self.degraded_reason = (
+                        f"refresh capped at {max_refreshes} symbols this cycle")
+                    continue
+                refreshes += 1
             view = self._analysis(ctx, sym)
             if not view:
                 continue

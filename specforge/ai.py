@@ -117,7 +117,8 @@ class AIClient:
             r = httpx.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json=req, timeout=120)
+                json=req,
+                timeout=float(self.cfg.get("request_timeout_seconds", 20)))
             r.raise_for_status()
             body = r.json()
             usage = body.get("usage", {})

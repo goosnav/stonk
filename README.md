@@ -70,6 +70,27 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 Paper mode is the default and needs **no keys or accounts**.
 
+## Headless operator console
+
+Use the TUI when the terminal itself is the control room:
+
+```bash
+.venv/bin/stonk --mode live tui          # live dashboard; starts the daemon if needed
+.venv/bin/stonk tui                      # auto-attaches to the mode already on port 8420
+.venv/bin/stonk tui --once --no-color    # stable snapshot for an agent or script
+```
+
+It shows trading readiness, broker and heartbeat health, account value and
+buying power, P&L, positions, working orders, the active engine phase, recent
+candidate verdicts, kill-switch recovery times, and current AI commentary.
+`Ctrl-C` stops a daemon started by that TUI; attaching to an existing server
+leaves it running.
+
+`stonk serve` is quiet by default. Use `serve --verbose` only when HTTP request
+diagnostics are useful. The complete structured audit remains available in
+`logs/audit-live.jsonl` or `logs/audit-paper.jsonl`; process diagnostics go to
+`logs/runtime-live.log` when launched by the macOS app or restart script.
+
 ## Going live (Robinhood)
 
 Read [TUTORIAL.md](TUTORIAL.md) first. Short version:
@@ -116,7 +137,7 @@ Implementation-level docs live in [dev/](dev/): [ARCHITECTURE.md](dev/ARCHITECTU
 ## Verification
 
 ```bash
-.venv/bin/pytest tests/ -q     # 66 tests, including the rendered dashboard smoke
+.venv/bin/pytest tests/ -q     # includes the rendered dashboard smoke test
 .venv/bin/stonk backtest --years 10 --tag v1   # walk-forward, costs included
 ```
 

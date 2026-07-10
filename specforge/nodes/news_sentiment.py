@@ -70,12 +70,20 @@ class Node(SignalNode):
         as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")
         events = []
         synopsis = []               # D35: homepage "AI read" — every classified
+        max_symbols = int(ctx.cfg.get(
+            "nodes", "news_sentiment", "max_symbols_per_cycle", default=12))
+        classified = 0
         for sym in ctx.universe:    # result, incl. the ones that DON'T trade
             if sym.startswith("^"):
                 continue
             heads = self._headlines(ctx, sym)
             if len(heads) < 2:
                 continue
+            if classified >= max_symbols:
+                self.degraded_reason = (
+                    f"classification capped at {max_symbols} symbols this cycle")
+                break
+            classified += 1
             result = self.ai.complete_json(
                 purpose="headline_classification", node_id=self.id,
                 system=SYSTEM,

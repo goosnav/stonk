@@ -3,9 +3,9 @@ review(); AI has no path around it (dev/ARCHITECTURE.md invariant #2).
 
 Two layers:
 1. Kill switches — evaluated once per cycle (check_kill_switches). Tripped
-   switches block ALL new entries; exits remain allowed. daily_loss/weekly_loss
-   auto-clear when the calendar rolls; drawdown and operational switches
-   (rejected-order storm) need a manual reset (CLI/GUI) after a human looks.
+   switches block ALL new entries; exits remain allowed. Recoverable switches
+   auto-clear after a stated cooldown. A switch without a clear time is a
+   deliberately major, human-action-required condition.
 2. Per-order review — the time-step budget (primary check, dev/DECISIONS.md D3)
    plus deployment/position/count/duplicate/staleness/approval checks. The
    governor may REDUCE size to fit caps rather than reject outright.
@@ -59,12 +59,22 @@ class Governor:
     def active_switches(self) -> dict:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
         today = self.today
+        now = datetime.fromisoformat(self.now_iso)
+        def expired(v: dict) -> bool:
+            if v.get("clear_at"):
+                return datetime.fromisoformat(v["clear_at"]) <= now
+            return bool(v.get("auto_clear") and v.get("clear_on", "") <= today)
         # auto-clear switches whose window rolled over
-        cleared = {k: v for k, v in switches.items()
-                   if not (v.get("auto_clear") and v.get("clear_on", "") <= today)}
+        cleared = {k: v for k, v in switches.items() if not expired(v)}
         if cleared != switches:
             if "drawdown" in switches and "drawdown" not in cleared:
                 self._reset_drawdown_baseline("auto_clear")
+            if "rejected_orders" in switches and "rejected_orders" not in cleared:
+                # The rejected rows that caused the cooldown are history, not
+                # a reason to re-trip immediately after automatic recovery.
+                self.store.kv_set("rejected_orders_reset_ts", self.now_iso)
+            for name in switches.keys() - cleared.keys():
+                self.store.audit("kill_switch_auto_cleared", {"name": name})
             self.store.kv_set(KILL_KEY, cleared)
         return cleared
 
@@ -75,12 +85,24 @@ class Governor:
         self.store.kv_set("dd_peak_reset_d", self.today)
         self.store.audit("drawdown_baseline_reset", {"date": self.today, "via": via})
 
-    def trip(self, name: str, reason: str, auto_clear_days: int | None = None) -> None:
+    def trip(self, name: str, reason: str, auto_clear_days: int | None = None,
+             auto_clear_minutes: int | None = None) -> None:
         switches = self.store.kv_get(KILL_KEY, {}) or {}
-        entry = {"reason": reason, "tripped_at": self.now_iso}
+        # Preserve the original trip/cooldown. Re-evaluating the same problem
+        # every cycle must not move the recovery window forever into the future.
+        if name in switches:
+            return
+        entry = {"reason": reason, "tripped_at": self.now_iso,
+                 "severity": "cooldown" if auto_clear_days is not None or
+                 auto_clear_minutes is not None else "major",
+                 "requires_human": auto_clear_days is None and auto_clear_minutes is None}
         if auto_clear_days is not None:
             entry["auto_clear"] = True
             entry["clear_on"] = (self._today_dt() + timedelta(days=auto_clear_days)).isoformat()
+        if auto_clear_minutes is not None:
+            entry["auto_clear"] = True
+            entry["clear_at"] = (datetime.fromisoformat(self.now_iso) +
+                                  timedelta(minutes=auto_clear_minutes)).isoformat()
         switches[name] = entry
         self.store.kv_set(KILL_KEY, switches)
         self.store.audit("kill_switch_tripped", {"name": name, **entry})
@@ -123,8 +145,8 @@ class Governor:
                                   f"{(1 - eq/peak):.1%} below peak {peak:.2f}",
                       auto_clear_days=cooldown)
         # broker-level bounces only; governor vetoes carry status 'vetoed'.
-        # Counted since the last manual reset (D39) and auto-clears next day —
-        # a broker-side storm shouldn't need a human forever.
+        # Counted since the last reset (D39) and auto-clears after a short
+        # cooldown — a broker-side storm shouldn't need a human forever.
         reset_ts = self.store.kv_get("rejected_orders_reset_ts", "") or ""
         rejected_today = len([o for o in self.store.orders_today(day=self.today, mode=self.mode)
                               if o["status"] == "rejected" and o["created_at"] > reset_ts])
@@ -132,7 +154,8 @@ class Governor:
             self.trip("rejected_orders",
                       f"{rejected_today} broker-rejected orders today — check the "
                       f"broker_review audit rows for the shared cause",
-                      auto_clear_days=1)
+                      auto_clear_minutes=self.r.get(
+                          "rejected_order_cooldown_minutes", 30))
         return self.active_switches()
 
     # ---------------- cycle budget ----------------

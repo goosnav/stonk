@@ -40,9 +40,10 @@ risk:
   # Submit a small ranked batch each cycle. This avoids broker rate-limit
   # bursts while the 10-minute cadence still allows frequent deployment.
   max_new_positions_per_cycle: 3
-  # broker bounces usually share one root cause — let a few more through
-  # before halting, and the switch now auto-clears after a day anyway
+  # Broker bounces usually share one root cause: pause the entry loop briefly,
+  # then retry without requiring a human to reset a routine provider incident.
   max_rejected_orders_per_day: 10
+  rejected_order_cooldown_minutes: 30
 
 # D39 "full-time trader" directive: trade through neutral/risk-off at reduced
 # size instead of freezing. No margin ever — notional is clamped to cash and

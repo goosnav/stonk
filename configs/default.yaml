@@ -45,6 +45,7 @@ risk:
   kill_switch_drawdown: 0.15
   drawdown_cooldown_days: 10       # auto-resume after N days; null = manual reset only
   max_rejected_orders_per_day: 5
+  rejected_order_cooldown_minutes: 30  # retry after transient broker incident
   stale_data_max_age_days: 4       # refuse to trade on bars older than this
   duplicate_order_cooldown_min: 60 # same symbol+side within window = duplicate
 
@@ -106,7 +107,7 @@ nodes:
   reversal:        {enabled: false, weight: 0.10, status: experimental, horizon_days: 5}
   earnings_drift:  {enabled: true,  weight: 0.25, status: probation,   horizon_days: 20}
   quality_value:   {enabled: true,  role: filter, status: production}
-  news_sentiment:  {enabled: false, weight: 0.05, status: experimental, horizon_days: 5, ai: true}
+  news_sentiment:  {enabled: false, weight: 0.05, status: experimental, horizon_days: 5, ai: true, max_symbols_per_cycle: 12}
   congress_trades: {enabled: false, weight: 0.05, status: experimental, horizon_days: 60}
   insider:         {enabled: false, weight: 0.05, status: experimental, horizon_days: 40}
   options_vol:     {enabled: false, weight: 0.05, status: experimental, horizon_days: 30}
@@ -116,7 +117,7 @@ nodes:
   # D37: LLM valuation read of company-published financials (yfinance),
   # kv-cached 3 days/symbol so scans don't re-spend tokens. Long-only system:
   # a sell/short view lands as direction=avoid (suppresses the long case).
-  fundamentals:    {enabled: true, weight: 0.15, status: experimental, horizon_days: 40, ai: true, refresh_days: 3}
+  fundamentals:    {enabled: true, weight: 0.15, status: experimental, horizon_days: 40, ai: true, refresh_days: 3, max_refreshes_per_cycle: 4}
 
 ensemble:
   min_final_score: 0.15            # below this: no trade (saying "no" is a feature)
@@ -168,4 +169,5 @@ ai:
     anthropic/claude-sonnet-4.5:    {input: 3.00, output: 15.00}
     x-ai/grok-4:                    {input: 3.00, output: 15.00}
   cache_ttl_hours: 24
+  request_timeout_seconds: 20      # AI failure degrades a node, never stalls a cycle
   est_tokens_per_headline: 220     # pre-flight cost estimate basis

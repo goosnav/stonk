@@ -152,6 +152,43 @@ def test_audit_file_mirror(store, tmp_path):
     assert row["event"] == "test_event" and row["payload"]["ok"] is True
 
 
+def test_operator_console_frame_is_quiet_and_informative(monkeypatch):
+    from specforge import cli
+    payloads = {
+        "/api/health": {"readiness": {"trading": True, "reasons": []},
+                        "broker": {"adapter": "paper", "connected": True},
+                        "engine": {"heartbeat_age_s": 5},
+                        "market": {"session": "regular", "et": "12:00 ET"},
+                        "pending_approvals": 0},
+        "/api/status": {"mode": "paper", "equity": 1000, "cash": 900,
+                        "buying_power": 900, "day_pnl": 2, "net_pnl": 3,
+                        "realized_pnl": 1, "unrealized_pnl": 2,
+                        "drawdown_from_peak": .01, "regime": "risk_on",
+                        "deployment_multiplier": 1, "cycle_budget": 100,
+                        "kill_switches": {}, "positions": [{
+                            "symbol": "AAA", "qty": 1, "avg_cost": 98,
+                            "last": 100, "value": 100, "pnl_usd": 2,
+                            "pnl_pct": .0204}]},
+        "/api/engine": {"state": {"phase": "idle", "detail": "cycle done"}},
+        "/api/today": {"hypothesis": "momentum remains constructive",
+                       "news": {"items": [{"symbol": "AAA", "sentiment": .4,
+                                            "summary": "positive catalyst"}]},
+                       "fundamentals": {"items": []}},
+        "/api/decisions": {"cycle": {"id": "c1", "budget": 100,
+                                        "budget_used": 20},
+                           "considered": [{"symbol": "AAA", "score": .6,
+                                           "result": "filled", "thesis": "momentum"}],
+                           "working": []},
+    }
+    monkeypatch.setattr(cli, "_console_api", lambda port, path, timeout=20: payloads[path])
+    frame = cli._console_frame(8420, color=False)
+    assert "equity $1,000.00" in frame
+    assert "POSITIONS (1)" in frame and "AAA" in frame
+    assert "AI COMMENTARY" in frame and "positive catalyst" in frame
+    assert "no kill switches active" in frame
+    assert "rh_mcp_call" not in frame
+
+
 def test_registry_skips_unimplemented_nodes(cfg):
     cfg.data["nodes"]["nonexistent_node"] = {"enabled": True, "weight": 0.5}
     reg = build_registry(cfg)
@@ -258,6 +295,22 @@ def test_health_endpoint(cfg, store):
     body2 = client.get("/api/health").json()
     assert not any("heartbeat" in r for r in body2["readiness"]["reasons"])
     assert body2["engine"]["heartbeat_source"] == "cron"
+
+
+def test_health_flags_stalled_cadence(cfg, store, monkeypatch):
+    from datetime import datetime, timedelta
+    from specforge import health
+
+    old = (datetime.now().astimezone() - timedelta(minutes=31)).isoformat()
+    store.kv_set("heartbeat", {"at": old, "cycle_id": "stuck",
+                               "mode": "paper", "source": "serve"})
+    monkeypatch.setattr(health, "_market_clock", lambda: {
+        "open": True, "session": "regular", "et": "12:00 ET"})
+    monkeypatch.setattr(health, "_broker_health", lambda cfg, store: {
+        "adapter": "paper", "connected": True, "detail": "SIMULATION"})
+    body = health.system_health(cfg, store, scheduler_alive=True)
+    assert any("expected about every 10m" in r
+               for r in body["readiness"]["reasons"])
 
 
 def test_set_env_var_upserts_and_preserves(tmp_path, monkeypatch):

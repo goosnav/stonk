@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from .store import Store
 
 BROKER_PROBE_TTL_S = 60
-HEARTBEAT_STALE_S = 6 * 3600
+MIN_HEARTBEAT_STALE_S = 30 * 60
 ET = ZoneInfo("America/New_York")
 
 
@@ -70,7 +70,11 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
     market = _market_clock()
 
     hb = store.kv_get("heartbeat") or {}
+    if hb.get("mode") != mode:                 # paper/live share the same DB
+        hb = {}
     hb_age = _age_s(hb.get("at")) if hb else None
+    interval_min = int(cfg.get("schedule", "scan_interval_minutes", default=10) or 10)
+    heartbeat_stale_s = max(MIN_HEARTBEAT_STALE_S, interval_min * 3 * 60)
     engine = {"last_scan_at": hb.get("at"), "last_cycle_id": hb.get("cycle_id"),
               "heartbeat_mode": hb.get("mode"), "heartbeat_source": hb.get("source"),
               "heartbeat_age_s": None if hb_age is None else int(hb_age),
@@ -104,9 +108,9 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
     if hb_age is None:
         reasons.append("no scan heartbeat ever — engine has not run; start the "
                        "daemon or cron (see OPS panel)")
-    elif hb_age > HEARTBEAT_STALE_S:
-        reasons.append(f"no scan heartbeat in {int(hb_age/3600)}h — is the "
-                       f"daemon/cron actually running?")
+    elif market["open"] and hb_age > heartbeat_stale_s:
+        reasons.append(f"no completed scan in {int(hb_age/60)}m — expected about "
+                       f"every {interval_min}m; inspect the engine phase")
     if data_age is not None and data_age > stale_limit:
         reasons.append(f"market data stale ({data_age}d old) — governor will veto entries")
     # Broker review blocks/refusals carry the actionable explanation. Query

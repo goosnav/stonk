@@ -43,6 +43,61 @@ def test_parse_failures_disable_ai_not_trading(cfg, store, monkeypatch):
     assert not Governor(cfg, store).active_switches()   # ...but trading unaffected
 
 
+def test_ai_request_timeout_is_configurable(cfg, store, monkeypatch):
+    cfg.data["ai"] = {"enabled": True, "daily_budget_usd": 1.0,
+                      "monthly_budget_usd": 10.0, "model": "m",
+                      "request_timeout_seconds": 7,
+                      "prices": {"m": {"input": 1, "output": 1}}}
+    monkeypatch.setenv("AI_API_KEY", "test")
+    seen = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    "choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    def post(*args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return Response()
+
+    monkeypatch.setattr("specforge.ai.httpx.post", post)
+    assert AIClient(cfg, store).complete_json("test", "node", "sys", "user") \
+        == {"ok": True}
+    assert seen["timeout"] == 7
+
+
+def test_news_ai_work_is_bounded_per_cycle(cfg, store, monkeypatch):
+    from specforge.data import MarketContext
+    from specforge.nodes.news_sentiment import Node
+
+    cfg.data["nodes"]["news_sentiment"] = {
+        "enabled": True, "weight": .05, "horizon_days": 5,
+        "max_symbols_per_cycle": 2}
+
+    class AI:
+        calls = 0
+
+        def available(self):
+            return True
+
+        def complete_json(self, *args, **kwargs):
+            self.calls += 1
+            return {"sentiment": .5, "confidence": .8, "catalyst": "product",
+                    "horizon_days": 5, "already_priced": False,
+                    "summary": "test catalyst"}
+
+    node = Node(cfg.get("nodes", "news_sentiment"))
+    node.id = "news_sentiment"
+    node.ai = AI()
+    monkeypatch.setattr(node, "_headlines", lambda ctx, sym: ["one", "two"])
+    node.compute(MarketContext(store, cfg))
+    assert node.ai.calls == 2
+    assert "capped at 2" in node.degraded_reason
+
+
 def test_weight_update_bounds_and_auto_disable(cfg, store):
     # winner node: 25 solid trades → multiplier rises but clamps at max 2.0
     for i in range(25):

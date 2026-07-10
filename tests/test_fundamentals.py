@@ -78,3 +78,14 @@ def test_validate_clamps(cfg):
     assert len(v["red_flags"]) == 4
     assert Node._validate(None) is None
     assert Node._validate({"conviction": 0.5}) is None
+
+
+def test_cold_fundamentals_refresh_is_bounded(cfg, store):
+    ai = StubAI(GOOD)
+    node = _node(cfg, ai)
+    node.cfg["max_refreshes_per_cycle"] = 1
+    ctx = MarketContext(store, cfg, as_of=store.latest_bar_date("AAA"))
+    ctx.offline = False
+    node.compute(ctx)
+    assert ai.calls == 1
+    assert "capped at 1" in node.degraded_reason

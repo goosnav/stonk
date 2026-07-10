@@ -39,9 +39,12 @@ Troubleshooting:
 - **Approvals**: orders above the approval threshold (default 10% of equity)
   wait here up to 24h. `approval_mode`: `auto` (full autonomy), `threshold`
   (default), `all` (approve everything).
-- **Kill switches**: daily/weekly loss auto-clear on schedule; drawdown and
-  operational switches need a manual reset (button, or
-  `stonk reset-kill <name>`) — that's on purpose: a human should look first.
+- **Kill switches**: routine incidents recover automatically. Broker rejection
+  storms cool down for 30 minutes, daily/weekly loss limits clear on schedule,
+  and drawdown protection resumes after its configured cooldown with a fresh
+  baseline. Only a switch explicitly marked `MAJOR` has no recovery time and
+  requires `stonk reset-kill <name>` after investigation. Exits remain allowed
+  while new entries are paused.
 
 ## 3. Validate before believing
 
@@ -57,8 +60,13 @@ so candidate error bars are grounded from day one.
 Then let paper mode run for at least 2–4 weeks:
 
 ```bash
-.venv/bin/stonk serve        # scheduler scans 09:45 / 12:30 / 15:30 ET
+.venv/bin/stonk tui          # quiet terminal dashboard + continuous scheduler
+# or: .venv/bin/stonk serve  # quiet GUI/headless server on port 8420
 ```
+
+The scheduler evaluates continuously at the configured market-hours interval.
+For automation, `.venv/bin/stonk --mode live tui --once --no-color` prints a
+stable account/engine snapshot and exits without stopping an existing daemon.
 
 ## 4. AI nodes (optional)
 
