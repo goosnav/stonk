@@ -1,5 +1,7 @@
 # Stonk Terminal
 
+![Classic Stonks image.](stonks.webp)
+
 A Bloomberg-inspired terminal for stonks: a modular, risk-bounded,
 self-improving speculation engine. The "brain" is a
 **switchboard of explainable strategy nodes** (momentum, short-term reversal,
