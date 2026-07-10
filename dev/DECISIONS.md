@@ -415,3 +415,27 @@ cycle (realized + unrealized at current marks) — the Net P&L chart populates
 even with no dashboard open. Root cause of "P&L not rendering": only ONE mark
 existed (marks previously came only from GUI status polls), so the chart
 showed its single-point placeholder.
+
+## D38. Startup crash fix + double-click Stonk.app (2026-07-10, user)
+CRASH: after a reboot, `run.command` (→ run.sh → `serve` with NO --mode →
+defaults PAPER) crashed with "single position > 25% rejected". Root cause:
+config_overrides is a mode-agnostic kv blob, but the GUI had stored live-mode
+risk values (max_single_equity_position 0.30, time_step_budget_pct 0.8) that
+are only legal under live.yaml's advanced_override. Loading them in paper mode
+fails Config.validate(). (The smoke `scan` passed because cmd_scan loads config
+WITHOUT overrides; only serve→current_config applies them.) FIX: current_config
+now catches ConfigError, refuses the override, and keeps the SAFE committed
+file config (audited config_override_rejected) instead of crashing. This is
+STRICTER not weaker — the dangerous value is rejected exactly as validate
+intends; validate itself and the set-time apply_override path are unchanged
+(still raise). Upgrade path noted in code: per-key pruning if a mode ever has
+a mix of safe+unsafe overrides worth partially keeping. Mode-scoped override
+blobs are the "proper" fix, deferred (YAGNI until the shared blob bites again).
+STONK.APP: double-click launcher at ~/Applications/Stonk.app. Deliberately NOT
+py2app/pyinstaller — freezing fastapi/uvicorn/yfinance is fragile; the app is a
+thin launcher for the existing .venv (laziest + most robust). Bundle = Info.plist
++ MacOS/Stonk (opens Terminal on scripts/stonk_app.sh) + Resources/stonk.icns.
+Launcher is idempotent: attaches to a running server (opens browser, no double-
+bind) else boots `--mode live serve` and opens the dashboard when healthy.
+Icon: assets/stonk.svg → QuickLook render → iconutil .icns (no image deps).
+Rebuild anytime with scripts/build_stonk_app.sh [dest].

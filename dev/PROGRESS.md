@@ -288,3 +288,10 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   avoid-as-short-proxy) proven with a real API call before enabling; engine
   stamps P&L marks every cycle so the chart fills headless. 58 tests + GUI
   smoke green.
+
+## 2026-07-10 (later) — D38 startup crash fix + Stonk.app
+- [x] Fixed reboot startup crash: current_config refuses cross-mode-dangerous
+  overrides and keeps the safe file config instead of taking the server down.
+  Regression test added. 59 offline + GUI smoke green.
+- [x] Stonk.app (~/Applications) — double-click launcher (attach-or-boot live,
+  custom green-uptrend icon). Rebuild: scripts/build_stonk_app.sh.

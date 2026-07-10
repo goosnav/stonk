@@ -11,3 +11,7 @@ data/*.db-*
 .claude/*.local.md
 data/backups/
 data/*.log
+
+# built app bundle (regenerate with scripts/build_stonk_app.sh)
+Stonk.app/
+*.iconset/

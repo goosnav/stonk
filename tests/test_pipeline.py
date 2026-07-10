@@ -127,6 +127,23 @@ def test_commit_reports_snapshots_dev_reports(store, tmp_path):
     assert log2.count("nightly") == 1
 
 
+def test_current_config_survives_cross_mode_override(cfg, store):
+    """D38: a live-only override (single position 30%, legal under live.yaml's
+    advanced_override) must NOT crash a paper-mode load — the server refuses
+    the override, keeps the safe file config, and audits it."""
+    from specforge.app import current_config
+    from specforge.config import ConfigError, load_config
+    store.kv_set("config_overrides", {"risk": {"max_single_equity_position": 0.30}})
+    # direct load still raises (validate is not weakened)
+    import pytest as _pt
+    with _pt.raises(ConfigError):
+        load_config("paper", overrides=store.kv_get("config_overrides"))
+    # but the server path survives, on the SAFE default
+    c = current_config(store, "paper")
+    assert c.get("risk", "max_single_equity_position") <= 0.25
+    assert any(a["event_type"] == "config_override_rejected" for a in store.audit_rows())
+
+
 def test_health_endpoint(cfg, store):
     """V3 truth contract: reasons NEVER empty when not trading; broker honest;
     heartbeat tracked; never throws."""

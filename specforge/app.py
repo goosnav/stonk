@@ -34,7 +34,20 @@ AI_PROVIDERS = {
 
 
 def current_config(store: Store, mode: str):
-    return load_config(mode, overrides=store.kv_get(OVERRIDES_KEY, {}))
+    overrides = store.kv_get(OVERRIDES_KEY, {}) or {}
+    try:
+        return load_config(mode, overrides=overrides)
+    except ConfigError as e:
+        # D38: config_overrides is a mode-agnostic kv blob, but a value set in
+        # the GUI while live (where live.yaml's advanced_override permits e.g.
+        # single-position 30%) is DANGEROUS when the same DB loads in paper
+        # mode. Refuse the override and keep the SAFE committed file config —
+        # never take the server down over it. This is stricter, not weaker:
+        # the dangerous value is rejected exactly as validate() intends.
+        # ponytail: drops the whole blob; per-key pruning if this ever bites a
+        # mode where some overrides are safe and others aren't worth keeping.
+        store.audit("config_override_rejected", {"mode": mode, "error": str(e)})
+        return load_config(mode)
 
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:

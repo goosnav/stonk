@@ -37,6 +37,19 @@ Data → Signal nodes → Regime gate → Ensemble (+error bars) → Portfolio
 
 ## Quick start
 
+**Double-click (macOS):** build `Stonk.app` once, then it lives wherever you
+put it (Applications, Desktop, Dock) and starts the control center on click:
+
+```bash
+./scripts/build_stonk_app.sh          # → ~/Applications/Stonk.app (custom icon)
+```
+
+The app attaches to a running server if one is up, otherwise boots `--mode live`
+and opens the dashboard. It's a launcher for this repo's `.venv` (not a frozen
+binary), so keep the repo at `~/Documents/code/stonk`.
+
+**Terminal:**
+
 ```bash
 ./run.sh                 # creates .venv, installs, smoke-tests, starts the GUI
 # → http://127.0.0.1:8420
