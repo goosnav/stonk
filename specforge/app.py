@@ -604,6 +604,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "orders": by_status,
             "top_vetoes": sorted(veto_reasons.items(), key=lambda x: -x[1])[:4],
             "news": store.kv_get("news_synopsis"),
+            "fundamentals": store.kv_get("fundamentals_synopsis"),
             "hypothesis": ((st["thesis"] or "").strip().splitlines()[0][:160]
                            if st else None),
         }

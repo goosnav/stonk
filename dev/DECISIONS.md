@@ -392,3 +392,26 @@ No margin/borrowing anywhere (buys still capped by cash/budget/deployment).
    validated override path, audit-logged. The Today panel's veto digest is
    what surfaced this — observability paying for itself same-day.
 5. Model tab: min node-box height 34px (two text lines no longer overlap).
+
+## D37. Fundamentals research node + engine P&L marks (2026-07-10, user)
+FUNDAMENTALS NODE (nodes/fundamentals.py, enabled, experimental, weight 0.15):
+company-published financials (yfinance info ratios + quarterly revenue/net-
+income trend) → compact brief → ONE LLM call (purpose "fundamentals", routed
+via ai.models, cheap default) → strict-JSON valuation verdict {valuation,
+direction long|avoid|neutral, conviction, horizon, thesis, red_flags} →
+deterministic SignalEvent. Long-only system: a sell/short view = avoid
+(suppresses the long case). Analysis kv-cached 3 days/symbol (fundamentals
+move quarterly — re-asking each scan is token burn); ETFs/indices skipped;
+offline/backtest → [] (no point-in-time fundamentals feed = lies). Synopsis
+kv feeds the Today panel's FUNDAMENTALS block. RELIABILITY: proven end-to-end
+with a REAL OpenRouter call before enabling (AAPL→avoid PE38, GE→avoid,
+NVDA→long; SPY skipped; $0.0005 for 3 names; cache re-run = zero spend), plus
+offline unit tests (validation clamps, cache, degradation). Earnings-call
+TRANSCRIPT ingestion deferred: no free reliable transcript source; the
+published-numbers brief is the honest v1, swap the brief builder when a
+transcript feed exists.
+ENGINE P&L MARKS: run_cycle now stamps a pnl intraday mark every live/paper
+cycle (realized + unrealized at current marks) — the Net P&L chart populates
+even with no dashboard open. Root cause of "P&L not rendering": only ONE mark
+existed (marks previously came only from GUI status polls), so the chart
+showed its single-point placeholder.

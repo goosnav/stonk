@@ -107,9 +107,13 @@ nodes:
   congress_trades: {enabled: false, weight: 0.05, status: experimental, horizon_days: 60}
   insider:         {enabled: false, weight: 0.05, status: experimental, horizon_days: 40}
   options_vol:     {enabled: false, weight: 0.05, status: experimental, horizon_days: 30}
-  # deterministic reader of the ACTIVE short-term hypothesis (V4/D28); the AI
+  # deterministic reader of the ACTIVE short-term hypothesis (V4/D34); the AI
   # generation step is separate + post-close. Needs hypothesis.enabled too.
   hypothesis:      {enabled: false, weight: 0.40, status: experimental, horizon_days: 10}
+  # D37: LLM valuation read of company-published financials (yfinance),
+  # kv-cached 3 days/symbol so scans don't re-spend tokens. Long-only system:
+  # a sell/short view lands as direction=avoid (suppresses the long case).
+  fundamentals:    {enabled: true, weight: 0.15, status: experimental, horizon_days: 40, ai: true, refresh_days: 3}
 
 ensemble:
   min_final_score: 0.15            # below this: no trade (saying "no" is a feature)

@@ -398,6 +398,14 @@ async function refreshToday(){
         <b class="${i.sentiment>0?'pos':i.sentiment<0?'neg':''}">${i.symbol} ${i.sentiment>0?'+':''}${i.sentiment}</b>
         <span class="dim">[${i.catalyst}${i.already_priced?' · priced in':''}]</span> ${i.summary}</div>`).join('')+`</div>`;
   }
+  if(t.fundamentals&&t.fundamentals.items){
+    const age=Math.round((Date.now()-+new Date(t.fundamentals.ts))/36e5);
+    const V={undervalued:'pos',overvalued:'neg'};
+    ai+=`<div style="margin-top:6px"><span class="badge">FUNDAMENTALS</span> <span class="dim">${age}h ago</span> `+
+      t.fundamentals.items.slice(0,5).map(i=>`<div style="margin:2px 0 0 6px">
+        <b>${i.symbol}</b> <span class="${V[i.valuation]||''}">${i.valuation}</span>
+        <span class="dim">[${i.direction} ${i.conviction}]</span> ${i.summary}</div>`).join('')+`</div>`;
+  }
   if(!ai) ai=`<div class="dim" style="margin-top:6px">no AI reads yet — enable AI + a key in Config, sentiment/hypothesis appear here after their next run</div>`;
   $('todaybox').innerHTML=`<b>${t.scans}</b> scans · <b>${t.candidates}</b> candidates → ${ord}`+
     (vetoes?`<div class="dim" style="font-size:11px;margin-top:4px">top vetoes: ${vetoes}</div>`:'')+ai;

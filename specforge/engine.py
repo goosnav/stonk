@@ -157,9 +157,22 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         if status == "filled":
             account = broker.get_account()     # keep caps honest within cycle
 
-    # 9. mark equity
+    # 9. mark equity + net P&L (D37: the engine stamps a pnl mark every cycle
+    # so the P&L chart populates even when no dashboard is open; realized from
+    # closed trades + unrealized at current marks — deposit-independent)
     account = broker.get_account()
     store.record_equity(account.equity, account.cash, source, d=ctx.as_of)
+    if refresh_data:                        # live/paper scans only, not backtests
+        realized = store.db.execute(
+            "SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE source=?",
+            (source,)).fetchone()["s"]
+        px = {**ctx.prices(), **live_px}
+        unreal = sum(
+            ((px.get(p.option_symbol or p.symbol) or p.avg_cost) - p.avg_cost)
+            * p.qty * (100.0 if p.asset_type == "option" else 1.0)
+            for p in account.positions if p.qty > 0)
+        store.record_intraday_mark(account.equity, account.cash, source,
+                                   pnl=round(realized + unreal, 2))
 
     summary = {
         "cycle_id": cycle_id, "as_of": ctx.as_of, "regime": reg.regime,

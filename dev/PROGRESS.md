@@ -282,3 +282,9 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   orders). Per-purpose AI models with monthly ($30) + strategy ($20) caps.
   Found + fixed the $1.8/cycle budget override that strangled today's trading.
   55 offline tests + GUI smoke green.
+
+## 2026-07-10 — D37 fundamentals node + P&L chart fix
+- [x] fundamentals node (LLM valuation of published financials, 3d cache,
+  avoid-as-short-proxy) proven with a real API call before enabling; engine
+  stamps P&L marks every cycle so the chart fills headless. 58 tests + GUI
+  smoke green.
