@@ -46,7 +46,7 @@ Rules:
   paper (simulation)", "broker disconnected: <err>", "market closed",
   "kill switch: drawdown", "no scan heartbeat in 8h — is the service running?".
 - scan_job writes kv `heartbeat` = {at, cycle_id, mode} after EVERY cycle
-  (also written by `specforge scan` so cron mode heartbeats too).
+  (also written by `stonk scan` so cron mode heartbeats too).
 - Broker connectivity for health = cached probe (60s TTL) of a cheap read;
   failure stores the exception string. Never let health throw — degrade to
   `"connected": false, "detail": str(e)`.
@@ -78,7 +78,7 @@ Detection: kv heartbeat.source = "serve"|"cron".
 
 ## TUI (chunk 2)
 
-`specforge tui [--mode live]` — plain ANSI, no deps: clears screen every 5s,
+`stonk tui [--mode live]` — plain ANSI, no deps: clears screen every 5s,
 renders: status line (mode/broker/heartbeat/readiness), equity + day P&L,
 open positions table, last 8 audit events, next scan time. Ctrl-C exits. It
 reads the DB + /api/health logic directly (no server required) so it doubles
@@ -109,13 +109,13 @@ as the "is this thing alive" probe.
 2. **Backend truth + ops**: /api/health, heartbeat writes in scan_job AND cli
    scan, `cmd_tui`, `scripts/install_cron.sh`, `scan --post-close` flag.
    Accept: `curl /api/health` shows readiness with honest reasons in paper
-   mode; `specforge tui` renders one frame offline; tests green.
+   mode; `stonk tui` renders one frame offline; tests green.
 3. **dashboard.html v3**: status bar + truth rules + OPS panel + full restyle
    per tokens above. Accept: `node --check` on extracted JS, id cross-check
    script passes, Playwright smoke (tests/test_gui.py) passes, screenshot
    captured to dev/reports/gui_v3.png.
 4. **Go live**: restart service in live mode (`pkill -f "specforge serve" &&
-   nohup .venv/bin/specforge --mode live serve --port 8420 &`). Accept:
+   nohup .venv/bin/stonk --mode live serve --port 8420 &`). Accept:
    /api/health shows mode=live, broker connected, readiness reflects market
    clock; first scheduled scan places real orders (watch audit log).
 5. **Docs**: TUTORIAL "How it runs" section mirrors the OPS panel; PROGRESS +

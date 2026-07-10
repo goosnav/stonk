@@ -1,8 +1,8 @@
-# CLAUDE_RUN_SUMMARY — SpecForge (final, 2026-07-06 end of day)
+# CLAUDE_RUN_SUMMARY — Stonk Terminal (final, 2026-07-06 end of day)
 
 ## What exists
 
-SpecForge v0.1.0: a validated, live-connected trading engine plus a Control
+Stonk Terminal v0.1.0: a validated, live-connected trading engine plus a Control
 Center GUI intended as sellable software. 21 commits, 27 tests (26 offline +
 1 Playwright GUI render test), decision log D1–D23.
 
@@ -39,7 +39,7 @@ Center GUI intended as sellable software. 21 commits, 27 tests (26 offline +
 ## What is NOT done (honest, human-gated)
 
 1. First live order placement (market hours + your approval click):
-   `.venv/bin/specforge --mode live serve` → approve intent in GUI.
+   `.venv/bin/stonk --mode live serve` → approve intent in GUI.
 2. Paper/live soak time (calendar) before raising the $50/cycle live cap.
 3. Options order path on RH adapter (account far below unlock anyway).
 4. Sprint C learning items (need live trade data that doesn't exist yet).

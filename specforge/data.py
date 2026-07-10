@@ -33,7 +33,7 @@ def fetch_stooq(symbol: str) -> list[dict]:
     if not ssym:
         return []
     r = httpx.get(STOOQ_URL.format(sym=ssym), timeout=30,
-                  headers={"User-Agent": "specforge/0.1"})
+                  headers={"User-Agent": "stonk-terminal/0.1"})
     r.raise_for_status()
     text = r.text
     if not text.startswith("Date,"):     # stooq returns junk/limits page on miss

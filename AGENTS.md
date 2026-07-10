@@ -165,19 +165,24 @@ Non-goals:
 
 ## 5. System Name
 
-Working name: `SpecForge`
+Product name: `Stonk Terminal`
 
-Reason: the system forges speculative hypotheses into tested, weighted, risk-bounded trading decisions.
+Short name: `Stonk`. The name deliberately borrows the irreverent "stonks"
+meme voice while the product itself remains a serious, auditable terminal.
 
-Internal components can use more literal names:
+Product components use the Stonk Terminal name:
 
-- `specforge-core`
-- `specforge-data`
-- `specforge-signals`
-- `specforge-risk`
-- `specforge-broker-robinhood-mcp`
-- `specforge-gui`
-- `specforge-research`
+- `stonk-terminal-core`
+- `stonk-terminal-data`
+- `stonk-terminal-signals`
+- `stonk-terminal-risk`
+- `stonk-terminal-broker-robinhood-mcp`
+- `stonk-terminal-gui`
+- `stonk-terminal-research`
+
+Compatibility note: the Python import package remains `specforge`, and the
+existing database/token/launchd namespaces retain that legacy name. Renaming
+live persistence is migration work, not branding work.
 
 ---
 

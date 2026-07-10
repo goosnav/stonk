@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Stonk.app — a double-clickable macOS launcher for the SpecForge control
+# Build Stonk Terminal.app — a double-clickable macOS launcher for the terminal
 # center. Regenerates the .icns from assets/stonk.svg (QuickLook render) if the
 # icon is missing, then assembles a plain .app bundle (no py2app/pyinstaller:
 # the app is a launcher for the existing .venv, not a frozen binary — that's
@@ -7,7 +7,7 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$HOME/Applications}"          # where the .app lands; override as arg
-APP="$OUT/Stonk.app"
+APP="$OUT/Stonk Terminal.app"
 cd "$REPO"
 
 # --- icon: build assets/stonk.icns if absent ---
@@ -32,8 +32,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Stonk</string>
-  <key>CFBundleDisplayName</key><string>Stonk</string>
+  <key>CFBundleName</key><string>Stonk Terminal</string>
+  <key>CFBundleDisplayName</key><string>Stonk Terminal</string>
   <key>CFBundleIdentifier</key><string>com.jbs.stonk</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

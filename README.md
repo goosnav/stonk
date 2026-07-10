@@ -1,6 +1,7 @@
-# SpecForge
+# Stonk Terminal
 
-A modular, risk-bounded, self-improving speculation engine. The "brain" is a
+A Bloomberg-inspired terminal for stonks: a modular, risk-bounded,
+self-improving speculation engine. The "brain" is a
 **switchboard of explainable strategy nodes** (momentum, short-term reversal,
 sector rotation, earnings drift, congress trades, insider clusters, AI news
 sentiment, options convexity) combined by a regime-conditioned ensemble, gated
@@ -32,16 +33,16 @@ Data → Signal nodes → Regime gate → Ensemble (+error bars) → Portfolio
 - **Bounded instruments only**: long equities/ETFs and long calls/puts (max
   loss = premium). No shorting, no naked options, no margin, ever.
 
-![SpecForge Control Center — Overview](docs/screenshot_overview.png)
+![Stonk Terminal — Overview](docs/screenshot_overview.png)
 ![Signal switchboard](docs/screenshot_switchboard.png)
 
 ## Quick start
 
-**Double-click (macOS):** build `Stonk.app` once, then it lives wherever you
+**Double-click (macOS):** build `Stonk Terminal.app` once, then it lives wherever you
 put it (Applications, Desktop, Dock) and starts the control center on click:
 
 ```bash
-./scripts/build_stonk_app.sh          # → ~/Applications/Stonk.app (custom icon)
+./scripts/build_stonk_app.sh          # → ~/Applications/Stonk Terminal.app
 ```
 
 The app attaches to a running server if one is up, otherwise boots `--mode live`
@@ -54,17 +55,17 @@ binary), so keep the repo at `~/Documents/code/stonk`.
 ./run.sh                 # creates .venv, installs, smoke-tests, starts the GUI
 # → http://127.0.0.1:8420
 
-./scripts/install_service.sh          # optional: run at login + auto-restart (macOS)
+./scripts/install_service.sh          # optional launchd mode; see macOS note below
 ```
 
 Or manually:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/specforge data --full        # ~2 min: full daily history, 46 symbols
-.venv/bin/specforge backtest --years 10 --tag v1   # validation + analog trades
-.venv/bin/specforge scan               # one full paper scan cycle right now
-.venv/bin/specforge serve              # GUI + scheduler (paper mode)
+.venv/bin/stonk data --full        # ~2 min: full daily history, 46 symbols
+.venv/bin/stonk backtest --years 10 --tag v1   # validation + analog trades
+.venv/bin/stonk scan               # one full paper scan cycle right now
+.venv/bin/stonk serve              # GUI + scheduler (paper mode)
 ```
 
 Paper mode is the default and needs **no keys or accounts**.
@@ -77,7 +78,7 @@ Read [TUTORIAL.md](TUTORIAL.md) first. Short version:
 2. `cp .env.example .env`, set `LIVE_TRADING_ENABLED=true` and
    `RH_ACCOUNT_WHITELIST=<account_number>`.
 3. Paper-trade until the §32 safety gates pass (the tutorial lists them).
-4. `.venv/bin/specforge --mode live serve` — live config starts with a
+4. `.venv/bin/stonk --mode live serve` — live config starts with a
    **$50/cycle** budget cap. First OAuth run opens a browser.
 5. If Robinhood rejects custom MCP clients, switch `broker: robinhood_bridge`
    in `configs/live.yaml` and schedule a Claude Code session with
@@ -115,10 +116,20 @@ Implementation-level docs live in [dev/](dev/): [ARCHITECTURE.md](dev/ARCHITECTU
 ## Verification
 
 ```bash
-.venv/bin/pytest tests/ -q     # 24 offline tests: governor, budget, kill
-                               # switches, no-lookahead, bridge, AI budget, weights
-.venv/bin/specforge backtest --years 10 --tag v1   # walk-forward, costs included
+.venv/bin/pytest tests/ -q     # 66 tests, including the rendered dashboard smoke
+.venv/bin/stonk backtest --years 10 --tag v1   # walk-forward, costs included
 ```
 
 Backtest reports land in `dev/reports/` with in/out-of-sample splits and an
 SPY buy-hold comparison. Treat backtests as hostile evidence.
+
+## Compatibility names
+
+The product and primary command are **Stonk Terminal** and `stonk`. The
+internal Python import package (`specforge`), existing database filename
+(`data/specforge.db`), token directory, and legacy `specforge` CLI alias stay
+in place so upgrades do not strand live state or duplicate background jobs.
+
+On macOS, `Stonk Terminal.app` is the recommended launcher when the repository
+lives under `Documents`; background launchd agents may need explicit privacy
+permission to read a virtual environment there.

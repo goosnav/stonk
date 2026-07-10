@@ -71,7 +71,7 @@ class QuoteService:
             return {}
         syms = ",".join(s.lower().replace("-", ".") + ".us" for s in plain)
         r = httpx.get(STOOQ_LIGHT.format(syms=syms), timeout=15,
-                      headers={"User-Agent": "specforge/0.1"})
+                      headers={"User-Agent": "stonk-terminal/0.1"})
         r.raise_for_status()
         import csv
         out = {}

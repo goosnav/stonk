@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stonk.app launcher (D38). Double-click target: start the SpecForge control
+# Stonk Terminal.app launcher (D38). Double-click target: start the terminal
 # center and open the dashboard. Idempotent — if a server is already serving
 # on the port, it just opens the browser instead of fighting for it.
 set -uo pipefail
@@ -9,7 +9,7 @@ PORT=8420
 URL="http://127.0.0.1:$PORT"
 cd "$REPO" || { echo "repo not found at $REPO"; read -r; exit 1; }
 
-echo "SPECFORGE — stonk control center"
+echo "STONK TERMINAL — autonomous market control center"
 echo "repo: $REPO"
 
 # already up? attach, don't double-bind the port.
@@ -19,7 +19,7 @@ if curl -sf "$URL/api/health" >/dev/null 2>&1; then
 fi
 
 # first run / missing venv: create + install (visible, one-time ~2 min).
-if [ ! -x .venv/bin/specforge ]; then
+if [ ! -x .venv/bin/stonk ]; then
   echo "first run: creating .venv and installing…"
   python3 -m venv .venv && .venv/bin/pip install -q --upgrade pip && \
     .venv/bin/pip install -q -e ".[dev]" || { echo "install failed"; read -r; exit 1; }
@@ -36,4 +36,4 @@ fi
 # shows logs and Ctrl-C / closing it stops the server.
 echo "starting live server at $URL  (close this window or Ctrl-C to stop)"
 mkdir -p logs
-.venv/bin/specforge --mode live serve --port "$PORT" 2>&1 | tee -a logs/runtime-live.log
+.venv/bin/stonk --mode live serve --port "$PORT" 2>&1 | tee -a logs/runtime-live.log

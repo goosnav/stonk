@@ -1,4 +1,4 @@
-# REBASE_PLAN — SpecForge (stonk)
+# REBASE_PLAN — Stonk Terminal
 
 ## Verdict
 

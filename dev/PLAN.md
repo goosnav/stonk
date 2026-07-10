@@ -1,4 +1,4 @@
-# SpecForge — Automated Speculation Engine (Architecture + MVP Build Plan)
+# Stonk Terminal — Automated Speculation Engine (Architecture + MVP Build Plan)
 
 ## Context
 
@@ -102,7 +102,7 @@ Each phase lands with its tests and updates README/TUTORIAL; final delivery meet
 ## Verification
 
 1. `pytest` — risk governor rejections, option bounded-risk validation, time-step budget enforcement, duplicate-order prevention, stale-data rejection, kill switches, backtest no-lookahead (assert every feature timestamp ≤ decision time), AI parse-failure discard.
-2. `specforge backtest --years 10` — report must show costs included, out-of-sample results, SPY comparison.
+2. `stonk backtest --years 10` — report must show costs included, out-of-sample results, SPY comparison.
 3. `specforge paper` for a multi-day run — closed loop with real data, audit log complete, dashboard live at localhost.
 4. Robinhood read-only integration test (get_accounts/portfolio/quotes) before any order path is enabled; `review_order` round-trip with a 1-share intent in approval mode as the first live action.
 5. Smoke test in `run.sh`: boots app, hits `/api/status`, runs one paper scan cycle, asserts audit rows written.

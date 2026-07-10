@@ -3,7 +3,7 @@
 One function, system_health(), answers: what mode is this, is the broker
 really connected, is anything actually running, is the market open, is the
 data fresh, and — the contract — WHY we are not trading whenever we aren't.
-Used by GET /api/health and `specforge tui`. Must NEVER raise: every probe
+Used by GET /api/health and `stonk tui`. Must NEVER raise: every probe
 degrades to connected=false + the error string (fail loudly, not silently).
 """
 from __future__ import annotations

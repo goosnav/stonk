@@ -43,7 +43,7 @@ class Node(SignalNode):
             return (cached or {}).get("rows", [])
         try:
             r = httpx.get(BFF_URL, timeout=20,
-                          headers={"User-Agent": "specforge/0.1"})
+                          headers={"User-Agent": "stonk-terminal/0.1"})
             r.raise_for_status()
             rows = []
             for t in (r.json().get("data") or []):

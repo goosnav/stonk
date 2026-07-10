@@ -7,9 +7,9 @@ Protocol (all through the shared SQLite DB + CLI):
    (resting). review_order() approves locally IF the account snapshot is fresh;
    the real RH review happens in the bridge session before placing.
 2. Bridge session (see scripts/bridge_prompt.md) runs:
-     specforge bridge-dump          → JSON: pending intents + snapshot request
+     stonk bridge-dump              → JSON: pending intents + snapshot request
    relays each intent through RH MCP tools (review → place → poll), then:
-     specforge bridge-report --file results.json
+     stonk bridge-report --file results.json
    which records fills (kv 'bridge_fill_<order_id>'), account snapshot
    (kv 'bridge_account'), and review rejections.
 3. Next engine cycle: Executor.reconcile() polls us; we serve the recorded
@@ -98,7 +98,7 @@ class BridgeBroker:
         return False                                # bridge session handles cancels
 
 
-# ---------- CLI-side helpers (used by `specforge bridge-dump/-report`) ----------
+# ---------- CLI-side helpers (used by `stonk bridge-dump/-report`) ----------
 
 def bridge_dump(store, cfg) -> dict:
     """Everything the bridge session needs, as one JSON blob."""
@@ -108,7 +108,7 @@ def bridge_dump(store, cfg) -> dict:
         "instructions": "See scripts/bridge_prompt.md. Review each intent via "
                         "review_equity_order; place with place_equity_order using "
                         "ref_id=idempotency_key; report results via "
-                        "`specforge bridge-report --file <results.json>`.",
+                        "`stonk bridge-report --file <results.json>`.",
         "account_whitelist_env": "RH_ACCOUNT_WHITELIST",
         "pending_intents": pending,
         "want_account_snapshot": True,

@@ -52,7 +52,7 @@ def current_config(store: Store, mode: str):
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     from .quotes import QuoteService
-    app = FastAPI(title="SpecForge", docs_url="/api/docs")
+    app = FastAPI(title="Stonk Terminal", docs_url="/api/docs")
     mode = cfg.mode
     quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
 
@@ -745,7 +745,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             print(f"[scheduler] scan done: {summary['cycle_id']} "
                   f"entries={summary['entries']} exits={summary['exits']}")
             if summary.get("kill_switches"):
-                _notify("SpecForge kill switch",
+                _notify("Stonk Terminal kill switch",
                         f"active: {', '.join(summary['kill_switches'])} — "
                         f"open the dashboard")
             # D29: intents were silently expiring (D25) because nothing told
@@ -753,12 +753,12 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             pending = sum(1 for s in summary.get("entries", {}).values()
                           if s == "pending_approval")
             if pending:
-                _notify("SpecForge: trades await approval",
+                _notify("Stonk Terminal: trades await approval",
                         f"{pending} intent(s) pending — approve in the "
                         f"dashboard before they expire")
         except Exception as e:                      # noqa: BLE001
             store.audit("scheduler_error", {"error": str(e)})
-            _notify("SpecForge scan FAILED", str(e)[:120])
+            _notify("Stonk Terminal scan FAILED", str(e)[:120])
             print(f"[scheduler] scan FAILED: {e}")
 
     def _notify(title: str, msg: str) -> None:
@@ -785,7 +785,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 from . import steering as steering_mod
                 hs = steering_mod.maintain(cfg, store)
                 if hs.get("short_term_proposed") or hs.get("north_star_proposed"):
-                    _notify("SpecForge: hypothesis proposal",
+                    _notify("Stonk Terminal: hypothesis proposal",
                             "a strategic choice awaits (or auto-applies at "
                             "expiry) — see the dashboard")
             except Exception as e:              # noqa: BLE001
@@ -794,7 +794,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             if proposals:
                 store.audit("promotion_proposals", proposals)
                 store.kv_set("promotion_proposals", proposals)
-                _notify("SpecForge", f"{len(proposals)} node promotion proposal(s) "
+                _notify("Stonk Terminal", f"{len(proposals)} node promotion proposal(s) "
                                      f"await your review")
             _backup_db(store)
             _commit_reports(store)
@@ -859,7 +859,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped
         (machine asleep past the grace window) — make it loud."""
         store.audit("scheduler_missed", {"scheduled": str(event.scheduled_run_time)})
-        _notify("SpecForge missed a scan",
+        _notify("Stonk Terminal missed a scan",
                 f"scheduled {event.scheduled_run_time:%H:%M} never ran — "
                 f"machine asleep?")
 

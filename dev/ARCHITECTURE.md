@@ -1,4 +1,4 @@
-# SpecForge Architecture (working notes)
+# Stonk Terminal Architecture (working notes)
 
 > Canonical spec: [../AGENTS.md](../AGENTS.md). Approved build plan: [PLAN.md](PLAN.md).
 > Decision log: [DECISIONS.md](DECISIONS.md). Current status: [PROGRESS.md](PROGRESS.md).
@@ -6,7 +6,7 @@
 
 ## One-paragraph summary
 
-SpecForge is a deterministic trading operating system with optional AI attachments.
+Stonk Terminal is a deterministic trading operating system with optional AI attachments.
 Strategy **nodes** (momentum, earnings drift, congress trades, …) each turn market
 data into `SignalEvent` forecasts — never orders. A regime-conditioned weighted
 **ensemble** merges them into `TradeCandidate`s with bootstrap error bars. A
@@ -63,7 +63,7 @@ Post-close job: mark-to-market equity curve, close matured trade records,
 | `steering.py` | V4/D34: non-blocking strategic-choice queue, tiered expiry defaults, validated apply paths, post-close maintenance | — |
 | `montecarlo.py` | Portfolio path simulation (AGENTS.md §25) for GUI/risk | — |
 | `app.py` | FastAPI: dashboard page + JSON API + APScheduler startup | — |
-| `cli.py` | `specforge scan|paper|backtest|status|serve|...` | — |
+| `cli.py` | `stonk scan|paper|backtest|status|serve|...` | — |
 
 ## Non-negotiable invariants (tested)
 

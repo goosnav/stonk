@@ -1,4 +1,4 @@
-"""CLI entry point. `specforge <cmd>` (or `.venv/bin/python -m specforge.cli`).
+"""CLI entry point. `stonk <cmd>` (or `.venv/bin/python -m specforge.cli`).
 
 Commands:
   data       refresh daily bars (--full re-pulls entire history)
@@ -119,7 +119,7 @@ def cmd_tui(args, cfg, store):
         while True:
             h = system_health(cfg, store)
             eq = store.equity_curve("live" if cfg.mode == "live" else "paper")
-            lines = ["\033[2J\033[H\033[1mSPECFORGE " + cfg.mode.upper() + X]
+            lines = ["\033[2J\033[H\033[1mSTONK TERMINAL " + cfg.mode.upper() + X]
             b = h["broker"]
             tag = (G + "[" + b["adapter"] + " OK]" + X) if b["connected"] \
                 else (R + "[" + b["adapter"] + " DOWN: " + (b.get("detail") or "")[:60] + "]" + X)
@@ -176,7 +176,7 @@ def cmd_hypothesis(args, cfg, store):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="specforge")
+    p = argparse.ArgumentParser(prog="stonk")
     p.add_argument("--mode", default=None, help="config overlay: paper|live")
     sub = p.add_subparsers(dest="cmd", required=True)
 

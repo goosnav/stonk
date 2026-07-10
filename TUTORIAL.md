@@ -1,4 +1,4 @@
-# SpecForge tutorial — zero to live, safely
+# Stonk Terminal tutorial — zero to live, safely
 
 ## 0. Requirements
 
@@ -18,10 +18,10 @@ and starts the GUI at **http://127.0.0.1:8420**.
 
 Troubleshooting:
 - `python3 not found` → install Python from python.org or `brew install python`.
-- Data download partial → rerun `.venv/bin/specforge data --full` (Stooq
+- Data download partial → rerun `.venv/bin/stonk data --full` (Stooq
   rate-limits occasionally; the risk governor refuses to trade on stale data,
   so nothing unsafe happens either way).
-- Port busy → `.venv/bin/specforge serve --port 8421`.
+- Port busy → `.venv/bin/stonk serve --port 8421`.
 
 ## 2. Understand the dashboard
 
@@ -41,12 +41,12 @@ Troubleshooting:
   (default), `all` (approve everything).
 - **Kill switches**: daily/weekly loss auto-clear on schedule; drawdown and
   operational switches need a manual reset (button, or
-  `specforge reset-kill <name>`) — that's on purpose: a human should look first.
+  `stonk reset-kill <name>`) — that's on purpose: a human should look first.
 
 ## 3. Validate before believing
 
 ```bash
-.venv/bin/specforge backtest --years 10 --tag v1
+.venv/bin/stonk backtest --years 10 --tag v1
 cat dev/reports/backtest_v1.json
 ```
 
@@ -57,7 +57,7 @@ so candidate error bars are grounded from day one.
 Then let paper mode run for at least 2–4 weeks:
 
 ```bash
-.venv/bin/specforge serve        # scheduler scans 09:45 / 12:30 / 15:30 ET
+.venv/bin/stonk serve        # scheduler scans 09:45 / 12:30 / 15:30 ET
 ```
 
 ## 4. AI nodes (optional)
@@ -90,7 +90,7 @@ Gate checklist (all must be true — the engine enforces the mechanical ones):
 Then, to trade **autonomously** (the default):
 
 ```bash
-.venv/bin/specforge --mode live serve            # runs now, scans on schedule
+.venv/bin/stonk --mode live serve            # runs now, scans on schedule
 # or run it as a background service that starts at login + auto-restarts:
 ./scripts/install_service.sh live
 ```
@@ -126,8 +126,8 @@ with clearly negative live expectancy (n≥30), and records promotion
 *proposals* — promotions themselves are yours to approve by editing the node's
 `status` in config after reviewing the scorecard.
 
-CLI equivalents: `specforge status` (JSON overview), `specforge approve|reject
-<intent_id>`, `specforge reset-kill <name>`, `specforge bridge-dump|bridge-report`.
+CLI equivalents: `stonk status` (JSON overview), `stonk approve|reject
+<intent_id>`, `stonk reset-kill <name>`, `stonk bridge-dump|bridge-report`.
 
 ## 7. What to expect (honesty section)
 

@@ -1,6 +1,6 @@
 """Scan-cycle orchestrator — the pipeline in dev/ARCHITECTURE.md, one function.
 
-run_cycle() is used verbatim by: the CLI (`specforge scan`), the scheduler
+run_cycle() is used verbatim by: the CLI (`stonk scan`), the scheduler
 (app.py), and the backtester (with as_of set and refresh_data=False). One code
 path for live/paper/backtest is the lookahead guarantee (D8).
 """

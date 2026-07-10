@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restart the live SpecForge server safely: refuses during NYSE market hours
+# Restart the live Stonk Terminal server safely: refuses during NYSE market hours
 # (a restart mid-session would disturb the live broker session and can miss
 # a scheduled scan). Used by the scheduled maintenance sessions to pick up
 # new commits. Usage:
@@ -21,14 +21,16 @@ if [ "${1:-}" != "--force" ]; then
   fi
 fi
 
-PID=$(pgrep -f "specforge --mode live serve" || true)
+PID=$(pgrep -f "(stonk|specforge) --mode live serve" || true)
 if [ -n "$PID" ]; then
   kill "$PID"
   # wait for the port to free up
   for _ in $(seq 1 10); do curl -sf "localhost:$PORT/api/health" >/dev/null 2>&1 || break; sleep 1; done
 fi
 
-nohup .venv/bin/specforge --mode live serve --port "$PORT" >> logs/runtime-live.log 2>&1 &
+BIN=.venv/bin/stonk
+[ -x "$BIN" ] || BIN=.venv/bin/specforge   # compatibility before editable reinstall
+nohup "$BIN" --mode live serve --port "$PORT" >> logs/runtime-live.log 2>&1 &
 disown
 
 for _ in $(seq 1 15); do

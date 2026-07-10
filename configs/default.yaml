@@ -1,4 +1,4 @@
-# SpecForge default configuration. paper.yaml / live.yaml overlay this.
+# Stonk Terminal default configuration. paper.yaml / live.yaml overlay this.
 # Everything here is editable from the GUI (changes are audit-logged);
 # the risk governor rejects dangerous values unless advanced_override: true.
 

@@ -18,7 +18,7 @@
 - [x] risk.py governor + kill switches; execution.py; engine.py run_cycle; cli.py
 - [x] tests/: 18 passing (governor rejections, budget enforcement, dup orders,
       stale data, kill switches, option validation, no-lookahead, e2e paper loop)
-- [x] VERIFIED: `specforge scan` end-to-end on real data — risk_on regime,
+- [x] VERIFIED: `stonk scan` end-to-end on real data — risk_on regime,
       71 signals → 29 candidates → 2 fills within $100 cycle budget, 3rd order
       correctly rejected on budget exhaustion; audit trail reconstructs cycle.
 
@@ -108,7 +108,7 @@
   (tests/test_gui.py, needs playwright; screenshots dev/reports/gui_*.png).
 - scripts/install_service.sh — launchd persistence (login start, crash restart).
 - NEXT LIVE STEP (human): during market hours run
-  `.venv/bin/specforge --mode live serve`, approve the first queued intent in
+  `.venv/bin/stonk --mode live serve`, approve the first queued intent in
   the GUI, verify the fill in the Robinhood app + next-cycle reconcile.
 
 ## BUILD COMPLETE — system is in OPERATION phase
@@ -258,7 +258,7 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   merge into the scan universe. Off by default (hypothesis.enabled).
 - [x] Steering: non-blocking strategic-choice queue with tiered expiry
   defaults (adopt vs status-quo), GUI panel with countdown, /api/steering,
-  cycle-start + on-read sweeps, `specforge hypothesis` CLI, post-close
+  cycle-start + on-read sweeps, `stonk hypothesis` CLI, post-close
   maintenance job. config.apply_override refactor = one validated override
   path for GUI + steering.
 - [x] GUI: Config tab rename, portfolio-value chart (intraday marks +

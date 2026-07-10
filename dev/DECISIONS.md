@@ -276,7 +276,7 @@ live now hard-checks the triple gate before installing the autonomous service.
 User: no fake information, fail gracefully, explain the run model, Bloomberg-
 weight UI. Shipped: specforge/health.py system_health() (mode, real broker
 probe, heartbeat, market clock, readiness with ALWAYS-populated reasons);
-heartbeats from serve/cron/manual-scan; `specforge tui`; scripts/
+heartbeats from serve/cron/manual-scan; `stonk tui`; scripts/
 install_cron.sh (launchd ping run-model); terminal restyle (zero radius, mono
 stack, amber/green tags, SIM prefix on every simulated $, per-panel FEED
 ERROR guards, no emoji). FIRST AUTONOMOUS LIVE TRADE at 10:50 ET: BUY

@@ -1,7 +1,7 @@
 [project]
-name = "specforge"
+name = "stonk-terminal"
 version = "0.1.0"
-description = "SpecForge — modular, risk-bounded speculation engine (Robinhood MCP first broker adapter)"
+description = "Stonk Terminal — autonomous, risk-bounded market speculation engine"
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
@@ -19,6 +19,8 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
+stonk = "specforge.cli:main"
+# Legacy alias: existing services and operator muscle memory keep working.
 specforge = "specforge.cli:main"
 
 [build-system]

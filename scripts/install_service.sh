@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install SpecForge as a macOS launchd user agent: starts at login, restarts
+# Install Stonk Terminal as a macOS launchd user agent: starts at login, restarts
 # on crash, logs to data/service.log. Usage:
 #   ./scripts/install_service.sh [paper|live]     (default: paper)
 #   ./scripts/install_service.sh uninstall
@@ -8,6 +8,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 PLIST="$HOME/Library/LaunchAgents/com.specforge.serve.plist"
 LABEL="com.specforge.serve"
+# Legacy label retained so reinstalling replaces, rather than duplicates, an
+# existing live service.
 
 if [ "${1:-}" = "uninstall" ]; then
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
@@ -17,7 +19,7 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 
 MODE="${1:-paper}"
-[ -x "$ROOT/.venv/bin/specforge" ] || { echo "run ./run.sh once first (.venv missing)"; exit 1; }
+[ -x "$ROOT/.venv/bin/stonk" ] || { echo "run ./run.sh once first (.venv missing)"; exit 1; }
 
 # Live installs must pass the triple gate NOW, or the service would boot but
 # refuse every order — fail loudly instead of pretending it's trading.
@@ -38,7 +40,7 @@ cat > "$PLIST" <<EOF
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>$ROOT/.venv/bin/specforge</string>
+    <string>$ROOT/.venv/bin/stonk</string>
     <string>--mode</string><string>$MODE</string>
     <string>serve</string><string>--port</string><string>8420</string>
   </array>
@@ -52,5 +54,13 @@ EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
+sleep 1
+if ! launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q "state = running"; then
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "service failed to start — macOS may be blocking background access to $ROOT" >&2
+  echo "use Stonk Terminal.app, move the repo outside Documents, or grant privacy access" >&2
+  exit 1
+fi
 echo "installed $LABEL (mode=$MODE) — GUI at http://127.0.0.1:8420"
 echo "logs: tail -f $ROOT/data/service.log · uninstall: $0 uninstall"

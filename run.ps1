@@ -1,4 +1,4 @@
-# SpecForge launcher (Windows). Mirrors run.sh.
+# Stonk Terminal launcher (Windows). Mirrors run.sh.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -15,12 +15,12 @@ if ($LASTEXITCODE -ne 0) { throw "tests failed" }
 
 if (-not (Test-Path "data\specforge.db")) {
   Write-Host "» downloading market data (first run, ~2 min)…"
-  .venv\Scripts\specforge data --full
+  .venv\Scripts\stonk data --full
 }
 
 Write-Host "» smoke test: one paper scan cycle…"
-.venv\Scripts\specforge scan --no-refresh
+.venv\Scripts\stonk scan --no-refresh
 if ($LASTEXITCODE -ne 0) { throw "smoke scan failed" }
 
 Write-Host "» starting GUI at http://127.0.0.1:8420"
-.venv\Scripts\specforge serve --port 8420
+.venv\Scripts\stonk serve --port 8420

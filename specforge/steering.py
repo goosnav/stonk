@@ -187,7 +187,7 @@ def ensure_north_star(cfg, store: Store, ai, ctx) -> dict | None:
 
 
 def maintain(cfg, store: Store, ai=None, ctx=None) -> dict:
-    """Post-close hypothesis upkeep (scheduler + `specforge hypothesis` CLI):
+    """Post-close hypothesis upkeep (scheduler + `stonk hypothesis` CLI):
     sweep expiries, bootstrap the north star, rotate a stale short-term
     hypothesis, review the north star on cadence. Everything routes through
     steering; nothing here touches orders. Returns a small summary."""

@@ -1,4 +1,4 @@
-# ROADMAP — how to bring SpecForge to fruition
+# ROADMAP — how to bring Stonk Terminal to fruition
 
 > **Audience: any agent (or human) picking this up cold.** Follow the sprints
 > in order. Each has exact commands, acceptance criteria, and a DO-NOT list.
@@ -22,7 +22,7 @@
 5. **Log decisions.** Any behavioral change gets a numbered entry in
    `dev/DECISIONS.md` and a line in `dev/PROGRESS.md`.
 6. **Never commit secrets.** `.env` is gitignored; keep it that way.
-7. Use `.venv/bin/python` / `.venv/bin/specforge` (no uv on this machine).
+7. Use `.venv/bin/python` / `.venv/bin/stonk` (no uv on this machine).
 
 ## Current state, one paragraph (2026-07-06)
 
@@ -30,7 +30,7 @@ All five build phases are CODE-COMPLETE and tested (25 offline tests green).
 Validation gate passed: 10-year walk-forward backtest (costs included) shows
 CAGR 7.6%, Sharpe 0.76, maxDD 16.8%, profit factor 1.39, out-of-sample better
 than in-sample (D18). The GUI runs at `http://127.0.0.1:8420` via
-`.venv/bin/specforge serve`. 1,756 backtest analog trades feed live error
+`.venv/bin/stonk serve`. 1,756 backtest analog trades feed live error
 bars. What remains is OPERATION, not construction: run paper for weeks, then
 tiny live, then let attribution learn, then (only if measured) widen.
 
@@ -39,7 +39,7 @@ tiny live, then let attribution learn, then (only if measured) widen.
 Goal: the closed loop runs unattended on the schedule and accumulates real
 paper trades.
 
-1. Start (or confirm running): `nohup .venv/bin/specforge serve --port 8420 &`
+1. Start (or confirm running): `nohup .venv/bin/stonk serve --port 8420 &`
    — the scheduler scans Mon–Fri 09:45/12:30/15:30 ET + 16:30 post-close.
    Better: install it as a launchd/systemd service so it survives reboots.
 2. Daily check (or automate as a cron/scheduled Claude session):
@@ -81,10 +81,10 @@ Prereq: Sprint A accept criteria met, and the human has funded the Robinhood
    `time_step_budget_abs_cap` in live.yaml plus approval thresholds keep any
    accident tiny anyway).
 4. First live order: temporarily set `risk.approval_mode: all` in
-   configs/live.yaml, run `.venv/bin/specforge --mode live scan`, approve the
+   configs/live.yaml, run `.venv/bin/stonk --mode live scan`, approve the
    single queued intent in the GUI, verify the fill appears in both the
    Robinhood app and `/api/status` next cycle (reconcile step).
-5. Restore `approval_mode: threshold`, start `.venv/bin/specforge --mode live
+5. Restore `approval_mode: threshold`, start `.venv/bin/stonk --mode live
    serve`, and let it run at the $50/cycle cap for ≥2 weeks.
 
 **Accept when:** ≥5 live fills reconciled correctly (engine positions ==
@@ -137,7 +137,7 @@ Do these in order; each step is small, committable, and independently useful.
    extension offline for the agent). First look may find cosmetic nits only —
    the API contract and JS syntax/id references are machine-verified.
 5. **Packaging spike** (later): pipx entry point already exists
-   (`specforge serve`); document + screenshot for a landing page.
+   (`stonk serve`); document + screenshot for a landing page.
 
 ## Sprint D — Hardening backlog (do opportunistically, lowest priority first)
 

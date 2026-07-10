@@ -47,6 +47,7 @@ def test_dashboard_renders_all_tabs_without_js_errors(gui_server):
         pg.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
         pg.goto(gui_server, wait_until="networkidle", timeout=30000)
         pg.wait_for_timeout(1500)
+        assert "STONK TERMINAL" in (pg.text_content("#brand") or "")
         assert "$" in (pg.text_content("#acct") or "")          # account cards filled
         for tab in ["trading", "switchboard", "risk", "model", "activity", "overview"]:
             pg.click(f'#tabs div[data-p="{tab}"]')

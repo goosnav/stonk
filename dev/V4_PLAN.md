@@ -118,7 +118,7 @@ nodes:
   node_promotion / watchlist_add / risk_suggestion — the last through
   app `_set_override` validation). Tiered expiry defaults per design.
 - `app.py`: `GET /api/steering`, `POST /api/steering/{id}`; audit everything.
-- Hypothesis regen (post-close scheduler + `specforge hypothesis` CLI) creates
+- Hypothesis regen (post-close scheduler + `stonk hypothesis` CLI) creates
   steering requests instead of hard-activating (except bootstrap north star).
 - Tests: expiry tiers (adopt vs status_quo), apply paths, dangerous risk
   suggestion rejected by validate, non-blocking guarantee (scan runs fine with

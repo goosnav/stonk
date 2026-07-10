@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Cron run-model (CONTROL_CENTER_V3): no resident process. launchd fires
-# `specforge scan` at each scan time (ET) + a post-close attribution run.
+# `stonk scan` at each scan time (ET) + a post-close attribution run.
 # launchd (unlike cron) runs missed jobs when a sleeping Mac wakes.
 # Usage: ./scripts/install_cron.sh [paper|live]   |   uninstall
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 BASE="com.specforge.scan"
+# Legacy label retained so reinstalling replaces existing scheduled jobs.
 
 if [ "${1:-}" = "uninstall" ]; then
   for f in "$HOME/Library/LaunchAgents/$BASE".*.plist; do
@@ -19,7 +20,7 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 
 MODE="${1:-paper}"
-[ -x "$ROOT/.venv/bin/specforge" ] || { echo "run ./run.sh once first"; exit 1; }
+[ -x "$ROOT/.venv/bin/stonk" ] || { echo "run ./run.sh once first"; exit 1; }
 if [ "$MODE" = "live" ]; then
   GATE=$("$ROOT/.venv/bin/python" -c "from specforge.config import load_config; ok,why=load_config('live').live_trading_allowed(); print('OK' if ok else 'BLOCKED: '+why)")
   [ "$GATE" = "OK" ] || { echo "live gate not open — $GATE"; exit 1; }
@@ -50,7 +51,7 @@ echo "$TIMES" | while read -r LABEL H M EXTRA; do
 <plist version="1.0"><dict>
   <key>Label</key><string>$BASE.$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>$ROOT/.venv/bin/specforge</string>
+    <string>$ROOT/.venv/bin/stonk</string>
     <string>--mode</string><string>$MODE</string>
     <string>scan</string>${EXTRA:+<string>$EXTRA</string>}
   </array>
@@ -71,4 +72,4 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $BASE.$LABEL ($H:$(printf '%02d' "$M") local, mode=$MODE)"
 done
-echo "logs: tail -f data/cron.log · check: .venv/bin/specforge tui"
+echo "logs: tail -f data/cron.log · check: .venv/bin/stonk tui"

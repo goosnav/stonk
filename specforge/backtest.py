@@ -68,7 +68,7 @@ def run_backtest(cfg, years: int = 10, tag: str = "default",
     if len(all_dates) - len(dates) < WARMUP_BARS:
         dates = all_dates[WARMUP_BARS:]           # ensure indicator warmup
     if not dates:
-        return {"error": "not enough history — run `specforge data --full` first"}
+        return {"error": "not enough history — run `stonk data --full` first"}
 
     registry = build_registry(bt_cfg)             # build once, reuse across days
     from .broker.paper import PaperBroker

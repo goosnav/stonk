@@ -157,7 +157,7 @@ class RobinhoodMCPBroker:
                     code_holder["state"] = (q.get("state") or [None])[0]
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"SpecForge: auth complete, close this tab.")
+                    self.wfile.write(b"Stonk Terminal: auth complete, close this tab.")
                     done.set()
 
                 def log_message(self, *a):  # silence
@@ -176,7 +176,7 @@ class RobinhoodMCPBroker:
         oauth = OAuthClientProvider(
             server_url=RH_MCP_URL,
             client_metadata=OAuthClientMetadata(
-                client_name="SpecForge",
+                client_name="Stonk Terminal",
                 redirect_uris=[f"http://127.0.0.1:{CALLBACK_PORT}/callback"],
                 grant_types=["authorization_code", "refresh_token"],
                 response_types=["code"],

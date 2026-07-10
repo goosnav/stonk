@@ -1,6 +1,6 @@
-# PRODUCT.md — SpecForge Control Center (the sellable product)
+# PRODUCT.md — Stonk Terminal (the sellable product)
 
-> Vision doc for turning SpecForge from a personal engine into shippable
+> Vision doc for turning Stonk Terminal from a personal engine into shippable
 > software. Written 2026-07-06. Owner-priorities: the GUI *is* the product;
 > the engine is the differentiator under it.
 
@@ -52,7 +52,7 @@ engine.
   connected/accounts/error; the GUI renders it as a "Connect Robinhood" card
   with copy-pasteable next steps (whitelist env, funding). Bridge fallback
   stays documented for when RH blocks custom clients.
-- **Packaging path (later)**: `pipx install specforge` → `specforge serve`;
+- **Packaging path (later)**: `pipx install stonk-terminal` → `stonk serve`;
   then a Tauri wrapper for a desktop app. Not started; do not build until the
   console is polished.
 
