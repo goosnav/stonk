@@ -6,6 +6,7 @@ path for live/paper/backtest is the lookahead guarantee (D8).
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta
 
 from . import data as data_mod
@@ -22,12 +23,50 @@ from .risk import CycleState, Governor
 from .store import Store
 
 
+# D39: one cycle at a time. Scan-now racing the scheduler ran two cycles
+# concurrently on 2026-07-10, doubled the orders, and tripped the
+# rejected_orders kill switch. Overlap now skips instead of racing.
+_CYCLE_LOCK = threading.Lock()
+
+
+def _stamp(store: Store, phase: str, detail: str = "",
+           cycle_id: str | None = None, trace: list | None = None) -> None:
+    """D39 live visibility: the GUI Engine tab polls kv['engine_state'] to show
+    exactly where the state machine is. `trace` accumulates this cycle's
+    phase timeline (written whole each stamp — it's tiny)."""
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    if trace is not None:
+        trace.append({"phase": phase, "detail": detail, "at": now})
+    store.kv_set("engine_state", {"phase": phase, "detail": detail,
+                                  "cycle_id": cycle_id, "at": now,
+                                  "trace": trace or []})
+
+
 def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
               refresh_data: bool = True, registry=None, log=print,
               live_quotes: dict | None = None) -> dict:
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode})
+        return {"skipped": "a cycle is already running — this one was not started"}
+    try:
+        return _run_cycle(cfg, store, broker, as_of, refresh_data, registry,
+                          log, live_quotes)
+    finally:
+        _CYCLE_LOCK.release()
+
+
+def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
+               refresh_data: bool = True, registry=None, log=print,
+               live_quotes: dict | None = None) -> dict:
     cycle_id = new_id()
+    trace: list = []
     source = "live" if cfg.mode == "live" else "paper"
     store.audit("cycle_start", {"as_of": as_of, "mode": cfg.mode}, cycle_id)
+
+    # backtests spin hundreds of cycles — don't churn the live-visibility kv
+    def st(phase: str, detail: str = ""):
+        if refresh_data:
+            _stamp(store, phase, detail, cycle_id, trace)
 
     # 1. data
     symbols = list(cfg.get("universe", "symbols", default=[]))
@@ -46,6 +85,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
             store.audit("hypothesis_watchlist_merged", {"added": extra}, cycle_id)
     aux = [cfg.get("universe", "vix_symbol", default="^VIX")]
     if refresh_data:
+        st("data", f"refreshing daily bars for {len(symbols) + len(aux)} symbols")
         data_mod.refresh(store, symbols + aux, log=log)
     ctx = MarketContext(store, cfg, as_of, offline=not refresh_data)
 
@@ -55,6 +95,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # Backtests (refresh_data=False, no injection) stay lookahead-clean.
     live_px = dict(live_quotes or {})
     if refresh_data and not live_px:
+        st("quotes", "fetching live quotes (broker → stooq → yfinance)")
         try:
             from .quotes import QuoteService
             live_px = {s: q["price"] for s, q in
@@ -65,6 +106,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         store.audit("live_quotes", {"n": len(live_px)}, cycle_id)
 
     # 2. account + broker
+    st("account", "reading account state from broker")
     broker = broker or make_broker(cfg, store)
     if hasattr(broker, "set_quotes"):          # paper broker has no live feed
         broker.set_quotes({**ctx.prices(), **live_px})
@@ -76,6 +118,8 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     governor = Governor(cfg, store, now_iso=now_iso)
     switches = governor.check_kill_switches(account, source)
     reg = regime_mod.classify(ctx, cfg)
+    st("risk_gate", f"regime {reg.regime} ×{reg.deployment_multiplier}"
+                    + (f" · KILL: {sorted(switches)}" if switches else " · no kill switches"))
     store.audit("regime", {"regime": reg.regime, "mult": reg.deployment_multiplier,
                            "evidence": reg.evidence}, cycle_id)
 
@@ -90,6 +134,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     # 4. settle async fills from prior cycles, then exits (free budget before
     #    spending it)
+    st("settle", "reconciling resting orders + checking stops/time exits")
     reconciled = executor.reconcile(cycle_id)
     mismatches = _position_mismatch(store, account, mode=source)
     if mismatches:
@@ -103,7 +148,11 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                          mode=source, live_px=live_px)
 
     # 5. human-approved intents from the queue
-    approvals = executor.process_approval_queue(account, ctx, cycle_id, reg.regime)
+    account = broker.get_account()
+    cycle = CycleState(governor.cycle_budget(account, reg.deployment_multiplier))
+    store.audit("cycle_budget", {"budget": cycle.budget,
+                                 "regime_mult": reg.deployment_multiplier}, cycle_id)
+    approvals = executor.process_approval_queue(account, ctx, cycle, cycle_id, reg.regime)
 
     # 6. signals (AI client injected for ai-flagged nodes; they degrade to
     #    silence when it's disabled/over budget)
@@ -116,6 +165,7 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         if node.role == "filter":
             filters.append(node)
             continue
+        st("signals", f"node {node.id} computing")
         try:
             node_events = node.compute(ctx)
         except Exception as e:                 # noqa: BLE001 — node isolation
@@ -127,11 +177,13 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         events.extend(node_events)
 
     # 7. ensemble → forecast → portfolio
+    st("ensemble", f"scoring {len(events)} signals across nodes")
     candidates = ensemble_mod.score(events, reg.regime, cfg, store, filters, ctx)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:
         store.record_candidate(c, cycle_id)
 
+    st("sizing", f"{len(candidates)} candidates → position sizing")
     account = broker.get_account()             # refresh after exits
     targets = portfolio_mod.construct(candidates, account, ctx, cfg)
 
@@ -141,25 +193,49 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     from .nodes.options_vol import convexity_overlay
     targets = convexity_overlay(targets, ctx, account, cfg, governor, store, log=log)
 
-    # 8. risk-gated execution under the time-step budget
-    cycle = CycleState(governor.cycle_budget(account, reg.deployment_multiplier))
-    store.audit("cycle_budget", {"budget": cycle.budget,
-                                 "regime_mult": reg.deployment_multiplier}, cycle_id)
+    # 8. Fact-check the whole desired batch against cash, buying power,
+    # deployment room, and the remaining cycle budget before sending order 1.
+    requested = round(sum(n for _, n in targets), 2)
+    targets = portfolio_mod.fit_to_capacity(targets, account, cfg, cycle.budget_left)
+    store.audit("batch_allocation", {
+        "requested": requested, "allocated": round(sum(n for _, n in targets), 2),
+        "cash": account.cash, "buying_power": account.buying_power,
+        "cycle_budget_left": cycle.budget_left,
+        "orders": [{"symbol": c.symbol, "notional": n} for c, n in targets],
+    }, cycle_id)
     entry_results = {}
-    for cand, notional in targets:
+    broker_blocked = "broker_rejected" in approvals
+    for i, (cand, notional) in enumerate(targets):
+        if broker_blocked:
+            entry_results[cand.symbol] = "skipped_broker_block"
+            continue
         price = live_px.get(cand.symbol) or ctx.close(cand.symbol)
         if not price:
             continue
+        st("execute", f"{cand.symbol}: governor review + order ${notional:.0f}")
         status = executor.execute_entry(
             cand, notional, price, account, cycle,
             ctx.data_age_days(cand.symbol), cycle_id, reg.regime)
         entry_results[cand.symbol] = status
+        if status == "broker_rejected":
+            # One shared account/broker problem should produce one diagnostic,
+            # not a burst of identical rejected orders and a self-inflicted
+            # kill switch. The next scheduled cycle may probe again.
+            broker_blocked = True
+            for remaining, _ in targets[i + 1:]:
+                entry_results[remaining.symbol] = "skipped_broker_block"
+            store.audit("entry_batch_halted", {
+                "symbol": cand.symbol, "reason": "broker rejected first attempted entry",
+                "skipped": [c.symbol for c, _ in targets[i + 1:]],
+            }, cycle_id)
+            break
         if status == "filled":
             account = broker.get_account()     # keep caps honest within cycle
 
     # 9. mark equity + net P&L (D37: the engine stamps a pnl mark every cycle
     # so the P&L chart populates even when no dashboard is open; realized from
     # closed trades + unrealized at current marks — deposit-independent)
+    st("mark", "stamping equity + net P&L")
     account = broker.get_account()
     store.record_equity(account.equity, account.cash, source, d=ctx.as_of)
     if refresh_data:                        # live/paper scans only, not backtests
@@ -184,6 +260,8 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         "equity": round(account.equity, 2), "cash": round(account.cash, 2),
     }
     store.audit("cycle_end", summary, cycle_id)
+    st("idle", f"cycle done: {len(events)} signals → {len(candidates)} candidates → "
+               f"entries {entry_results or 'none'} · exits {exits or 'none'}")
     return summary
 
 

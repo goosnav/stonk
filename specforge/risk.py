@@ -92,6 +92,11 @@ class Governor:
             self.store.audit("kill_switch_reset", {"name": name})
             if name == "drawdown":
                 self._reset_drawdown_baseline("manual_reset")
+            if name == "rejected_orders":
+                # D39: without this baseline, the switch re-trips on the NEXT
+                # cycle (today's rejection count is still over the limit) and
+                # the human's reset is silently undone until midnight
+                self.store.kv_set("rejected_orders_reset_ts", self.now_iso)
 
     def check_kill_switches(self, account: AccountState, source: str) -> dict:
         """Run at cycle start. Evaluates loss/drawdown limits against the equity
@@ -117,11 +122,17 @@ class Governor:
             self.trip("drawdown", f"equity {eq:.2f} is "
                                   f"{(1 - eq/peak):.1%} below peak {peak:.2f}",
                       auto_clear_days=cooldown)
-        # broker-level bounces only; governor vetoes carry status 'vetoed'
+        # broker-level bounces only; governor vetoes carry status 'vetoed'.
+        # Counted since the last manual reset (D39) and auto-clears next day —
+        # a broker-side storm shouldn't need a human forever.
+        reset_ts = self.store.kv_get("rejected_orders_reset_ts", "") or ""
         rejected_today = len([o for o in self.store.orders_today(day=self.today, mode=self.mode)
-                              if o["status"] == "rejected"])
+                              if o["status"] == "rejected" and o["created_at"] > reset_ts])
         if rejected_today > self.r.get("max_rejected_orders_per_day", 5):
-            self.trip("rejected_orders", f"{rejected_today} rejected orders today")
+            self.trip("rejected_orders",
+                      f"{rejected_today} broker-rejected orders today — check the "
+                      f"broker_review audit rows for the shared cause",
+                      auto_clear_days=1)
         return self.active_switches()
 
     # ---------------- cycle budget ----------------
@@ -163,7 +174,8 @@ class Governor:
     # ---------------- per-order review ----------------
     def review(self, intent: OrderIntent, candidate: TradeCandidate,
                account: AccountState, cycle: CycleState,
-               data_age_days: int | None) -> RiskDecision:
+               data_age_days: int | None,
+               skip_duplicate: bool = False) -> RiskDecision:
         rj = lambda *reasons: RiskDecision("REJECTED", list(reasons))  # noqa: E731
 
         # --- hard blocks first ---
@@ -173,7 +185,7 @@ class Governor:
                 return rj(f"kill switches active: {sorted(active)}")
         if data_age_days is None or data_age_days > self.r.get("stale_data_max_age_days", 4):
             return rj(f"stale data: age={data_age_days} days")
-        if self.store.recent_order_exists(
+        if not skip_duplicate and self.store.recent_order_exists(
                 intent.symbol, intent.side,
                 self.r.get("duplicate_order_cooldown_min", 60),
                 now_iso=self.now_iso, mode=self.mode):
@@ -235,11 +247,15 @@ class Governor:
                 return rj(f"deployment cap: ${deployed:.2f} of ${max_deploy:.2f} deployed")
             notional = min(notional, room)
             reasons.append(f"reduced to deployment cap room ${room:.2f}")
-        if notional > account.cash:
-            if account.cash < MIN_ORDER_NOTIONAL:
-                return rj("insufficient cash")
-            notional = account.cash
-            reasons.append("reduced to available cash")
+        # Never treat margin buying power as cash. Conversely, open broker
+        # orders can reserve buying power before cash/positions update, so the
+        # lower of the two is the only honest amount available for a new buy.
+        spendable = min(max(0.0, account.cash), max(0.0, account.buying_power))
+        if notional > spendable:
+            if spendable < MIN_ORDER_NOTIONAL:
+                return rj(f"insufficient spendable cash (${spendable:.2f})")
+            notional = spendable
+            reasons.append(f"reduced to spendable cash (${spendable:.2f})")
 
         # --- approval policy (D4) ---
         # Threshold compares the REQUESTED size, pre-reduction: portfolio layer

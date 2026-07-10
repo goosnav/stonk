@@ -109,6 +109,28 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
                        f"daemon/cron actually running?")
     if data_age is not None and data_age > stale_limit:
         reasons.append(f"market data stale ({data_age}d old) — governor will veto entries")
+    # Broker review blocks/refusals carry the actionable explanation. Query
+    # them directly rather than scanning a bounded audit tail that busy MCP
+    # traffic can push out in minutes. A newer fill proves the block cleared.
+    import json as _json
+    today = datetime.now().astimezone().date().isoformat()
+    refusal = store.db.execute(
+        "SELECT * FROM audit WHERE event_type='broker_place_refused' "
+        "AND substr(ts,1,10)=? ORDER BY id DESC LIMIT 1", (today,)).fetchone()
+    review = store.db.execute(
+        "SELECT * FROM audit WHERE event_type='broker_review' "
+        "AND substr(ts,1,10)=? AND payload LIKE '%\"ok\": false%' "
+        "ORDER BY id DESC LIMIT 1", (today,)).fetchone()
+    fill = store.db.execute(
+        "SELECT * FROM audit WHERE event_type IN "
+        "('order_filled','order_filled_reconciled') ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    blocked = max((r for r in (refusal, review) if r),
+                  key=lambda r: r["id"], default=None)
+    if blocked and (not fill or fill["id"] < blocked["id"]):
+        payload = _json.loads(blocked["payload"] or "{}")
+        detail = payload.get("response") or ", ".join(payload.get("warnings", []))
+        reasons.append(f"broker blocked entries — {str(detail)[:260]}")
 
     return {"mode": mode, "broker": broker, "engine": engine, "market": market,
             "data": data, "kill_switches": sorted(switches),

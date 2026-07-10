@@ -11,6 +11,8 @@ data/*.db-*
 .claude/*.local.md
 data/backups/
 data/*.log
+logs/*
+!logs/README.md
 
 # built app bundle (regenerate with scripts/build_stonk_app.sh)
 Stonk.app/

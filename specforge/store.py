@@ -12,10 +12,29 @@ Design notes (see dev/ARCHITECTURE.md):
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Optional
+
+_AUDIT_LOG = logging.getLogger("specforge.audit")
+_AUDIT_LOG.propagate = False
+
+
+def configure_file_logging(mode: str, log_dir: str | Path | None = None) -> Path:
+    """Mirror the SQLite audit trail to a rotating, grep-friendly JSONL file."""
+    directory = Path(log_dir or Path(__file__).resolve().parent.parent / "logs")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"audit-{mode}.jsonl"
+    if not any(isinstance(h, RotatingFileHandler) and
+               Path(h.baseFilename) == path for h in _AUDIT_LOG.handlers):
+        handler = RotatingFileHandler(path, maxBytes=10_000_000, backupCount=5)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _AUDIT_LOG.addHandler(handler)
+        _AUDIT_LOG.setLevel(logging.INFO)
+    return path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars(
@@ -172,10 +191,16 @@ class Store:
 
     # ---------- audit ----------
     def audit(self, event_type: str, payload: Any = None, cycle_id: str = "") -> None:
+        ts = _now()
+        body = json.dumps(payload, default=str)
         self.db.execute(
             "INSERT INTO audit(ts, cycle_id, event_type, payload) VALUES(?,?,?,?)",
-            (_now(), cycle_id, event_type, json.dumps(payload, default=str)))
+            (ts, cycle_id, event_type, body))
         self.db.commit()
+        if any(isinstance(h, RotatingFileHandler) for h in _AUDIT_LOG.handlers):
+            _AUDIT_LOG.info(json.dumps({"ts": ts, "cycle_id": cycle_id,
+                                        "event": event_type, "payload": payload},
+                                       default=str))
 
     def audit_rows(self, cycle_id: str | None = None, limit: int = 500) -> list[dict]:
         q, args = "SELECT * FROM audit", []

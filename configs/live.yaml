@@ -8,6 +8,10 @@ live_trading_enabled: true
 # not yesterday's close). Cost: a few extra stooq/yfinance calls per hour.
 schedule:
   scans: ["09:35", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
+  # D39: the real cadence — a full cycle every 10 min while the market is
+  # open. Cron scans above stay as a belt-and-suspenders fallback; the cycle
+  # lock makes any overlap a skip, never a duplicate order.
+  scan_interval_minutes: 10
 # advanced_override justified: on a $50 probation account the standard
 # percentage caps produce sub-$5 orders (below exchange/engine minimums).
 # The DOLLAR amounts stay tiny; revert to defaults as equity grows past ~$500.
@@ -21,9 +25,6 @@ risk:
   # the real bound on bleed rate, not an idle-cash floor.
   max_account_deployment: 0.98
   min_cash_reserve: 0.02
-  # D35: with 7 cycles/day, 3 new positions/day was the binding constraint on
-  # deployment. 6 keeps single-position and per-cycle caps as the real bounds.
-  max_daily_new_positions: 6
   # AUTONOMOUS by default (user directive): the engine trades on its own within
   # the tiny dollar caps above + kill switches. To watch/gate instead, set
   # `all` (every order waits) or `threshold` here or in the GUI Risk tab.
@@ -32,3 +33,23 @@ risk:
   # limit/qty next cycle, so cap the TTL short — a stale intent must not fire
   # at yesterday's price.
   approval_timeout_hours: 6
+  # D39: with ~40 cycles/day the old 6/day cap was the binding constraint.
+  # Dollar caps (single-position, per-cycle budget, cash clamp) stay the
+  # real bound on bleed; count caps just stop runaway churn.
+  max_daily_new_positions: 12
+  # Submit a small ranked batch each cycle. This avoids broker rate-limit
+  # bursts while the 10-minute cadence still allows frequent deployment.
+  max_new_positions_per_cycle: 3
+  # broker bounces usually share one root cause — let a few more through
+  # before halting, and the switch now auto-clears after a day anyway
+  max_rejected_orders_per_day: 10
+
+# D39 "full-time trader" directive: trade through neutral/risk-off at reduced
+# size instead of freezing. No margin ever — notional is clamped to cash and
+# deployment >100% is a config validation error.
+regime:
+  deployment_multiplier:
+    risk_on: 1.0
+    neutral: 0.8
+    risk_off: 0.4
+    stress: 0.15

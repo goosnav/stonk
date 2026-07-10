@@ -94,7 +94,9 @@ class OrderIntent:
         return OrderIntent(
             id=new_id(), candidate_id=candidate.id, symbol=candidate.symbol,
             asset_type=candidate.asset_type, side=candidate.side, qty=qty,
-            limit_price=limit_price, notional=round(qty * limit_price, 2),
+            limit_price=limit_price,
+            notional=round(qty * limit_price *
+                           (100 if candidate.asset_type == "option" else 1), 2),
             idempotency_key=key, created_at=now, option_symbol=candidate.option_symbol)
 
 

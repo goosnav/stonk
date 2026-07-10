@@ -29,6 +29,54 @@ def test_full_paper_cycle_and_audit_reconstruction(cfg, store):
     assert summary["budget_used"] <= summary["budget"] + 1e-6
 
 
+def test_broker_block_halts_remaining_entry_batch(cfg, store):
+    from datetime import datetime
+    from specforge.models import AccountState, OrderReview, SignalEvent
+
+    class BlockingBroker:
+        def __init__(self):
+            self.review_calls = 0
+
+        def set_quotes(self, quotes):
+            pass
+
+        def get_account(self):
+            return AccountState(equity=1000, cash=1000, buying_power=1000,
+                                positions=[], as_of=datetime.now().isoformat())
+
+        def review_order(self, intent):
+            self.review_calls += 1
+            return OrderReview(ok=False, warnings=["account_not_ready"])
+
+        def place_order(self, intent):
+            raise AssertionError("blocked review must never place")
+
+    class Signals:
+        id = "momentum"
+        role = "alpha"
+        degraded_reason = ""
+
+        def compute(self, ctx):
+            return [SignalEvent(
+                symbol=s, direction="long", score=.8, confidence=.9,
+                horizon_days=20, expected_return=.04, expected_volatility=.1,
+                downside_estimate=-.1, evidence=["test"],
+                data_as_of=datetime.now(), node_id="momentum")
+                for s in ("AAA", "BBB", "CCC")]
+
+    cfg.data["ensemble"]["min_final_score"] = -1
+    cfg.data["nodes"]["quality_value"]["enabled"] = False
+    cfg.data["risk"]["stale_data_max_age_days"] = 999
+    broker = BlockingBroker()
+    summary = run_cycle(cfg, store, broker=broker, refresh_data=False,
+                        registry={"momentum": Signals()})
+    assert broker.review_calls == 1
+    assert "broker_rejected" in summary["entries"].values()
+    assert "skipped_broker_block" in summary["entries"].values()
+    assert any(r["event_type"] == "entry_batch_halted"
+               for r in store.audit_rows(cycle_id=summary["cycle_id"]))
+
+
 def test_second_cycle_respects_duplicate_cooldown(cfg, store):
     s1 = run_cycle(cfg, store, refresh_data=False)
     filled = [s for s, v in s1["entries"].items() if v == "filled"]
@@ -56,6 +104,52 @@ def test_exit_time_stop(cfg, store):
     trades = store.trades()
     assert trades and trades[0]["exit_reason"].startswith("time_stop")
     assert trades[0]["regime"]                      # analog cell fields populated
+
+
+def test_resting_sell_fill_closes_position_and_records_trade(cfg, store):
+    from datetime import datetime
+    from specforge.execution import Executor
+    from specforge.models import AccountState, Fill, OrderReview, new_id
+    from specforge.risk import Governor
+
+    class RestingBroker:
+        def get_account(self):
+            return AccountState(equity=100, cash=0, buying_power=0, positions=[],
+                                as_of=datetime.now().isoformat())
+
+        def review_order(self, intent):
+            return OrderReview(ok=True, warnings=[])
+
+        def place_order(self, intent):
+            return None
+
+        def poll_order(self, broker_order_id, intent):
+            return Fill(order_id=intent.id, symbol=intent.symbol, side="sell",
+                        qty=intent.qty, price=110,
+                        filled_at=datetime.now().isoformat())
+
+    pid = new_id()
+    store.save_position(pid, {
+        "symbol": "AAA", "asset_type": "equity", "qty": 1, "avg_cost": 100,
+        "opened_at": "2026-01-01T00:00:00", "horizon_days": 20,
+        "stop_price": 90, "candidate_id": "", "nodes": ["momentum"],
+        "option_symbol": None, "status": "open", "mode": "paper"})
+    broker = RestingBroker()
+    ex = Executor(cfg, store, broker, Governor(cfg, store))
+    assert ex.execute_exit(store.open_positions("paper")[0], 110, "time_stop",
+                           broker.get_account(), "c1", "neutral") == "resting"
+    assert ex.reconcile("c2")["AAA"] == "filled"
+    assert store.open_positions("paper") == []
+    assert store.trades(source="paper")[0]["exit_reason"] == "time_stop"
+
+
+def test_audit_file_mirror(store, tmp_path):
+    import json
+    from specforge.store import configure_file_logging
+    path = configure_file_logging("paper", tmp_path)
+    store.audit("test_event", {"ok": True}, "cycle")
+    row = json.loads(path.read_text().splitlines()[-1])
+    assert row["event"] == "test_event" and row["payload"]["ok"] is True
 
 
 def test_registry_skips_unimplemented_nodes(cfg):

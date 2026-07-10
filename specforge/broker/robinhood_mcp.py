@@ -72,6 +72,12 @@ class BrokerAuthError(RuntimeError):
     Fallback: set broker: robinhood_bridge in config (see scripts/bridge_prompt.md)."""
 
 
+class BrokerOrderRejected(RuntimeError):
+    """D39: the broker answered a place call with a refusal instead of an
+    order object. Carries the broker's own words; the executor records the
+    order as rejected instead of pretending it rests."""
+
+
 def _f(v, default=0.0) -> float:
     try:
         return float(v)
@@ -202,7 +208,21 @@ class RobinhoodMCPBroker:
         return {}
 
     def _call(self, tool: str, args: dict) -> dict:
+        import re
+        import time
         out = asyncio.run(self._call_async(tool, args))
+        # D39: RH throttles bursts — a 429 arrives as PROSE ("API error 429:
+        # ... available in N seconds"), which killed all 12 placements on
+        # 2026-07-10. Honor the hint and retry; place is idempotent (ref_id).
+        for _ in range(3):
+            txt = out.get("text", "") if isinstance(out, dict) else ""
+            if "API error 429" not in txt:
+                break
+            m = re.search(r"available in (\d+) seconds", txt)
+            wait = min(int(m.group(1)) if m else 15, 60) + 1
+            self.store.audit("rh_mcp_throttled", {"tool": tool, "wait_s": wait})
+            time.sleep(wait)
+            out = asyncio.run(self._call_async(tool, args))
         self.store.audit("rh_mcp_call", {"tool": tool, "args": args,
                                          "response_keys": list(out)[:20]})
         # RH wraps payloads as {"data": {...}, "guide": "..."} (observed live
@@ -328,7 +348,15 @@ class RobinhoodMCPBroker:
         checks = res.get("order_checks") or {}
         alert_type = checks.get("alertType") if isinstance(checks, dict) else str(checks)
         benign = {None, "", "EQUITY_OVERNIGHT_MARKET_BUY_FTUX_POPUP"}  # informational FTUX
-        if alert_type not in benign:
+        # Only explicitly configured informational alerts may pass. Account
+        # eligibility/suitability is intentionally not acknowledged by
+        # default: on 2026-07-10 it preceded a hard broker refusal.
+        ack = set(self.cfg.get("execution", "acknowledged_broker_alerts",
+                               default=[]) or [])
+        if alert_type in ack:
+            self.store.audit("broker_alert_acknowledged",
+                             {"alert": alert_type, "symbol": intent.symbol})
+        elif alert_type not in benign:
             warnings.append(f"order_check:{alert_type}")
         # unknown/severe warning ⇒ not ok (AGENTS.md §34.16); engine then skips
         return OrderReview(ok=not warnings, warnings=warnings, raw=res)
@@ -343,6 +371,16 @@ class RobinhoodMCPBroker:
         invalidate_read_cache()          # cash/positions changed
         order = _first(res, "order", default=res)
         broker_id = _first(order, "id", "order_id")
+        if not broker_id:
+            # D39: prose instead of an order object = the broker REFUSED
+            # (2026-07-10: 12 "resting" orders never existed at RH). Log the
+            # broker's exact words — that text is the diagnosis.
+            self.store.audit("broker_place_refused",
+                             {"symbol": intent.symbol,
+                              "response": json.dumps(res)[:600]})
+            raise BrokerOrderRejected(
+                f"{intent.symbol}: no order id in place response — "
+                f"{json.dumps(res)[:300]}")
         self.store.update_order(intent.id, broker_order_id=broker_id)
         state = str(_first(order, "state", "status", default="")).lower()
         if state == "filled":
@@ -354,6 +392,11 @@ class RobinhoodMCPBroker:
 
     def poll_order(self, broker_order_id: str, intent: OrderIntent) -> Fill | str | None:
         """→ Fill when filled, 'dead' when cancelled/rejected, None when open."""
+        if not broker_order_id:
+            # D39: a 'placed' row with no broker id is a phantom (refused
+            # placement recorded before the refusal was detectable) — bury it
+            # instead of hanging reconcile on a nonsense order query
+            return "dead"
         res = self._call("get_equity_orders",
                          {"account_number": self._account(), "order_id": broker_order_id})
         orders = _first(res, "orders", "results", default=[]) or []

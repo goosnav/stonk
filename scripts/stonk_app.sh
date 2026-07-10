@@ -35,4 +35,5 @@ fi
 # the triple-check in config.live_trading_allowed). Foreground so this window
 # shows logs and Ctrl-C / closing it stops the server.
 echo "starting live server at $URL  (close this window or Ctrl-C to stop)"
-exec .venv/bin/specforge --mode live serve --port "$PORT"
+mkdir -p logs
+.venv/bin/specforge --mode live serve --port "$PORT" 2>&1 | tee -a logs/runtime-live.log

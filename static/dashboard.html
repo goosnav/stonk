@@ -112,12 +112,13 @@
   <span id="enginetag" class="tag">…</span>
   <span id="strip" style="display:flex;gap:12px;flex-wrap:wrap"></span>
   <span id="countdown">—</span>
-  <button class="primary" onclick="scanNow()">Scan now</button>
+  <button class="primary" onclick="scanNow()" title="Run one full evaluate→trade cycle immediately. Optional — the engine loops on its own; safe to press anytime (skips if a cycle is already running).">Scan now</button>
   <div id="readiness">…</div>
 </div>
 <div id="alerts"></div>
 <div id="tabs">
   <div data-p="overview" class="on">Overview</div>
+  <div data-p="engine">Engine</div>
   <div data-p="trading">Trading</div>
   <div data-p="switchboard">Switchboard</div>
   <div data-p="risk">Config</div>
@@ -177,6 +178,31 @@
     <h2>Broker connection</h2>
     <p class="explain">Paper needs nothing. Live trading = connect Robinhood, whitelist the agentic account, and pass the triple gate.</p>
     <div id="brokerbox">—</div>
+  </section>
+</div>
+<!-- ============ ENGINE ============ -->
+<div class="page" data-page="engine" style="display:none">
+  <section class="wide">
+    <h2>State machine — <span id="eng_phase_label">…</span></h2>
+    <p class="explain">Live position of the autonomous loop, stamped at every phase transition (updates every 3s). SLEEPING = market closed but the engine is alive; IDLE = between cycles, waiting for the next tick.</p>
+    <div id="eng_strip" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">—</div>
+    <div id="eng_detail" class="dim" style="margin-top:8px;font-size:11.5px">—</div>
+  </section>
+  <section>
+    <h2>Cadence — is it actually running?</h2>
+    <p class="explain">The loop runs a full cycle on this interval during market hours. The cycle lock guarantees one cycle at a time, so Scan Now during a running cycle is a safe no-op.</p>
+    <table class="kv"><tbody id="eng_cadence"></tbody></table>
+  </section>
+  <section>
+    <h2>Last cycle — phase timeline</h2>
+    <p class="explain">What the most recent cycle did, phase by phase, with time spent in each.</p>
+    <table id="eng_trace"><thead><tr><th>phase</th><th>detail</th><th>took</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section class="wide">
+    <h2>Considered — buy ideas &amp; verdicts, latest cycle</h2>
+    <p class="explain">Every candidate the ensemble surfaced, the governor's verdict on it, and why. A REJECTED row with a reason is the system working, not failing. Hover a row for the thesis.</p>
+    <table id="eng_decisions"><thead><tr><th>sym</th><th>score</th><th>size</th>
+      <th>verdict</th><th>result</th><th>why</th></tr></thead><tbody></tbody></table>
   </section>
 </div>
 <!-- ============ TRADING ============ -->
@@ -685,8 +711,15 @@ function tchart(canvas, pts, opts){
   for(let i=0;i<=2;i++){const t=t0+(t1-t0)*i/2,d=new Date(t);
     const lbl=spanD<2?d.toTimeString().slice(0,5):d.toISOString().slice(5,10);
     x.fillText(lbl,Math.min(X(t),W-34),H-5);}
+  // canvas strokeStyle can NOT resolve var(--…) — hex only, or the line
+  // silently keeps the gridline gray (the invisible-P&L bug, D39)
   const lc=opts.color||'#5aa2f7';
-  x.beginPath();x.strokeStyle=lc;x.lineWidth=2;
+  const baseY=(opts.zero&&vlo<0&&vhi>0)?Y(0):H-B;   // fill down to $0 or floor
+  x.beginPath();x.moveTo(X(ts[0]),baseY);
+  pts.forEach((p,i)=>x.lineTo(X(ts[i]),Y(vs[i])));
+  x.lineTo(X(ts[ts.length-1]),baseY);x.closePath();
+  x.fillStyle=lc+'22';x.fill();
+  x.beginPath();x.strokeStyle=lc;x.lineWidth=2.5;
   pts.forEach((p,i)=>{i?x.lineTo(X(ts[i]),Y(vs[i])):x.moveTo(X(ts[i]),Y(vs[i]));});
   x.stroke();
   const lastX=X(ts[ts.length-1]),lastY=Y(vs[vs.length-1]);
@@ -698,13 +731,15 @@ async function refreshDecisions(){
     ? '<b>WORKING NOW:</b> '+d.working.map(w=>`<span class="badge" style="margin-right:6px">
         ${w.side.toUpperCase()} ${w.symbol} ${w.qty}@${w.limit_price} · ${w.status}</span>`).join('')
     : '<span class="dim">no orders working at the broker right now</span>';
-  const V={APPROVED:'pos',REJECTED:'neg',REQUIRES_HUMAN_APPROVAL:''};
-  $('decisions').tBodies[0].innerHTML=(d.considered||[]).map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
+  const V={APPROVED:'pos',APPROVED_WITH_SIZE_REDUCTION:'pos',REJECTED:'neg',REQUIRES_HUMAN_APPROVAL:''};
+  const rows=(d.considered||[]).map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
     <td><b>${c.symbol}</b></td><td>${c.score}</td><td>${c.notional?fmt$(c.notional):'—'}</td>
     <td class="${V[c.verdict]??''}">${c.verdict||'not sized'}</td>
     <td>${c.result||'—'}</td>
     <td class="dim" style="max-width:420px">${(c.reasons||[]).join('; ')||(c.thesis||'').slice(0,90)}</td></tr>`).join('')
     ||'<tr><td colspan=6 class="dim">no candidates in the last scan</td></tr>';
+  $('decisions').tBodies[0].innerHTML=rows;
+  $('eng_decisions').tBodies[0].innerHTML=rows;   // Engine tab mirrors the trail
   const cy=d.cycle;
   $('dec_cycle').textContent=cy?`cycle ${cy.id.slice(0,8)} · ${cy.ts} · regime ${cy.regime} · budget ${cy.budget_used}/${cy.budget}`+
     (Object.keys(d.exits||{}).length?` · exits: ${JSON.stringify(d.exits)}`:''):'no scans yet';
@@ -718,8 +753,10 @@ async function refreshCurve(){
   const cur=pl.current??0, first=pl.points[0]?.pnl??cur, chg=cur-first;
   $('pv_now').innerHTML=`<span class="${cls(cur)}">${fmt$(cur)} net P&amp;L</span>
     <span class="dim" style="font-size:11px">${chg>=0?'+':''}${chg.toFixed(2)} ${PV_RANGE} · equity ${fmt$(pv.current??0)}</span>`;
+  // green when the account is up overall, red when it's down (sign of net
+  // P&L, not slope) — hex because canvas can't resolve CSS variables
   tchart($('curve'), pl.points.map(p=>({t:p.t, equity:p.pnl})),
-         {color: cur>=first?'var(--green)':'var(--red)', zero:true, dollar:true});
+         {color: cur>=0?'#00d964':'#ff4b4b', zero:true, dollar:true});
 }
 function steerCountdown(exp){
   const ms=+new Date(exp)-Date.now();
@@ -786,11 +823,47 @@ async function refreshAudit(){
     <td class="dim mono" style="font-size:11px">${(r.payload||'').slice(0,170)}</td></tr>`).join('');
 }
 async function scanNow(){
-  toast('scanning…');
+  toast('scanning… watch the Engine tab for live phase-by-phase progress');
   const s=await post('/api/scan',{});
+  if(s.skipped){toast('scan skipped: '+s.skipped);return;}
   toast(`scan ${s.cycle_id}: ${s.signals} signals → ${s.candidates} candidates\n`+
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
+}
+/* ---------- engine state machine (D39) ---------- */
+const ENG_PHASES=['sleeping','data','quotes','account','risk_gate','settle',
+                  'signals','ensemble','sizing','execute','mark','idle'];
+async function refreshEngine(){
+  const e=await api('/api/engine');
+  const s=e.state||{};
+  const ageS=s.at?Math.max(0,Math.round((Date.now()-+new Date(s.at))/1000)):null;
+  const running=!['idle','sleeping','never_ran'].includes(s.phase);
+  $('eng_phase_label').innerHTML=`<span class="${running?'pos':'dim'}">${(s.phase||'?').toUpperCase().replace('_',' ')}</span>`+
+    (ageS!=null?` <span class="dim" style="text-transform:none">· updated ${ageS<90?ageS+'s':Math.round(ageS/60)+'m'} ago</span>`:'');
+  const arrow='<span style="color:var(--line)">→</span>';
+  $('eng_strip').innerHTML=ENG_PHASES.map(p=>{
+    const on=p===s.phase;
+    return `<div style="padding:5px 9px;border:1px solid ${on?'var(--amber)':'var(--line)'};
+      color:${on?'var(--amber)':'var(--dim)'};font-size:10px;text-transform:uppercase;
+      letter-spacing:.06em;${on?'font-weight:700;background:#1f1408':''}">${p.replace('_',' ')}</div>`;
+  }).join(arrow);
+  $('eng_detail').textContent=s.detail||'—';
+  const m=e.market||{}, runs=Object.entries(e.next_runs||{});
+  $('eng_cadence').innerHTML=[
+    ['loop interval', e.interval_minutes?`every ${e.interval_minutes} min during market hours`
+                     :'cron scan times only (no continuous loop configured)'],
+    ['market', `${(m.session||'?')} ${m.et||''}`],
+    ['cron scan times (ET)', (e.scan_times||[]).join(', ')||'—'],
+    ...runs.map(([id,t])=>['next '+id, (t||'').slice(0,19).replace('T',' ')]),
+    ['last completed cycle', e.heartbeat?`${(e.heartbeat.at||'').slice(0,19).replace('T',' ')} via ${e.heartbeat.source}`:'never'],
+  ].map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  const tr=s.trace||[];
+  $('eng_trace').tBodies[0].innerHTML=tr.map((t,i)=>{
+    const next=tr[i+1];
+    const dur=next?((+new Date(next.at)-+new Date(t.at))/1000).toFixed(0)+'s':'…';
+    return `<tr><td><b>${t.phase}</b></td>
+      <td class="dim" style="font-size:11px">${t.detail||''}</td><td>${dur}</td></tr>`;
+  }).join('')||'<tr><td colspan=3 class="dim">no cycle trace yet — appears after the first scan on the new engine</td></tr>';
 }
 // fail gracefully: a dead feed renders an explicit error in its panel,
 // never a stale silent value
@@ -861,8 +934,10 @@ function refreshAll(){
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
   guard(refreshToday,'todaybox'); guard(refreshDecisions,'decisions');
+  guard(refreshEngine,'eng_strip');
 }
 refreshAll();
+setInterval(()=>{guard(refreshEngine,'eng_strip');},3000);
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();

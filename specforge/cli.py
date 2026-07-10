@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .store import Store
+from .store import Store, configure_file_logging
 
 
 def _store(cfg) -> Store:
@@ -85,6 +85,7 @@ def cmd_backtest(args, cfg, store):
 def cmd_serve(args, cfg, store):
     import uvicorn
     from .app import create_app
+    store.audit("service_starting", {"mode": cfg.mode, "port": args.port})
     uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port)
 
 
@@ -202,6 +203,7 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     cfg = load_config(args.mode)
+    configure_file_logging(cfg.mode)
     store = _store(cfg)
     return globals()[f"cmd_{args.cmd.replace('-', '_')}"](args, cfg, store)
 

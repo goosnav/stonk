@@ -76,6 +76,9 @@ execution:
   limit_offset_pct: 0.001          # limit at last price +/- offset (cross the spread a hair)
   spread_cost_bps: 3               # cost model: half-spread for liquid names
   slippage_bps: 5
+  # Explicit opt-in only. Suitability/account-eligibility warnings are not
+  # acknowledgements: they block until the broker says the account is ready.
+  acknowledged_broker_alerts: []
 
 regime:
   vix_risk_on_max: 20

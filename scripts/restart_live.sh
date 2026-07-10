@@ -9,6 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT=8420
+mkdir -p logs
 
 if [ "${1:-}" != "--force" ]; then
   # ponytail: coarse guard — weekday 09:30-16:30 ET blocks, holidays not
@@ -27,7 +28,7 @@ if [ -n "$PID" ]; then
   for _ in $(seq 1 10); do curl -sf "localhost:$PORT/api/health" >/dev/null 2>&1 || break; sleep 1; done
 fi
 
-nohup .venv/bin/specforge --mode live serve --port "$PORT" >> data/server.log 2>&1 &
+nohup .venv/bin/specforge --mode live serve --port "$PORT" >> logs/runtime-live.log 2>&1 &
 disown
 
 for _ in $(seq 1 15); do
@@ -37,5 +38,5 @@ for _ in $(seq 1 15); do
     exit 0
   fi
 done
-echo "server did not come back within 15s — check data/server.log" >&2
+echo "server did not come back within 15s — check logs/runtime-live.log" >&2
 exit 1

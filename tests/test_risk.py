@@ -224,3 +224,30 @@ def test_cash_reserve_and_deployment_stricter_wins(cfg, store):
                    CycleState(10000), 1)
     assert d.verdict == "APPROVED_WITH_SIZE_REDUCTION"
     assert d.approved_notional == pytest.approx(20, abs=0.5)   # only $20 room to $500
+
+
+def test_buying_power_reservations_are_not_reused(cfg, store):
+    """Cash can look high while working orders have already reserved it."""
+    c = make_candidate("AAA", notional=20)
+    account = AccountState(equity=1000, cash=1000, buying_power=4,
+                           positions=[], as_of=datetime.now().isoformat())
+    d = Governor(cfg, store).review(make_intent(c), c, account, CycleState(100), 1)
+    assert d.verdict == "REJECTED"
+    assert "spendable cash" in d.reasons[0]
+
+
+def test_batch_targets_scale_to_spendable_capacity(cfg):
+    from specforge.portfolio import fit_to_capacity
+    cfg.data["risk"]["max_new_positions_per_cycle"] = 3
+    targets = [(make_candidate(symbol, notional=30), 30.0)
+               for symbol in ("AAA", "BBB", "CCC", "DDD")]
+    fitted = fit_to_capacity(targets, acct(equity=100, cash=70), cfg, budget=50)
+    assert len(fitted) == 3
+    assert sum(n for _, n in fitted) == pytest.approx(50, abs=0.02)
+    assert all(n >= 5 for _, n in fitted)
+
+
+def test_option_intent_notional_includes_contract_multiplier():
+    c = make_candidate("AAA", notional=200, asset_type="option")
+    intent = OrderIntent.make(c, qty=2, limit_price=1.0)
+    assert intent.notional == 200

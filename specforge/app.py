@@ -672,12 +672,30 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "nodes": sorted(nodes, key=lambda n: -n["effective_weight"]),
         }
 
+    @app.get("/api/engine")
+    def engine_status():
+        """D39: the state-machine view. Current phase (kv stamped by run_cycle
+        at every transition), the last cycle's phase trace, and cadence."""
+        from .health import _market_clock
+        c = fresh_cfg()
+        sched = getattr(app.state, "scheduler", None)
+        jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
+        return {"state": store.kv_get("engine_state")
+                or {"phase": "never_ran", "detail": "no cycle has run yet",
+                    "at": None, "trace": []},
+                "market": _market_clock(),
+                "interval_minutes": c.get("schedule", "scan_interval_minutes"),
+                "scan_times": c.get("schedule", "scans", default=[]),
+                "next_runs": jobs,
+                "heartbeat": store.kv_get("heartbeat")}
+
     @app.post("/api/scan")
     def manual_scan():
         from .engine import run_cycle
         from .health import write_heartbeat
         summary = run_cycle(fresh_cfg(), store)
-        write_heartbeat(store, summary["cycle_id"], mode, source="serve")
+        if not summary.get("skipped"):
+            write_heartbeat(store, summary["cycle_id"], mode, source="serve")
         return summary
 
     # ---------------- scheduler ----------------
@@ -720,6 +738,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         cfg = current_config(store, mode)
         try:
             summary = run_cycle(cfg, store)
+            if summary.get("skipped"):          # another cycle holds the lock
+                return
             from .health import write_heartbeat
             write_heartbeat(store, summary["cycle_id"], cfg.mode, source="serve")
             print(f"[scheduler] scan done: {summary['cycle_id']} "
@@ -810,6 +830,30 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     sched.add_job(post_close_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
                                               minute=int(m), timezone=tz),
                   misfire_grace_time=1800, id="post_close")
+
+    # D39 continuous heartbeat: full cycle every N minutes while the market is
+    # open (the engine.py cycle lock makes overlap with the cron scans a no-op)
+    # and a visible "sleeping" stamp when it's closed — the state machine is
+    # always demonstrably alive, never a 3-hour black box.
+    iv = cfg.get("schedule", "scan_interval_minutes")
+    if iv:
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        def interval_job():
+            from .health import _market_clock
+            mkt = _market_clock()
+            if mkt["open"]:
+                scan_job()
+            else:
+                from datetime import datetime as _dt
+                store.kv_set("engine_state", {
+                    "phase": "sleeping", "cycle_id": None, "trace": [],
+                    "detail": f"market {mkt['session']} ({mkt['et']}) — engine "
+                              f"alive, cycles resume at the next open",
+                    "at": _dt.now().astimezone().isoformat(timespec="seconds")})
+
+        sched.add_job(interval_job, IntervalTrigger(minutes=int(iv)),
+                      misfire_grace_time=120, id="scan_interval")
 
     def _on_missed(event):
         """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped
