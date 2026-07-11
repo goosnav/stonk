@@ -453,3 +453,12 @@ Stock discovery uses Nasdaq Trader listing files plus SEC CIK enrichment, not
 web search. The free-data universe is labeled survivorship-limited and requires
 forward shadow evidence before learned live influence. Research work is bounded,
 non-AI, closed-market-only, and yields before trading.
+## D42 (2026-07-11): truthful autonomy status and durable research actions
+
+Trading heartbeat age is only a failure signal while the market is open.
+Closed-market UI reports the scheduler/research worker separately. Manual
+discovery, deep research, and holding training enqueue durable jobs; they use
+the autonomous worker, never contact execution, and never bypass budgets or
+champion gates. Research history breadth reaches 500 names before additional
+global TCN trials, preventing repeated optimization of the original 30-name
+sample.

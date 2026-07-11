@@ -6,7 +6,9 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from specforge.montecarlo import block_bootstrap
-from specforge.research import resolve_forecasts
+from specforge.research import (cancel_job, deep_research, discover_opportunities,
+                                enqueue_job, latest_sec_filing, list_jobs,
+                                resolve_forecasts)
 from specforge.universe import parse_directory, refresh_membership, symbols
 
 
@@ -68,6 +70,69 @@ def test_research_model_and_universe_apis_expose_real_state(cfg, store):
     assert graph["horizon"] == 5
     assert len(graph["topology"]["nodes"]) > 10
     assert graph["topology"]["edges"]
+    assert graph["effective_live_blend"] == 0
+    assert graph["topology_provenance"] == "initial_prior"
     assert client.get("/api/research").status_code == 200
     universe = client.get("/api/universe?tier=active&limit=10").json()
     assert universe["tier"] == "active" and universe["limit"] == 10
+
+
+def test_research_jobs_are_durable_deduplicated_and_cancellable(store):
+    first = enqueue_job(store, "discover")
+    assert enqueue_job(store, "discover")["id"] == first["id"]
+    assert list_jobs(store)[0]["status"] == "queued"
+    assert cancel_job(store, first["id"])["status"] == "cancelled"
+
+
+def test_research_job_api_contract(cfg, store):
+    from specforge.app import create_app
+    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    created = client.post("/api/research/jobs", json={"kind": "train_holdings"})
+    assert created.status_code == 200 and created.json()["status"] == "queued"
+    assert client.get("/api/research/jobs").json()[0]["kind"] == "train_holdings"
+    cancelled = client.post(f"/api/research/jobs/{created.json()['id']}/cancel")
+    assert cancelled.json()["status"] == "cancelled"
+
+
+def test_discovery_persists_exactly_25_without_ai(cfg, store):
+    from conftest import synth_bars
+    as_of = store.latest_bar_date("SPY")
+    with store.db:
+        for i in range(30):
+            sym = f"T{i:02d}"
+            store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (sym, sym, "NASDAQ", "common", 0, 0, 1, as_of,
+                              as_of, "test", None, sym))
+            store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                             (as_of, sym, "research", i + 1, "test",
+                              '{"dollar_volume":100000000}'))
+            store.upsert_bars(sym, synth_bars(daily_drift=.001 + i / 100000), "test")
+    result = discover_opportunities(cfg, store)
+    assert result["status"] == "completed" and len(result["shortlist"]) == 25
+    assert len(symbols(store, "shortlist")) == 25
+
+
+def test_deep_research_fails_closed_when_ai_disabled(cfg, store):
+    result = deep_research(cfg, store)
+    assert result["status"] == "skipped" and "AI" in result["reason"]
+
+
+def test_latest_sec_filing_extracts_narrative_and_source_hash():
+    class Response:
+        def __init__(self, payload=None, text=""):
+            self._payload, self.text = payload, text
+            self.content = text.encode()
+        def json(self): return self._payload
+        def raise_for_status(self): return None
+    class Client:
+        @staticmethod
+        def get(url, **kwargs):
+            if "submissions" in url:
+                return Response({"filings": {"recent": {
+                    "form": ["8-K", "10-Q"], "accessionNumber": ["x", "1-2-3"],
+                    "primaryDocument": ["x.htm", "q.htm"],
+                    "filingDate": ["2026-01-01", "2026-02-01"]}}})
+            return Response(text="<html><style>no</style><body>Revenue grew strongly.</body></html>")
+    filing = latest_sec_filing("123", Client)
+    assert filing["form"] == "10-Q" and "Revenue grew" in filing["text"]
+    assert len(filing["sha256"]) == 64 and filing["url"].endswith("/q.htm")

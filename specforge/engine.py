@@ -194,7 +194,7 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # equations remain unchanged and the deterministic ensemble stays the
     # fallback; an unvalidated graph has a zero live blend.
     from .graph import blend_candidates
-    blend_candidates(candidates, events, reg.regime, cfg, store)
+    blend_candidates(candidates, events, reg.regime, cfg, store, cycle_id)
     candidates.sort(key=lambda c: c.final_score, reverse=True)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:

@@ -747,26 +747,76 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def model_graph(symbol: str = "SPY", horizon: int = 21):
         """Actual deployed topology plus symbol-specific live activations."""
         from .graph import champion as graph_champion
+        from .neural import describe as describe_neural
         c = fresh_cfg(); graph = graph_champion(store)
         if horizon not in (5, 21):
             raise HTTPException(400, "horizon must be 5 or 21")
         snapshots = store.kv_get("graph_last_activations", {}) or {}
+        symbol = symbol.upper()
+        if "symbols" in snapshots:
+            snapshot = snapshots.get("symbols", {}).get(symbol)
+            if snapshot:
+                snapshot = {**snapshot, "as_of": snapshots.get("as_of"),
+                            "cycle_id": snapshots.get("cycle_id")}
+        else:                                  # compatibility with D41 snapshots
+            snapshot = snapshots.get(symbol)
+        configured = float(c.get("analog_graph", "live_blend", default=0) or 0)
+        effective = configured if graph["status"] == "champion" else 0.0
         return {"schema": "stonk.graph.v1", "version": graph["id"],
                 "status": graph["status"], "metrics": graph.get("metrics", {}),
-                "live_blend": c.get("analog_graph", "live_blend", default=0),
-                "symbol": symbol.upper(), "horizon": horizon,
+                "live_blend": configured,
+                "configured_live_blend": configured,
+                "effective_live_blend": effective,
+                "topology_provenance": "learned" if graph["status"] == "champion"
+                                       else "initial_prior",
+                "symbol": symbol, "horizon": horizon,
                 "topology": graph["topology"],
-                "snapshot": snapshots.get(symbol.upper())}
+                "snapshot": snapshot,
+                "temporal": describe_neural(c, store, symbol)}
 
     @app.get("/api/research")
     def research_status():
         from .research import status
         return status(store)
 
+    @app.post("/api/research/jobs")
+    def create_research_job(body: dict):
+        from .research import enqueue_job
+        try:
+            return enqueue_job(store, str(body.get("kind", "")),
+                               body.get("payload") or {}, priority=10)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/research/jobs")
+    def research_jobs(limit: int = 20):
+        from .research import list_jobs
+        return list_jobs(store, min(100, max(1, limit)))
+
+    @app.post("/api/research/jobs/{job_id}/cancel")
+    def cancel_research_job(job_id: str):
+        from .research import cancel_job
+        try:
+            return cancel_job(store, job_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/research/reports")
+    def research_reports(symbol: str | None = None, limit: int = 20):
+        sql, params = "SELECT * FROM research_reports", []
+        if symbol:
+            sql += " WHERE symbol=?"; params.append(symbol.upper())
+        sql += " ORDER BY created_at DESC LIMIT ?"; params.append(min(100, max(1, limit)))
+        rows = [dict(r) for r in store.db.execute(sql, tuple(params))]
+        for row in rows:
+            row["sources"] = json.loads(row["sources"] or "{}")
+            row["report"] = json.loads(row["report"] or "{}")
+        return rows
+
     @app.get("/api/universe")
     def universe_status(tier: str = "active", limit: int = 250, offset: int = 0):
-        if tier not in ("research", "active"):
-            raise HTTPException(400, "tier must be research or active")
+        if tier not in ("research", "active", "shortlist"):
+            raise HTTPException(400, "tier must be research, active, or shortlist")
         limit = min(500, max(1, limit)); offset = max(0, offset)
         d = store.db.execute("SELECT MAX(as_of) d FROM universe_membership WHERE tier=?",
                              (tier,)).fetchone()["d"]
@@ -801,6 +851,11 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     @app.post("/api/scan")
     def manual_scan():
+        from .health import _market_clock
+        market = _market_clock()
+        if not market["open"]:
+            return {"skipped": f"market {market['session']}; use Discover Opportunities "
+                               "for closed-market analysis"}
         from .engine import run_cycle
         from .health import write_heartbeat
         summary = run_cycle(fresh_cfg(), store)
@@ -924,6 +979,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         store.audit("db_backup", {"path": str(dest)})
 
     cfg = current_config(store, mode)
+    from .research import recover_jobs
+    recover_jobs(store)
     tz = cfg.get("schedule", "timezone", default="America/New_York")
     sched = BackgroundScheduler(timezone=tz)
     # misfire_grace_time: a scan fired up to 30 min late (laptop wake) still
@@ -974,8 +1031,9 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         if _market_clock()["open"]:
             return
         try:
-            from .research import run_next
-            run_next(c, store)
+            from .research import run_next, run_operator_job
+            if run_operator_job(c, store) is None:
+                run_next(c, store)
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "research",
                                             "error": str(e)[:300]})

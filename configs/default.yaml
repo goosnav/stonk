@@ -129,8 +129,8 @@ nodes:
   gap:             {enabled: true, weight: 0.10, status: experimental, horizon_days: 5}
   # vol_contraction: VCP-lite breakout, daily bars only, fully backtestable
   vol_contraction: {enabled: true, weight: 0.15, status: experimental, horizon_days: 20}
-  # neural: PyTorch MLP (specforge/neural.py); silent until its validation IC
-  # clears neural.min_val_ic — an unproven model gets no vote
+  # neural: causal multivariate TCN; silent until all validation/shadow gates
+  # pass — an unproven model gets no vote
   neural:          {enabled: true, weight: 0.15, status: experimental, horizon_days: 21}
 
 ensemble:
@@ -181,6 +181,7 @@ neural:
   max_epochs: 50
   patience: 5
   max_trials_per_snapshot: 6
+  walk_forward_folds: 5
   holding_min_bars: 1250
   holding_blend: 0.25
   max_checkpoint_age_days: 7
@@ -192,6 +193,7 @@ research:
   weekend_task_seconds: 1800
   max_cpu_threads: 4
   backfill_batch_size: 50
+  min_training_universe: 500
   forecast_horizons: [5, 21]
 
 ai:

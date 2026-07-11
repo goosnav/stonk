@@ -20,6 +20,9 @@ def construct(candidates: list[TradeCandidate], account: AccountState,
     pos_cap = account.equity * cfg.get("risk", "max_single_equity_position", default=0.08)
     max_new = cfg.get("risk", "max_daily_new_positions", default=3)
     held = {p.symbol for p in account.positions if p.qty > 0}
+    scenarios = ctx.store.kv_get("research_scenarios") or {}
+    scenario_fresh = scenarios.get("as_of") == ctx.store.latest_bar_date(
+        cfg.get("universe", "benchmark", default="SPY"))
 
     targets = []
     for c in candidates:
@@ -27,6 +30,10 @@ def construct(candidates: list[TradeCandidate], account: AccountState,
             break
         if c.symbol in held:
             continue                     # no averaging up/down in MVP
+        scenario = (scenarios.get("candidates") or {}).get(c.symbol) if scenario_fresh else None
+        if scenario and scenario.get("recommended_scale", 1) <= 0:
+            c.risk_flags.append("bootstrap median did not improve after costs")
+            continue
         price = ctx.close(c.symbol)
         atr = ctx.atr_pct(c.symbol)
         if not price or not atr or atr <= 0:
@@ -34,6 +41,11 @@ def construct(candidates: list[TradeCandidate], account: AccountState,
         notional = min(account.equity * vol_target / atr, pos_cap)
         # conviction scaling: score 0.15→~60% size, 0.5+→full size
         notional *= min(1.0, 0.5 + c.final_score)
+        if scenario:
+            notional *= float(scenario.get("recommended_scale", 1))
+            if scenario.get("recommended_scale", 1) < 1:
+                c.risk_flags.append(
+                    f"bootstrap size ×{scenario['recommended_scale']:.2f} for drawdown")
         if notional < 5.0:
             continue
         c.target_notional = round(notional, 2)

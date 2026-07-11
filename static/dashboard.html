@@ -42,6 +42,11 @@
   button.primary:hover { background:var(--green); color:#000; }
   button.ok { color:var(--green); } button.no { color:var(--red); }
   button.no:hover { background:var(--red); color:#000; }
+  button:disabled { color:var(--dim); border-color:var(--line); cursor:not-allowed;
+                    background:transparent; }
+  #actionrail { width:100%; display:flex; gap:6px; align-items:center;
+                border-top:1px solid var(--line); padding-top:5px; }
+  #actionstate { margin-left:auto; color:var(--dim); font-size:10.5px; }
   /* alerts */
   #alerts { padding:0 12px; }
   .alert { margin:6px 0; padding:5px 10px; border:1px solid var(--red);
@@ -112,8 +117,14 @@
   <span id="enginetag" class="tag">…</span>
   <span id="strip" style="display:flex;gap:12px;flex-wrap:wrap"></span>
   <span id="countdown">—</span>
-  <button class="primary" onclick="scanNow()" title="Run one full evaluate→trade cycle immediately. Optional — the engine loops on its own; safe to press anytime (skips if a cycle is already running).">Scan now</button>
   <div id="readiness">…</div>
+  <div id="actionrail" aria-label="Operator actions">
+    <button id="tradecycle" class="primary" onclick="scanNow()" title="Run the ordinary governed trade cycle. Available only while the market is open.">Run trade cycle</button>
+    <button onclick="queueResearch('discover')" title="Rank the broad research universe using deterministic cached-data signals. Never places orders.">Discover opportunities</button>
+    <button onclick="queueResearch('deep_research')" title="Use the configured, budget-limited AI to deeply evaluate the top five discoveries.">Deep-research top 5</button>
+    <button onclick="queueResearch('train_holdings')" title="Queue one bounded full-network challenger for each current holding. Never mutates a champion.">Train holdings</button>
+    <span id="actionstate">no operator jobs</span>
+  </div>
 </div>
 <div id="alerts"></div>
 <div id="tabs">
@@ -295,7 +306,7 @@
 <div class="page" data-page="model" style="display:none">
   <section class="wide">
     <h2>Model shape — <span id="model_regime">…</span></h2>
-    <p class="explain">The actual deployed analog-neural DAG. Every box is an auditable specialist equation or learned interaction; edge width is learned weight, green/red is positive/negative, dashed is pruned, and node intensity is this symbol's activation. The governor remains outside the graph.</p>
+    <p class="explain">The selected analog-neural DAG. Every box is an auditable specialist equation or interaction. Initial-prior edges are gray; validated learned edges use green/red for positive/negative contribution, dashed means pruned, and node intensity is this symbol's latest activation. The governor remains outside the graph.</p>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <label>symbol <input id="graph_symbol" value="SPY" maxlength="10" style="width:80px" onchange="refreshModel()"></label>
       <label>horizon <select id="graph_horizon" onchange="refreshModel()"><option value="5">5 days</option><option value="21" selected>21 days</option></select></label>
@@ -371,7 +382,7 @@ const NODE_DESC = {
   hypothesis:'deterministic reader of the active AI market hypothesis',
   gap:'opening gap up 1.5-6% in an uptrend rides continuation (live quotes; silent in backtests)',
   vol_contraction:'VCP-lite: vol squeeze near 60d high in an uptrend → breakout entry',
-  neural:'PyTorch MLP predicting 21d excess return; trains while market closed, silent until val IC clears the gate',
+  neural:'Causal multivariate TCN predicting 5d/21d excess-return quantiles; challengers train off-hours and remain silent until every gate passes',
 };
 
 function line(canvas, series){
@@ -469,9 +480,13 @@ async function refreshHealth(){
   $('markettag').textContent = 'MKT '+(m.session||'?').toUpperCase()+' '+(m.et||'');
   $('markettag').className = 'tag ' + (m.open ? 'ok' : 'warn');
   const age = h.engine && h.engine.heartbeat_age_s, et = $('enginetag');
-  if(age==null){ et.textContent='ENGINE NEVER RAN'; et.className='tag err'; }
-  else if(age > 6*3600){ et.textContent='ENGINE DEAD '+Math.round(age/3600)+'H'; et.className='tag down'; }
-  else { et.textContent='ENGINE '+(age<120?age+'S':Math.round(age/60)+'M')+' AGO ('+(h.engine.heartbeat_source||'?')+')'; et.className='tag ok'; }
+  const op=(h.engine&&h.engine.operational_state)||'offline';
+  const labels={trading:'AUTONOMY ON · TRADING',researching:'AUTONOMY ON · RESEARCH',
+    closed_idle:'AUTONOMY ON · CLOSED IDLE',stale:'ENGINE STALE',offline:'ENGINE OFFLINE'};
+  et.textContent=labels[op]||op.toUpperCase();
+  et.title=(h.engine&&h.engine.operational_detail)||'';
+  et.className='tag '+(op==='offline'||op==='stale'?'down':op==='closed_idle'?'warn':'ok');
+  $('tradecycle').disabled=!(h.market&&h.market.open);
   const rd = h.readiness||{}, r = $('readiness');
   r.className = rd.trading ? 'trading' : '';
   r.id = 'readiness';
@@ -846,6 +861,22 @@ async function scanNow(){
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
+async function queueResearch(kind){
+  const names={discover:'opportunity discovery',deep_research:'deep research',
+               train_holdings:'holding training'};
+  const job=await post('/api/research/jobs',{kind});
+  toast(`${names[kind]} ${job.status}: ${job.id}`);
+  refreshJobs();
+}
+async function refreshJobs(){
+  const jobs=await api('/api/research/jobs?limit=8');
+  const active=jobs.find(j=>j.status==='running'||j.status==='queued');
+  if(!active){ $('actionstate').textContent=jobs[0]
+      ? `last ${jobs[0].kind}: ${jobs[0].status}`:'no operator jobs'; return; }
+  const p=active.progress||{};
+  $('actionstate').innerHTML=`<span class="${active.status==='running'?'pos':''}">${active.kind} · ${active.status}</span>`+
+    (p.symbol?` · ${p.symbol} ${p.index||0}/${p.total||0}`:'');
+}
 /* ---------- engine state machine (D39) ---------- */
 const ENG_PHASES=['sleeping','data','quotes','account','risk_gate','settle',
                   'signals','ensemble','sizing','execute','mark','idle'];
@@ -907,21 +938,26 @@ async function refreshModel(){
   lastGraph=g;
   $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
     (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
-  $('graph_version').textContent=`${g.version} · ${g.status} · live blend ${Math.round((g.live_blend||0)*100)}%`;
+  $('graph_version').textContent=`${g.topology_provenance==='initial_prior'?'INITIAL TOPOLOGY':g.version} · ${g.status} · effective ${Math.round((g.effective_live_blend||0)*100)}% / cap ${Math.round((g.configured_live_blend||0)*100)}%`;
   const nodes=m.nodes;
   const topo=g.topology, snap=g.snapshot?.activations||{}, layers=[1,2,3,4], W=1080, H=620, BW=180, BH=42;
   const pos={};
   layers.forEach((layer,li)=>{const ns=topo.nodes.filter(n=>n.layer===layer);ns.forEach((n,i)=>{
     pos[n.id]={x:25+li*260,y:45+i*Math.min(70,520/Math.max(1,ns.length))};});});
-  const edge=e=>{const a=pos[e.source],b=pos[e.target],w=Number(e.weight||0),c=w>=0?'var(--green)':'var(--red)';
+  const edge=e=>{const a=pos[e.source],b=pos[e.target],w=Number(e.weight||0),c=g.topology_provenance==='initial_prior'?'#606873':w>=0?'var(--green)':'var(--red)';
     if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .25 : .8}" ${e.pruned?'stroke-dasharray="4,4"':''}><title>${e.source} → ${e.target}: ${w.toFixed(4)}${e.pruned?' pruned':''}</title></path>`};
   const box=n=>{const p=pos[n.id],a=snap[n.id]||{},v=Math.min(1,Math.abs(Number(a.value||0))),stroke=n.role==='output'?'var(--cyan)':n.role==='gate'?'var(--amber)':'#7d8799';
     return `<g onclick="showGraphNode('${n.id}')" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${n.id}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${n.activation} · ${a.value==null?'—':Number(a.value).toFixed(3)}</text></g>`};
-  $('modelsvg').innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:900px">${layers.map((l,i)=>`<text x="${30+i*260}" y="20" fill="#7d8799" font-size="10" font-family="monospace">LAYER ${l}</text>`).join('')}${topo.edges.map(edge).join('')}${topo.nodes.map(box).join('')}<rect x="1000" y="270" width="75" height="55" fill="var(--panel)" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/><text x="1008" y="292" fill="var(--text)" font-size="9">GOVERNOR</text><text x="1008" y="309" fill="#7d8799" font-size="8">outside graph</text></svg>`;
+  const layerNames=['STOCK-LOCAL','MARKET CONTEXT','INTERACTIONS','FORECASTS'];
+  $('modelsvg').innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:900px">${layers.map((l,i)=>`<text x="${30+i*260}" y="20" fill="#7d8799" font-size="10" font-family="monospace">${layerNames[i]} · L${l}</text>`).join('')}${topo.edges.map(edge).join('')}${topo.nodes.map(box).join('')}<rect x="1000" y="270" width="75" height="55" fill="var(--panel)" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/><text x="1008" y="292" fill="var(--text)" font-size="9">GOVERNOR</text><text x="1008" y="309" fill="#7d8799" font-size="8">outside graph</text></svg>`;
+  if(!g.snapshot) $('graph_detail').innerHTML=`<span class="dim">No activation snapshot for ${sym}. A completed scan that evaluates this symbol will populate raw values and edge contributions.</span>`;
   const nu=research.neural, rr=research.weekly, rs=research.state||{}, us=research.universe?.tiers||{};
+  const temporal=g.temporal||{}, arch=temporal.architecture||{}, held=temporal.holdings||[];
   $('learnbox').innerHTML=
     `<div><span class="badge">RESEARCH</span> ${rs.phase||'never_ran'} · ${rs.detail||'—'} · research ${(us.research||0).toLocaleString()} / active ${(us.active||0).toLocaleString()}</div>`+
     `<div style="margin-top:4px"><span class="badge">GLOBAL TCN</span> ${nu ? `${nu.status||'—'} · ${nu.data_as_of||'—'} · ${JSON.stringify(nu.metrics||{}).slice(0,180)}`:'no challenger yet'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">TCN SHAPE</span> ${arch.window||60} sessions → ${(arch.blocks||[]).map(b=>`Conv1d 32 k3 d${b.dilation}`).join(' → ')} → 5d/21d quantiles</div>`+
+    `<div style="margin-top:4px"><span class="badge">HOLDING NETS</span> ${held.length?held.map(h=>`${h.symbol}: ${h.run?h.run.status:'none'} · ${h.bars}/1250 bars · blend ${Math.round((h.effective_blend||0)*100)}%`).join('<br>'):'no live holdings'}</div>`+
     `<div style="margin-top:4px"><span class="badge">WALK-FORWARD</span> ${rr
       ? `${(rr.window||[]).join(' → ')} · ${rr.n_trades} trades · win ${rr.win_rate==null?'—':(rr.win_rate*100).toFixed(0)+'%'} · OOS ${JSON.stringify(rr.out_of_sample_30pct||{}).slice(0,120)} · ran ${(rr.ran_at||'').slice(5,16).replace('T',' ')}`
       : '<span class="dim">no weekly report yet</span>'}</div>`;
@@ -944,10 +980,12 @@ function refreshAll(){
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
   guard(refreshToday,'todaybox'); guard(refreshDecisions,'decisions');
   guard(refreshEngine,'eng_strip');
+  guard(refreshJobs,'actionstate');
 }
 refreshAll();
 setInterval(()=>{guard(refreshEngine,'eng_strip');},3000);
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
+setInterval(()=>{guard(refreshJobs,'actionstate');},5000);
 setInterval(()=>{refreshMarket();},30000);
 setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
   refreshCosts();refreshAudit();refreshSteering();refreshToday();refreshDecisions();},60000);

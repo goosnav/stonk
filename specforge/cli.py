@@ -194,7 +194,7 @@ def _console_frame(port: int, color: bool) -> str:
     rd, broker, engine = h["readiness"], h["broker"], h["engine"]
     hb = engine.get("heartbeat_age_s")
     heartbeat = "never" if hb is None else (f"{hb}s" if hb < 120 else f"{hb//60}m")
-    phase = (e.get("state") or {}).get("phase", "unknown")
+    phase = engine.get("operational_state") or (e.get("state") or {}).get("phase", "unknown")
     deployment = 1 - s["cash"] / s["equity"] if s.get("equity") else 0
     state = G + "TRADING" + X if rd["trading"] else A + "PAUSED" + X
 
@@ -203,7 +203,9 @@ def _console_frame(port: int, color: bool) -> str:
              f"{state}  broker:{broker['adapter']} "
              f"{'OK' if broker['connected'] else 'DOWN'}  "
              f"market:{h['market']['session']} {h['market']['et']}  "
-             f"engine:{phase}  last-scan:{heartbeat} ago",
+             f"autonomy:{phase}" +
+             (f"  last-scan:{heartbeat} ago" if h["market"].get(
+                 "open", h["market"].get("session") == "regular") else ""),
              f"{B}ACCOUNT{X}  equity {_money(s['equity'])}  cash {_money(s['cash'])}  "
              f"buying-power {_money(s.get('buying_power'))}  deployed {deployment:.1%}",
              f"P&L  day {_money(s.get('day_pnl'))}  total {_money(s.get('net_pnl'))}  "
@@ -249,12 +251,19 @@ def _console_frame(port: int, color: bool) -> str:
     us = research.get("universe") or {}
     tiers = us.get("tiers") or {}
     graph = research.get("graph") or {}
+    active_job = next((j for j in research.get("jobs", [])
+                       if j.get("status") in ("queued", "running")), None)
     lines += ["", B + "OFF-HOURS RESEARCH" + X,
               f"{rs.get('phase', 'unknown')}: {rs.get('detail', '—')}  "
               f"catalog {((us.get('catalog') or {}).get('count') or 0):,} · "
               f"research {(tiers.get('research') or 0):,} · active {(tiers.get('active') or 0):,}",
               f"analog graph {graph.get('id', 'default')} {graph.get('status', 'shadow')} · "
               f"TCN {((research.get('neural') or {}).get('status') or 'shadow')}"]
+    if active_job:
+        p = active_job.get("progress") or {}
+        lines.append(f"operator job {active_job['kind']} {active_job['status']}"
+                     + (f" · {p.get('symbol')} {p.get('index')}/{p.get('total')}"
+                        if p.get("symbol") else ""))
 
     switches = s.get("kill_switches") or {}
     lines += ["", B + "RISK / RECOVERY" + X]

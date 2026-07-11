@@ -154,6 +154,25 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
               "heartbeat_stale_s": heartbeat_stale_s,
               "scheduler_alive": scheduler_alive,
               "next_runs": next_runs or {}}
+    research = store.kv_get("research_state") or {"phase": "never_ran"}
+    if scheduler_alive is False:
+        operational_state = "offline"
+        operational_detail = "scheduler is not running"
+    elif market["open"] and (hb_age is None or hb_age > heartbeat_stale_s):
+        operational_state = "stale"
+        operational_detail = "market is open but the trading loop is stale"
+    elif market["open"]:
+        operational_state = "trading"
+        operational_detail = "autonomous trading loop is active"
+    elif research.get("phase") not in ("idle", "caught_up", "never_ran"):
+        operational_state = "researching"
+        operational_detail = research.get("detail") or "closed-market research is running"
+    else:
+        operational_state = "closed_idle"
+        operational_detail = "scheduler is armed; market is closed"
+    engine.update(operational_state=operational_state,
+                  operational_detail=operational_detail,
+                  research_state=research)
 
     bench = cfg.get("universe", "benchmark", default="SPY")
     newest = store.latest_bar_date(bench)

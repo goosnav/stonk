@@ -21,6 +21,8 @@ def test_tcn_quantiles_are_ordered():
     assert out.shape == (4, 2, 3)
     assert np.all(out[:, :, 0] <= out[:, :, 1])
     assert np.all(out[:, :, 1] <= out[:, :, 2])
+    probability = model.probability(torch.randn(4, 60, len(neural.FEATURES))).detach().numpy()
+    assert probability.shape == (4, 2) and np.all((probability >= 0) & (probability <= 1))
 
 
 def test_dataset_is_chronological_and_train_normalized(cfg, store):
@@ -55,3 +57,13 @@ def test_holding_network_requires_full_symbol_history(cfg, store):
     result = neural.train_challenger(cfg, store, symbol="AAA")
     assert result["status"] == "waiting"
     assert "1250" in result["reason"]
+
+
+def test_holding_gate_requires_improvement_at_both_horizons():
+    good = {str(h): {"pinball": .009, "correlation": .1,
+                     "directional_accuracy": .53, "coverage": .8}
+            for h in (5, 21)}
+    good["global_baseline"] = {str(h): {"pinball": .01} for h in (5, 21)}
+    assert neural.holding_gate_passed(good)
+    good["21"]["coverage"] = .9
+    assert not neural.holding_gate_passed(good)

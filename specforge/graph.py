@@ -303,22 +303,64 @@ def _safe_corr(a, b) -> float:
     return float(np.corrcoef(a, b)[0, 1]) if len(a) > 5 and np.std(a) and np.std(b) else 0.0
 
 
-def blend_candidates(candidates, events, regime: str, cfg, store) -> None:
+def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
+                     folds: int = 5, prune_pct: float = .01) -> tuple[dict, dict]:
+    """Expanding-window topology fit; every fold scores only later rows."""
+    import numpy as np
+    if len(bases) < 180:
+        learned, metrics = fit_weights(topology, bases, targets, prune_pct=prune_pct)
+        metrics["walk_forward_folds"] = 0
+        metrics["walk_forward_reason"] = "need at least 180 chronological samples"
+        return learned, metrics
+    initial = max(100, int(len(bases) * .45))
+    width = max(10, (len(bases) - initial) // folds)
+    fold_metrics = []
+    for index in range(folds):
+        train_end = initial + index * width
+        test_end = len(bases) if index == folds - 1 else min(len(bases), train_end + width)
+        learned, _ = fit_weights(topology, bases[:train_end], targets[:train_end],
+                                 max_epochs=30, prune_pct=prune_pct)
+        pred = np.asarray([[evaluate(learned, b)["outputs"][5],
+                            evaluate(learned, b)["outputs"][21]]
+                           for b in bases[train_end:test_end]])
+        truth = np.asarray(targets[train_end:test_end])
+        fold_metrics.append({"fold": index + 1, "train": train_end,
+                             "test": test_end - train_end,
+                             "ic_5d": round(_safe_corr(pred[:, 0], truth[:, 0]), 4),
+                             "ic_21d": round(_safe_corr(pred[:, 1], truth[:, 1]), 4)})
+    learned, metrics = fit_weights(topology, bases, targets, prune_pct=prune_pct)
+    metrics.update(walk_forward_folds=folds, folds=fold_metrics,
+                   median_fold_ic_5d=round(float(np.median(
+                       [f["ic_5d"] for f in fold_metrics])), 4),
+                   median_fold_ic_21d=round(float(np.median(
+                       [f["ic_21d"] for f in fold_metrics])), 4))
+    return learned, metrics
+
+
+def blend_candidates(candidates, events, regime: str, cfg, store,
+                     cycle_id: str | None = None) -> None:
     """Apply the validated graph as a capped score blend, in place."""
     champ = champion(store)
     blend = float(cfg.get("analog_graph", "live_blend", default=0.0) or 0.0)
     if champ["status"] != "champion":
         blend = 0.0
     snapshots = {}
+    by_symbol = sorted({e.symbol for e in events} | {c.symbol for c in candidates} |
+                       set(cfg.get("universe", "symbols", default=[])))
+    for symbol in by_symbol:
+        snapshots[symbol] = evaluate(
+            champ["topology"], event_bases(events, symbol, regime))
     for c in candidates:
-        result = evaluate(champ["topology"], event_bases(events, c.symbol, regime))
+        result = snapshots[c.symbol]
         graph_score = math.tanh(float(result["outputs"][21]))
         if blend:
             c.final_score = round((1 - blend) * c.final_score + blend * graph_score, 4)
             c.thesis = (c.thesis + f"; analog_graph:{graph_score:+.3f}")[:400]
             c.contributing_nodes = sorted(set(c.contributing_nodes + ["analog_graph"]))
         snapshots[c.symbol] = {"graph_score": graph_score, **result}
-    store.kv_set("graph_last_activations", snapshots)
+    as_of = max((e.data_as_of.strftime("%Y-%m-%d") for e in events), default=None)
+    store.kv_set("graph_last_activations", {
+        "as_of": as_of, "cycle_id": cycle_id, "symbols": snapshots})
     # Evaluate the latest challenger in shadow across every signaled symbol,
     # not merely names selected for a trade. This supplies unbiased forward
     # labels for topology gates while leaving candidate scores untouched.
@@ -327,7 +369,6 @@ def blend_candidates(candidates, events, regime: str, cfg, store) -> None:
         "ORDER BY created_at DESC LIMIT 1").fetchone()
     if challenger:
         topology = json.loads(challenger["topology"])
-        as_of = max((e.data_as_of.strftime("%Y-%m-%d") for e in events), default=None)
         by_symbol = sorted({e.symbol for e in events})
         with store.db:
             for symbol in by_symbol:
@@ -353,7 +394,15 @@ def maybe_promote(cfg, store) -> dict:
     from .neural import shadow_metrics
     sm, metrics = shadow_metrics(store, row["id"]), json.loads(row["metrics"] or "{}")
     hs = sm["horizons"]
-    passed = metrics.get("walk_forward_folds", 0) >= 5 and sm["sessions"] >= 30 and all(
+    folds = metrics.get("folds") or []
+    fold_gate = len(folds) >= 5 and \
+        sum(f.get("ic_5d", 0) > 0 for f in folds) >= 4 and \
+        sum(f.get("ic_21d", 0) > 0 for f in folds) >= 4 and \
+        min(f.get("ic_5d", -1) for f in folds) > -.01 and \
+        min(f.get("ic_21d", -1) for f in folds) > -.01 and \
+        metrics.get("median_fold_ic_5d", 0) >= .015 and \
+        metrics.get("median_fold_ic_21d", 0) >= .02
+    passed = fold_gate and sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0
         for h in (5, 21))

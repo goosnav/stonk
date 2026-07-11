@@ -154,6 +154,15 @@ CREATE TABLE IF NOT EXISTS model_forecasts(         -- shadow/live learning labe
   resolved_at TEXT, realized_excess REAL, feature_hash TEXT,
   PRIMARY KEY(model_id, as_of, symbol, horizon)
 );
+CREATE TABLE IF NOT EXISTS research_jobs(            -- durable operator/autonomous work
+  id TEXT PRIMARY KEY, kind TEXT, status TEXT, priority INTEGER DEFAULT 0,
+  requested_at TEXT, started_at TEXT, completed_at TEXT,
+  payload TEXT, progress TEXT, result TEXT, error TEXT, attempts INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS research_reports(         -- structured company deep reads
+  id TEXT PRIMARY KEY, symbol TEXT, as_of TEXT, created_at TEXT,
+  sources TEXT, report TEXT, status TEXT
+);
 CREATE TABLE IF NOT EXISTS equity_intraday(         -- throttled live marks (V4)
   ts TEXT, equity REAL, cash REAL, source TEXT,
   pnl REAL                                          -- realized+unrealized (D36):
@@ -165,6 +174,8 @@ CREATE INDEX IF NOT EXISTS idx_signals_cycle ON signals(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_membership(as_of, tier, rank);
 CREATE INDEX IF NOT EXISTS idx_forecasts_unresolved ON model_forecasts(resolved_at, horizon);
 CREATE INDEX IF NOT EXISTS idx_filing_fact_asof ON filing_facts(cik, tag, filed);
+CREATE INDEX IF NOT EXISTS idx_research_jobs_status ON research_jobs(status, priority, requested_at);
+CREATE INDEX IF NOT EXISTS idx_research_reports_symbol ON research_reports(symbol, created_at);
 """
 
 

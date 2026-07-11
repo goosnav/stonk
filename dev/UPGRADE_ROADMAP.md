@@ -57,3 +57,20 @@ The catalog/bootstrap may take multiple closed-market runs because free feeds
 are rate-limited. Point-in-time SEC coverage will fill incrementally. Until the
 historical and shadow gates are actually satisfied, both learned systems remain
 visible but non-influential shadows.
+
+## Operator research controls — 2026-07-11
+
+The dashboard and TUI now distinguish the trading loop from the closed-market
+research worker. A weekend trading heartbeat is not evidence of a dead engine.
+The graph API reports configured and effective blend separately; initial prior
+edges are not presented as learned weights.
+
+Operator discovery, deep research, and holding training use a durable SQLite
+job queue processed by the same single research worker as autonomous work.
+Discovery is deterministic and never trades. AI deep reads honor the ordinary
+budget. Holding jobs create challengers and cannot mutate live champions.
+
+Breadth now precedes optimization: below 500 research-ready companies the
+queue prioritizes official-catalog history backfill. Five-fold graph/TCN
+tournaments, point-in-time valuation channels, probability calibration, and
+bootstrap sizing remain fail-closed behind the existing deployment gates.

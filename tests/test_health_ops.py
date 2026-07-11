@@ -150,6 +150,17 @@ def test_system_health_last_error_is_sanitized_and_aged(cfg, store, monkeypatch)
     assert all("934803396" not in a for a in h["alerts"])
 
 
+def test_closed_market_scheduler_is_idle_not_dead(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["engine"]["operational_state"] == "closed_idle"
+    store.kv_set("research_state", {"phase": "tcn", "detail": "training"})
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["engine"]["operational_state"] == "researching"
+    h = system_health(cfg, store, scheduler_alive=False)
+    assert h["engine"]["operational_state"] == "offline"
+
+
 # ---------------- endpoints ----------------
 
 def test_liveness_endpoint_is_dependency_free(client):
