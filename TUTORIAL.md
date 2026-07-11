@@ -126,7 +126,24 @@ Then, to trade **autonomously** (the default):
   orders in regular hours (encoded in the adapter). Whole-share orders go as
   limit orders.
 
-## 6. Watch the self-improvement loop
+## 6. Monitoring & keeping it alive
+
+[RUNBOOK.md](RUNBOOK.md) is the full operator manual. The short version:
+
+```bash
+scripts/check_health.py               # one-line verdict; exit 0 ok / 1 needs-operator
+                                      # / 2 app-failure / 3 down (watchdog contract)
+scripts/install_service.sh status     # launchd state + the same verdict
+curl -s :8420/api/metrics | jq        # monitor contract: uptime, cycles, last error
+```
+
+`status: ok` while `trading: no` is normal (market closed, paper mode).
+`degraded` means the app is fine but something needs *you* — broker auth,
+kill switch, stale data — and restarting won't help. Only `stale`/`down`
+justify a restart (`./scripts/restart_live.sh`, market-hours guarded).
+Everything above is read-only and safe to run against the live server.
+
+## 7. Watch the self-improvement loop
 
 Nightly post-close job: marks equity, updates node scorecards, moves weight
 multipliers (shrunk toward zero edge until ≥20 trades), auto-disables nodes
@@ -137,7 +154,7 @@ with clearly negative live expectancy (n≥30), and records promotion
 CLI equivalents: `stonk status` (JSON overview), `stonk approve|reject
 <intent_id>`, `stonk reset-kill <name>`, `stonk bridge-dump|bridge-report`.
 
-## 7. What to expect (honesty section)
+## 8. What to expect (honesty section)
 
 The projected-APR banner is a measurement, not a promise. The strategy stack
 (momentum + earnings drift + sector confirmation + regime gate + strict loss

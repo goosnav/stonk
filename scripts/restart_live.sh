@@ -21,9 +21,10 @@ if [ "${1:-}" != "--force" ]; then
   fi
 fi
 
-PID=$(pgrep -f "(stonk|specforge) --mode live serve" || true)
-if [ -n "$PID" ]; then
-  kill "$PID"
+PIDS=$(pgrep -f "(stonk|specforge) --mode live serve" || true)
+if [ -n "$PIDS" ]; then
+  # kill every matching pid (a hung instance plus its replacement can coexist)
+  echo "$PIDS" | xargs kill 2>/dev/null || true
   # wait for the port to free up
   for _ in $(seq 1 10); do curl -sf "localhost:$PORT/api/health" >/dev/null 2>&1 || break; sleep 1; done
 fi

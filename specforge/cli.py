@@ -84,8 +84,21 @@ def cmd_backtest(args, cfg, store):
 
 
 def cmd_serve(args, cfg, store):
+    import socket
+
     import uvicorn
     from .app import create_app
+    # Refuse to double-serve BEFORE create_app: a second instance would start
+    # a second scheduler against the shared DB in the window before uvicorn
+    # discovers the port is taken. Duplicate live engines must never race.
+    with socket.socket() as probe:
+        try:
+            probe.bind(("127.0.0.1", args.port))
+        except OSError:
+            print(f"port {args.port} is already serving — another Stonk Terminal "
+                  f"instance? `stonk tui` attaches to it; "
+                  f"scripts/check_health.py reports its health", file=sys.stderr)
+            return 2
     store.audit("service_starting", {"mode": cfg.mode, "port": args.port})
     uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port,
                 log_level="info" if args.verbose else "warning",

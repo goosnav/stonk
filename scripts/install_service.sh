@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Install Stonk Terminal as a macOS launchd user agent: starts at login, restarts
-# on crash, logs to data/service.log. Usage:
+# Install Stonk Terminal as a macOS launchd user agent: starts at login,
+# restarts on crash with a 60s throttle (crash-loop protection), logs to
+# logs/service.log. Restart-safety: kill switches, the live gate, and broker
+# blocks all live in the DB/env, so a supervisor restart can never skip them.
+# Usage:
 #   ./scripts/install_service.sh [paper|live]     (default: paper)
+#   ./scripts/install_service.sh status           service state + health verdict
 #   ./scripts/install_service.sh uninstall
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,8 +22,30 @@ if [ "${1:-}" = "uninstall" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "status" ]; then
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+      | grep -E "state = |pid = |last exit code" | sed 's/^[[:space:]]*/  launchd /'
+  else
+    echo "  launchd: $LABEL not loaded (the server may still run un-supervised" \
+         "via Stonk Terminal.app or scripts/restart_live.sh)"
+  fi
+  exec python3 "$ROOT/scripts/check_health.py"
+fi
+
 MODE="${1:-paper}"
 [ -x "$ROOT/.venv/bin/stonk" ] || { echo "run ./run.sh once first (.venv missing)"; exit 1; }
+
+# Refuse to install under a foreign (non-launchd) server: launchd would boot a
+# second instance that loses the port race and crash-loops against the running
+# one. Two live engines must never race.
+if curl -sf --max-time 3 "http://127.0.0.1:8420/api/health" >/dev/null 2>&1; then
+  if ! launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q "state = running"; then
+    echo "port 8420 is already served by a non-launchd process (Stonk Terminal.app"
+    echo "window or restart_live.sh). Stop that instance first, then re-run."
+    exit 1
+  fi
+fi
 
 # Live installs must pass the triple gate NOW, or the service would boot but
 # refuse every order — fail loudly instead of pretending it's trading.
@@ -33,6 +59,7 @@ if [ "$MODE" = "live" ]; then
   echo "live gate OK — installing AUTONOMOUS live trader (approval_mode from configs/live.yaml)"
 fi
 
+mkdir -p "$ROOT/logs"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -47,8 +74,9 @@ cat > "$PLIST" <<EOF
   <key>WorkingDirectory</key><string>$ROOT</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>$ROOT/data/service.log</string>
-  <key>StandardErrorPath</key><string>$ROOT/data/service.log</string>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>$ROOT/logs/service.log</string>
+  <key>StandardErrorPath</key><string>$ROOT/logs/service.log</string>
 </dict></plist>
 EOF
 
@@ -63,4 +91,4 @@ if ! launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q "state = runnin
   exit 1
 fi
 echo "installed $LABEL (mode=$MODE) — GUI at http://127.0.0.1:8420"
-echo "logs: tail -f $ROOT/data/service.log · uninstall: $0 uninstall"
+echo "logs: tail -f $ROOT/logs/service.log · status: $0 status · uninstall: $0 uninstall"

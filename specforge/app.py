@@ -51,10 +51,25 @@ def current_config(store: Store, mode: str):
 
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
+    import os
+
     from .quotes import QuoteService
     app = FastAPI(title="Stonk Terminal", docs_url="/api/docs")
     mode = cfg.mode
     quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
+    app.state.started_at = datetime.now().astimezone()
+
+    def _process() -> dict:
+        now = datetime.now().astimezone()
+        return {"pid": os.getpid(),
+                "started_at": app.state.started_at.isoformat(timespec="seconds"),
+                "uptime_s": int((now - app.state.started_at).total_seconds())}
+
+    def _scheduler_alive():
+        """None = no scheduler in this process (embedded/tests) — unknown, not
+        dead. False only when the scheduler object exists and stopped."""
+        sched = getattr(app.state, "scheduler", None)
+        return bool(sched.running) if sched else None
 
     def fresh_cfg():
         return current_config(store, mode)
@@ -179,16 +194,62 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def proposals():
         return store.kv_get("promotion_proposals", [])
 
-    @app.get("/api/health")
-    def health():
-        """Truth aggregator (CONTROL_CENTER_V3): mode, real broker
-        connectivity, heartbeat, market clock, and — always — WHY we are not
-        trading whenever we aren't. Broker probe is kv-cached 60s."""
+    @app.get("/health")
+    def liveness():
+        """Process liveness ONLY — touches no store/config/broker, so it
+        answers fast even when the engine or DB is wedged. Readiness/why-not-
+        trading lives in /api/health; the monitor contract in /api/metrics."""
+        return {"ok": True, "mode": mode, **_process()}
+
+    def _system_health():
         from .health import system_health
         sched = getattr(app.state, "scheduler", None)
         jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
         return system_health(fresh_cfg(), store, next_runs=jobs,
-                             scheduler_alive=bool(sched and sched.running))
+                             scheduler_alive=_scheduler_alive())
+
+    @app.get("/api/health")
+    def health():
+        """Truth aggregator (CONTROL_CENTER_V3): mode, real broker
+        connectivity, heartbeat, market clock, and — always — WHY we are not
+        trading whenever we aren't. Broker probe is kv-cached 60s. `status`/
+        `alerts` carry the app-health rollup (ok|degraded|stale|error)."""
+        return _system_health()
+
+    @app.get("/api/metrics")
+    def metrics():
+        """Monitor contract (schema stonk.metrics.v1, documented in
+        RUNBOOK.md): read-only, sanitized, stable keys. status/alerts judge
+        APP health — market-closed is `ok`; health.readiness answers the
+        separate question 'why is it not trading right now'."""
+        h = _system_health()
+        src = "live" if mode == "live" else "paper"
+        today = datetime.now().astimezone().date().isoformat()
+        cycles_today = store.db.execute(
+            "SELECT COUNT(*) n FROM audit WHERE event_type='cycle_end' "
+            "AND substr(ts,1,10)=? AND json_extract(payload,'$.mode')=?",
+            (today, src)).fetchone()["n"]
+        errors_today = store.db.execute(
+            "SELECT COUNT(*) n FROM audit WHERE event_type='scheduler_error' "
+            "AND substr(ts,1,10)=?", (today,)).fetchone()["n"]
+        positions_open = store.db.execute(
+            "SELECT COUNT(*) n FROM positions WHERE status='open' AND mode=?",
+            (src,)).fetchone()["n"]
+        lq = store.db.execute(
+            "SELECT ts FROM audit WHERE event_type='live_quotes' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        from . import __version__
+        return {"schema": "stonk.metrics.v1", "as_of": h["as_of"],
+                "status": h["status"], "alerts": h["alerts"],
+                "mode": mode, "version": __version__, "process": _process(),
+                "cycles": {"today": cycles_today, "errors_today": errors_today,
+                           "last_scan_at": h["engine"].get("last_scan_at"),
+                           "last_cycle_id": h["engine"].get("last_cycle_id"),
+                           "next_runs": h["engine"].get("next_runs", {})},
+                "positions_open": positions_open,
+                "last_quote_cycle_at": lq["ts"] if lq else None,
+                "last_error": h["last_error"],
+                "health": h}
 
     @app.get("/api/version")
     def version():
