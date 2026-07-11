@@ -439,3 +439,17 @@ Launcher is idempotent: attaches to a running server (opens browser, no double-
 bind) else boots `--mode live serve` and opens the dashboard when healthy.
 Icon: assets/stonk.svg → QuickLook render → iconutil .icns (no image deps).
 Rebuild anytime with scripts/build_stonk_app.sh [dest].
+
+## D41. Dual networks, immutable champions, official universe (2026-07-11)
+
+The first MLP overfit unchanged rows in production research (rank-IC 0.043 →
+0.0076 by epoch 22,315), proving that nonstop champion training is unsafe.
+Specialist modules now form a separate analog-neural DAG whose edge weights are
+differentiable while their equations remain explicit. A causal quantile TCN is
+one specialist, not the ensemble itself. All training writes challengers;
+champion replacement is atomic and validation/shadow-gated.
+
+Stock discovery uses Nasdaq Trader listing files plus SEC CIK enrichment, not
+web search. The free-data universe is labeled survivorship-limited and requires
+forward shadow evidence before learned live influence. Research work is bounded,
+non-AI, closed-market-only, and yields before trading.

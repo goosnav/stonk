@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# D40 neural node; everything degrades to silence without it
+neural = ["torch"]
 
 [project.scripts]
 stonk = "specforge.cli:main"

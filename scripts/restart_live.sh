@@ -21,21 +21,41 @@ if [ "${1:-}" != "--force" ]; then
   fi
 fi
 
-PIDS=$(pgrep -f "(stonk|specforge) --mode live serve" || true)
+PIDS=$(pgrep -f "(stonk|specforge).*--mode live serve" || true)
 if [ -n "$PIDS" ]; then
   # kill every matching pid (a hung instance plus its replacement can coexist)
   echo "$PIDS" | xargs kill 2>/dev/null || true
-  # wait for the port to free up
-  for _ in $(seq 1 10); do curl -sf "localhost:$PORT/api/health" >/dev/null 2>&1 || break; sleep 1; done
+  # A graceful Uvicorn shutdown may answer one final health request while it
+  # drains open dashboard connections. Wait for both the old PIDs and the
+  # listener to disappear; otherwise the replacement can mistake that final
+  # response for its own health check.
+  for _ in $(seq 1 30); do
+    alive=false
+    for pid in $PIDS; do kill -0 "$pid" 2>/dev/null && alive=true; done
+    if ! $alive && ! curl -sf --max-time 1 "localhost:$PORT/api/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+if curl -sf --max-time 1 "localhost:$PORT/api/health" >/dev/null 2>&1; then
+  echo "old server still owns port $PORT after shutdown timeout" >&2
+  exit 1
 fi
 
 BIN=.venv/bin/stonk
 [ -x "$BIN" ] || BIN=.venv/bin/specforge   # compatibility before editable reinstall
 nohup "$BIN" --mode live serve --port "$PORT" >> logs/runtime-live.log 2>&1 &
+NEW_PID=$!
 disown
 
 for _ in $(seq 1 15); do
   sleep 1
+  if ! kill -0 "$NEW_PID" 2>/dev/null; then
+    echo "replacement server exited before becoming healthy — check logs/runtime-live.log" >&2
+    exit 1
+  fi
   if HEALTH=$(curl -sf "localhost:$PORT/api/health" 2>/dev/null); then
     echo "restarted ok: $HEALTH"
     exit 0

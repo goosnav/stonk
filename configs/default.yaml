@@ -26,6 +26,12 @@ universe:
   min_price: 5.0
   min_dollar_volume: 50000000
   max_spread_pct: 0.005      # assumed spread cap for liquid-universe cost model
+  research_size: 1500
+  active_size: 250
+  execution_shortlist_size: 25
+  research_min_dollar_volume: 10000000
+  execution_min_dollar_volume: 50000000
+  min_history_bars: 260
 
 risk:
   # --- The primary safety check: per-scan-cycle deployment budget.
@@ -118,6 +124,14 @@ nodes:
   # kv-cached 3 days/symbol so scans don't re-spend tokens. Long-only system:
   # a sell/short view lands as direction=avoid (suppresses the long case).
   fundamentals:    {enabled: true, weight: 0.15, status: experimental, horizon_days: 40, ai: true, refresh_days: 3, max_refreshes_per_cycle: 4}
+  # D40 additions — all experimental, all earn weight through measured trades:
+  # gap: live-quote opening-gap continuation (silent in backtests by design)
+  gap:             {enabled: true, weight: 0.10, status: experimental, horizon_days: 5}
+  # vol_contraction: VCP-lite breakout, daily bars only, fully backtestable
+  vol_contraction: {enabled: true, weight: 0.15, status: experimental, horizon_days: 20}
+  # neural: PyTorch MLP (specforge/neural.py); silent until its validation IC
+  # clears neural.min_val_ic — an unproven model gets no vote
+  neural:          {enabled: true, weight: 0.15, status: experimental, horizon_days: 21}
 
 ensemble:
   min_final_score: 0.15            # below this: no trade (saying "no" is a feature)
@@ -129,6 +143,15 @@ ensemble:
     min_trades_before_update: 20
     shrinkage: 0.7                 # Bayesian shrink toward zero edge
     regime_min_n: 30               # trades per (node, regime) cell before a regime multiplier applies
+
+# Learned connections between the auditable specialist equations. The graph
+# remains a zero-influence shadow until a validated champion is promoted.
+analog_graph:
+  enabled: true
+  live_blend: 0.25
+  max_topology_trials_per_snapshot: 24
+  prune_contribution_pct: 0.01
+  shadow_sessions: 30
 
 sizing:
   vol_target_pct: 0.01             # per-position daily vol target (fraction of equity)
@@ -144,6 +167,32 @@ hypothesis:
   north_star_review_days: 30
   max_watchlist: 8                # symbols the hypothesis may add to the scan
   steering_ttl_hours: 24          # steering request lifetime before expiry default
+
+# D40 neural training loop. Trains ONLY while the market is closed (bounded
+# 30-min-interval bursts), checkpoints atomically every burst, and the node
+# refuses to trade until validation IC (embargoed holdout) clears min_val_ic.
+neural:
+  enabled: true
+  checkpoint: data/models/global_tcn.pt
+  holdings_dir: data/models/holdings
+  input_sessions: 60
+  horizons: [5, 21]
+  quantiles: [0.1, 0.5, 0.9]
+  max_epochs: 50
+  patience: 5
+  max_trials_per_snapshot: 6
+  holding_min_bars: 1250
+  holding_blend: 0.25
+  max_checkpoint_age_days: 7
+  train_since: "2011-01-01"        # regime relevance + VIX availability
+
+research:
+  interval_minutes: 15
+  max_task_seconds: 600
+  weekend_task_seconds: 1800
+  max_cpu_threads: 4
+  backfill_batch_size: 50
+  forecast_horizons: [5, 21]
 
 ai:
   enabled: false

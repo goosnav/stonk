@@ -5,6 +5,7 @@ Commands:
   scan       run one full scan cycle (paper unless --mode live)
   status     account, kill switches, projection, pending approvals
   backtest   walk-forward backtest (--years N) → report + analog trades
+  research   inspect or run the bounded closed-market research queue
   tui        quiet terminal dashboard; attaches to or runs the daemon
   serve      start the quiet GUI/headless server (FastAPI on --port)
   approve/reject <intent_id>   decide a queued order
@@ -83,22 +84,31 @@ def cmd_backtest(args, cfg, store):
     print(json.dumps(report, indent=2, default=str))
 
 
+def cmd_research(args, cfg, store):
+    from .research import run_next, status
+    if args.status:
+        print(json.dumps(status(store), indent=2, default=str))
+    else:
+        print(json.dumps(run_next(cfg, store, max_seconds=args.max_minutes * 60),
+                         indent=2, default=str))
+
+
 def cmd_serve(args, cfg, store):
     import socket
 
     import uvicorn
     from .app import create_app
-    # Refuse to double-serve BEFORE create_app: a second instance would start
-    # a second scheduler against the shared DB in the window before uvicorn
-    # discovers the port is taken. Duplicate live engines must never race.
-    with socket.socket() as probe:
-        try:
-            probe.bind(("127.0.0.1", args.port))
-        except OSError:
+    # Refuse a real listener before create_app starts a second scheduler.
+    # Binding is the wrong probe: TIME_WAIT can reject a bind after a clean
+    # restart even though no process is serving (observed 2026-07-11).
+    try:
+        with socket.create_connection(("127.0.0.1", args.port), timeout=.25):
             print(f"port {args.port} is already serving — another Stonk Terminal "
                   f"instance? `stonk tui` attaches to it; "
                   f"scripts/check_health.py reports its health", file=sys.stderr)
             return 2
+    except OSError:
+        pass
     store.audit("service_starting", {"mode": cfg.mode, "port": args.port})
     uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port,
                 log_level="info" if args.verbose else "warning",
@@ -174,6 +184,10 @@ def _console_frame(port: int, color: bool) -> str:
     e = _console_api(port, "/api/engine")
     today = _console_api(port, "/api/today")
     decisions = _console_api(port, "/api/decisions")
+    try:
+        research = _console_api(port, "/api/research")
+    except Exception:
+        research = {}
 
     G, R, A, D, B, X = (("\033[32m", "\033[31m", "\033[33m", "\033[2m",
                           "\033[1m", "\033[0m") if color else ("",) * 6)
@@ -230,6 +244,17 @@ def _console_frame(port: int, color: bool) -> str:
         verdict = c.get("result") or c.get("verdict") or "not_selected"
         lines.append(f"{c['symbol']:<6} score {c['score']:.3f}  {verdict:<18} "
                      f"{(c.get('thesis') or '')[:75]}")
+
+    rs = research.get("state") or {}
+    us = research.get("universe") or {}
+    tiers = us.get("tiers") or {}
+    graph = research.get("graph") or {}
+    lines += ["", B + "OFF-HOURS RESEARCH" + X,
+              f"{rs.get('phase', 'unknown')}: {rs.get('detail', '—')}  "
+              f"catalog {((us.get('catalog') or {}).get('count') or 0):,} · "
+              f"research {(tiers.get('research') or 0):,} · active {(tiers.get('active') or 0):,}",
+              f"analog graph {graph.get('id', 'default')} {graph.get('status', 'shadow')} · "
+              f"TCN {((research.get('neural') or {}).get('status') or 'shadow')}"]
 
     switches = s.get("kill_switches") or {}
     lines += ["", B + "RISK / RECOVERY" + X]
@@ -330,6 +355,9 @@ def main(argv=None):
     s.add_argument("--years", type=int, default=10)
     s.add_argument("--tag", default="default")
     s.add_argument("--save-analogs", action="store_true", default=True)
+    s = sub.add_parser("research")
+    s.add_argument("--status", action="store_true")
+    s.add_argument("--max-minutes", type=int, default=10)
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8420)
     s.add_argument("--verbose", action="store_true",
                    help="stream HTTP access logs (default is quiet; audit stays on disk)")

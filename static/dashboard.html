@@ -295,8 +295,14 @@
 <div class="page" data-page="model" style="display:none">
   <section class="wide">
     <h2>Model shape — <span id="model_regime">…</span></h2>
-    <p class="explain">The live signal network as it has self-improved. Box height tracks effective weight (base × learned multiplier, regime-conditioned); green/red edge = measured per-trade expectancy; dashed = disabled. The governor gates everything — no node ever places an order.</p>
+    <p class="explain">The actual deployed analog-neural DAG. Every box is an auditable specialist equation or learned interaction; edge width is learned weight, green/red is positive/negative, dashed is pruned, and node intensity is this symbol's activation. The governor remains outside the graph.</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <label>symbol <input id="graph_symbol" value="SPY" maxlength="10" style="width:80px" onchange="refreshModel()"></label>
+      <label>horizon <select id="graph_horizon" onchange="refreshModel()"><option value="5">5 days</option><option value="21" selected>21 days</option></select></label>
+      <span id="graph_version" class="badge">—</span>
+    </div>
     <div id="modelsvg" style="overflow-x:auto">—</div>
+    <div id="graph_detail" class="mono dim" style="font-size:11px;margin-top:8px">click a node for its equation flow</div>
   </section>
   <section class="wide">
     <h2>Node ledger</h2>
@@ -304,6 +310,11 @@
     <table><thead><tr><th>node</th><th>status</th><th>base</th><th>learned ×</th>
       <th>effective</th><th>signals 7d</th><th>trades</th><th>expectancy</th>
       <th>hit</th><th>IR</th></tr></thead><tbody id="model_table"></tbody></table>
+  </section>
+  <section class="wide">
+    <h2>Learning loops</h2>
+    <p class="explain">The global causal TCN and full per-holding networks are nodes inside the outer graph. Closed-market research creates immutable challengers; it never trains a live champion in place.</p>
+    <div id="learnbox" class="mono" style="font-size:11.5px">—</div>
   </section>
 </div>
 <!-- ============ ACTIVITY ============ -->
@@ -356,6 +367,11 @@ const NODE_DESC = {
   congress_trades:'politician disclosure clusters, filing-date keyed, slow thematic tilt',
   insider:'insider cluster BUYS (selling is noise, buying is signal)',
   options_vol:'converts the top conviction into a bounded-premium long call (unlocks ~$5k)',
+  fundamentals:'AI valuation read of company-published financials, cached 3d/symbol',
+  hypothesis:'deterministic reader of the active AI market hypothesis',
+  gap:'opening gap up 1.5-6% in an uptrend rides continuation (live quotes; silent in backtests)',
+  vol_contraction:'VCP-lite: vol squeeze near 60d high in an uptrend → breakout entry',
+  neural:'PyTorch MLP predicting 21d excess return; trains while market closed, silent until val IC clears the gate',
 };
 
 function line(canvas, series){
@@ -873,49 +889,42 @@ async function guard(fn, panelId){
     if(el) el.innerHTML = '<span class="feed-error">-- FEED ERROR: '
       + String(e.message||e).slice(0,120) + ' --</span>'; }
 }
+let lastGraph=null;
+function showGraphNode(id){
+  if(!lastGraph)return;
+  const n=lastGraph.topology.nodes.find(x=>x.id===id)||{};
+  const a=(lastGraph.snapshot?.activations||{})[id]||{};
+  $('graph_detail').innerHTML=`<b>${id}</b> · layer ${n.layer} · ${n.role} · activation ${n.activation}<br>`+
+    `specialist raw ${a.raw??'—'} × base scale ${n.base_scale??1} + bias ${n.bias??0} → preactivation ${a.preactivation??'—'} → <b>${a.value??'—'}</b><br>`+
+    `incoming: ${(a.incoming||[]).map(x=>`${x.source} ${x.value>=0?'+':''}${Number(x.value).toFixed(4)}`).join(' · ')||'none'}`;
+}
 async function refreshModel(){
   const m=await api('/api/model');
+  const sym=($('graph_symbol').value||'SPY').toUpperCase();
+  const horizon=+$('graph_horizon').value;
+  const g=await api(`/api/model/graph?symbol=${encodeURIComponent(sym)}&horizon=${horizon}`);
+  const research=await api('/api/research');
+  lastGraph=g;
   $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
     (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
+  $('graph_version').textContent=`${g.version} · ${g.status} · live blend ${Math.round((g.live_blend||0)*100)}%`;
   const nodes=m.nodes;
-  const rowH=n=>Math.max(34, Math.min(64, 24+n.effective_weight*90));
-  let y=14; const pos={};
-  nodes.forEach(n=>{pos[n.id]={y, h:rowH(n)}; y+=rowH(n)+10;});
-  const H=Math.max(y+8, 240), NX=170, NW=178, EX=430, GX=560, BX=676;
-  const mid=t=>pos[t].y+pos[t].h/2;
-  const col=n=>n.status==='production'?'var(--green)':n.status==='probation'
-    ?'var(--amber)':'#7d8799';
-  const edge=n=>{
-    const w=Math.max(1, n.effective_weight*8);
-    const c=n.trades_n<3?'#3a3f4c':(n.expectancy>0?'var(--green)':'var(--red)');
-    return `<path d="M ${NX+NW} ${mid(n.id)} C ${EX-40} ${mid(n.id)}, ${EX-40} ${H/2}, ${EX} ${H/2}"
-      stroke="${c}" stroke-width="${n.enabled?w:0.6}" fill="none"
-      ${n.enabled?'':'stroke-dasharray="3,3"'} opacity="${n.enabled?0.9:0.35}"/>`;};
-  const box=n=>{
-    const p=pos[n.id], c=col(n);
-    return `<rect x="${NX}" y="${p.y}" width="${NW}" height="${p.h}" fill="var(--panel)"
-      stroke="${c}" ${n.enabled?'':'stroke-dasharray="4,3"'} opacity="${n.enabled?1:0.45}"/>
-    <text x="${NX+8}" y="${p.y+15}" fill="${c}" font-size="11" font-family="monospace">${n.id}${n.ai?' ⚡AI':''}${n.role==='filter'?' [veto]':''}</text>
-    <text x="${NX+8}" y="${p.y+p.h-6}" fill="#7d8799" font-size="9" font-family="monospace">
-      eff ${n.effective_weight.toFixed(2)} (${n.base_weight}×${n.multiplier})${n.trades_n?` · ${n.trades_n} trades ${(n.expectancy*100).toFixed(1)}%`:''}</text>`;};
-  const hypoOn=m.hypothesis.enabled && pos['hypothesis'];
-  const hypoBox=hypoOn?`<rect x="8" y="${pos['hypothesis'].y}" width="130" height="${pos['hypothesis'].h}"
-      fill="none" stroke="var(--cyan)"/>
-    <text x="14" y="${pos['hypothesis'].y+15}" fill="var(--cyan)" font-size="10" font-family="monospace">AI hypothesis</text>
-    <text x="14" y="${pos['hypothesis'].y+pos['hypothesis'].h-6}" fill="#7d8799" font-size="9" font-family="monospace">${m.hypothesis.short_term?`${m.hypothesis.short_term.stances} stances`: 'none active'}</text>
-    <line x1="138" y1="${mid('hypothesis')}" x2="${NX}" y2="${mid('hypothesis')}" stroke="var(--cyan)"/>`:'';
-  const chain=(x,label,sub)=>`<rect x="${x}" y="${H/2-26}" width="104" height="52" fill="var(--panel)" stroke="var(--line)"/>
-    <text x="${x+8}" y="${H/2-8}" fill="var(--text)" font-size="11" font-family="monospace">${label}</text>
-    <text x="${x+8}" y="${H/2+10}" fill="#7d8799" font-size="9" font-family="monospace">${sub}</text>`;
-  $('modelsvg').innerHTML=`<svg viewBox="0 0 800 ${H}" width="100%" style="min-width:760px">
-    <text x="8" y="10" fill="#7d8799" font-size="9" font-family="monospace">market data → signal nodes → ensemble → governor → broker</text>
-    ${hypoBox}${nodes.map(edge).join('')}${nodes.map(box).join('')}
-    ${chain(EX,'ENSEMBLE',`min score ${m.ensemble.min_final_score}`)}
-    ${chain(GX,'GOVERNOR',m.kill_switches.length?'KILL ACTIVE':'budget-gated')}
-    ${chain(BX,'BROKER','orders')}
-    <line x1="${EX+104}" y1="${H/2}" x2="${GX}" y2="${H/2}" stroke="var(--line)"/>
-    <line x1="${GX+104}" y1="${H/2}" x2="${BX}" y2="${H/2}" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/>
-  </svg>`;
+  const topo=g.topology, snap=g.snapshot?.activations||{}, layers=[1,2,3,4], W=1080, H=620, BW=180, BH=42;
+  const pos={};
+  layers.forEach((layer,li)=>{const ns=topo.nodes.filter(n=>n.layer===layer);ns.forEach((n,i)=>{
+    pos[n.id]={x:25+li*260,y:45+i*Math.min(70,520/Math.max(1,ns.length))};});});
+  const edge=e=>{const a=pos[e.source],b=pos[e.target],w=Number(e.weight||0),c=w>=0?'var(--green)':'var(--red)';
+    if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .25 : .8}" ${e.pruned?'stroke-dasharray="4,4"':''}><title>${e.source} → ${e.target}: ${w.toFixed(4)}${e.pruned?' pruned':''}</title></path>`};
+  const box=n=>{const p=pos[n.id],a=snap[n.id]||{},v=Math.min(1,Math.abs(Number(a.value||0))),stroke=n.role==='output'?'var(--cyan)':n.role==='gate'?'var(--amber)':'#7d8799';
+    return `<g onclick="showGraphNode('${n.id}')" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${n.id}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${n.activation} · ${a.value==null?'—':Number(a.value).toFixed(3)}</text></g>`};
+  $('modelsvg').innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:900px">${layers.map((l,i)=>`<text x="${30+i*260}" y="20" fill="#7d8799" font-size="10" font-family="monospace">LAYER ${l}</text>`).join('')}${topo.edges.map(edge).join('')}${topo.nodes.map(box).join('')}<rect x="1000" y="270" width="75" height="55" fill="var(--panel)" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/><text x="1008" y="292" fill="var(--text)" font-size="9">GOVERNOR</text><text x="1008" y="309" fill="#7d8799" font-size="8">outside graph</text></svg>`;
+  const nu=research.neural, rr=research.weekly, rs=research.state||{}, us=research.universe?.tiers||{};
+  $('learnbox').innerHTML=
+    `<div><span class="badge">RESEARCH</span> ${rs.phase||'never_ran'} · ${rs.detail||'—'} · research ${(us.research||0).toLocaleString()} / active ${(us.active||0).toLocaleString()}</div>`+
+    `<div style="margin-top:4px"><span class="badge">GLOBAL TCN</span> ${nu ? `${nu.status||'—'} · ${nu.data_as_of||'—'} · ${JSON.stringify(nu.metrics||{}).slice(0,180)}`:'no challenger yet'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">WALK-FORWARD</span> ${rr
+      ? `${(rr.window||[]).join(' → ')} · ${rr.n_trades} trades · win ${rr.win_rate==null?'—':(rr.win_rate*100).toFixed(0)+'%'} · OOS ${JSON.stringify(rr.out_of_sample_30pct||{}).slice(0,120)} · ran ${(rr.ran_at||'').slice(5,16).replace('T',' ')}`
+      : '<span class="dim">no weekly report yet</span>'}</div>`;
   $('model_table').innerHTML=nodes.map(n=>`<tr style="opacity:${n.enabled?1:0.45}">
     <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
     <td>${n.status||'—'}</td><td>${n.base_weight??'—'}</td><td>×${n.multiplier}</td>

@@ -126,6 +126,34 @@ CREATE TABLE IF NOT EXISTS steering(                -- non-blocking strategic ch
   payload TEXT,                                     -- JSON kind-specific apply data
   decided_key TEXT, decided_at TEXT, decided_via TEXT  -- gui | expiry
 );
+CREATE TABLE IF NOT EXISTS instruments(             -- official listing catalog
+  symbol TEXT PRIMARY KEY, name TEXT, exchange TEXT, security_type TEXT,
+  is_etf INTEGER DEFAULT 0, is_adr INTEGER DEFAULT 0, active INTEGER DEFAULT 1,
+  first_seen TEXT, last_seen TEXT, source TEXT, cik TEXT, raw_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS universe_membership(     -- point-in-time tiers
+  as_of TEXT, symbol TEXT, tier TEXT, rank INTEGER, reason TEXT, metrics TEXT,
+  PRIMARY KEY(as_of, symbol, tier)
+);
+CREATE TABLE IF NOT EXISTS filing_facts(            -- SEC facts keyed by availability
+  cik TEXT, tag TEXT, period_end TEXT, filed TEXT, value REAL, unit TEXT,
+  form TEXT, accession TEXT,
+  PRIMARY KEY(cik, tag, period_end, filed, accession)
+);
+CREATE TABLE IF NOT EXISTS graph_versions(          -- immutable champion/challengers
+  id TEXT PRIMARY KEY, created_at TEXT, data_as_of TEXT, status TEXT,
+  parent_id TEXT, topology TEXT, metrics TEXT, checkpoint TEXT
+);
+CREATE TABLE IF NOT EXISTS model_runs(              -- global + holding TCNs
+  id TEXT PRIMARY KEY, kind TEXT, symbol TEXT, created_at TEXT, data_as_of TEXT,
+  status TEXT, parent_id TEXT, metrics TEXT, checkpoint TEXT, feature_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS model_forecasts(         -- shadow/live learning labels
+  model_id TEXT, as_of TEXT, symbol TEXT, horizon INTEGER,
+  q10 REAL, q50 REAL, q90 REAL, probability_positive REAL,
+  resolved_at TEXT, realized_excess REAL, feature_hash TEXT,
+  PRIMARY KEY(model_id, as_of, symbol, horizon)
+);
 CREATE TABLE IF NOT EXISTS equity_intraday(         -- throttled live marks (V4)
   ts TEXT, equity REAL, cash REAL, source TEXT,
   pnl REAL                                          -- realized+unrealized (D36):
@@ -134,6 +162,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_cycle ON audit(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_orders_dup ON orders(symbol, side, created_at);
 CREATE INDEX IF NOT EXISTS idx_trades_analog ON trades(source, regime, score_bucket);
 CREATE INDEX IF NOT EXISTS idx_signals_cycle ON signals(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_membership(as_of, tier, rank);
+CREATE INDEX IF NOT EXISTS idx_forecasts_unresolved ON model_forecasts(resolved_at, horizon);
+CREATE INDEX IF NOT EXISTS idx_filing_fact_asof ON filing_facts(cik, tag, filed);
 """
 
 

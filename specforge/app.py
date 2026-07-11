@@ -718,6 +718,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 "per_trade_ir": sc.get("per_trade_ir"),
             })
         st = store.active_hypothesis("short_term")
+        from .graph import champion as graph_champion
+        graph = graph_champion(store)
         return {
             "regime": reg.regime,
             "deployment_multiplier": reg.deployment_multiplier,
@@ -734,7 +736,48 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 if st else None,
                 "north_star_active": store.active_hypothesis("north_star") is not None},
             "nodes": sorted(nodes, key=lambda n: -n["effective_weight"]),
+            "neural": store.kv_get("neural_status"),
+            "research": store.kv_get("research_report"),
+            "analog_graph": {"id": graph["id"], "status": graph["status"],
+                             "metrics": graph.get("metrics", {}),
+                             "live_blend": c.get("analog_graph", "live_blend", default=0)},
         }
+
+    @app.get("/api/model/graph")
+    def model_graph(symbol: str = "SPY", horizon: int = 21):
+        """Actual deployed topology plus symbol-specific live activations."""
+        from .graph import champion as graph_champion
+        c = fresh_cfg(); graph = graph_champion(store)
+        if horizon not in (5, 21):
+            raise HTTPException(400, "horizon must be 5 or 21")
+        snapshots = store.kv_get("graph_last_activations", {}) or {}
+        return {"schema": "stonk.graph.v1", "version": graph["id"],
+                "status": graph["status"], "metrics": graph.get("metrics", {}),
+                "live_blend": c.get("analog_graph", "live_blend", default=0),
+                "symbol": symbol.upper(), "horizon": horizon,
+                "topology": graph["topology"],
+                "snapshot": snapshots.get(symbol.upper())}
+
+    @app.get("/api/research")
+    def research_status():
+        from .research import status
+        return status(store)
+
+    @app.get("/api/universe")
+    def universe_status(tier: str = "active", limit: int = 250, offset: int = 0):
+        if tier not in ("research", "active"):
+            raise HTTPException(400, "tier must be research or active")
+        limit = min(500, max(1, limit)); offset = max(0, offset)
+        d = store.db.execute("SELECT MAX(as_of) d FROM universe_membership WHERE tier=?",
+                             (tier,)).fetchone()["d"]
+        rows = [] if not d else [dict(r) for r in store.db.execute(
+            "SELECT u.*,i.name,i.exchange,i.security_type FROM universe_membership u "
+            "LEFT JOIN instruments i ON i.symbol=u.symbol WHERE u.as_of=? AND u.tier=? "
+            "ORDER BY u.rank LIMIT ? OFFSET ?", (d, tier, limit, offset))]
+        for row in rows:
+            row["metrics"] = json.loads(row["metrics"] or "{}")
+        return {"as_of": d, "tier": tier, "limit": limit, "offset": offset,
+                "rows": rows}
 
     @app.get("/api/engine")
     def engine_status():
@@ -896,14 +939,14 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                                               minute=int(m), timezone=tz),
                   misfire_grace_time=1800, id="post_close")
 
+    from apscheduler.triggers.interval import IntervalTrigger
+
     # D39 continuous heartbeat: full cycle every N minutes while the market is
     # open (the engine.py cycle lock makes overlap with the cron scans a no-op)
     # and a visible "sleeping" stamp when it's closed — the state machine is
     # always demonstrably alive, never a 3-hour black box.
     iv = cfg.get("schedule", "scan_interval_minutes")
     if iv:
-        from apscheduler.triggers.interval import IntervalTrigger
-
         def interval_job():
             from .health import _market_clock
             mkt = _market_clock()
@@ -922,6 +965,59 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             interval_job, IntervalTrigger(minutes=int(iv)),
             next_run_time=datetime.now().astimezone() + timedelta(seconds=3),
             misfire_grace_time=120, id="scan_interval")
+
+    # Closed-market research plane: one bounded, idempotent task per tick.
+    # It trains challengers, never mutates live champions in place.
+    def research_job():
+        from .health import _market_clock
+        c = current_config(store, mode)
+        if _market_clock()["open"]:
+            return
+        try:
+            from .research import run_next
+            run_next(c, store)
+        except Exception as e:                  # noqa: BLE001
+            store.audit("scheduler_error", {"job": "research",
+                                            "error": str(e)[:300]})
+
+    sched.add_job(research_job, IntervalTrigger(
+        minutes=int(cfg.get("research", "interval_minutes", default=15))),
+        next_run_time=datetime.now().astimezone() + timedelta(seconds=8),
+        misfire_grace_time=600, id="research")
+
+    # D40: the weekend research loop — schedule slot existed since V1 but was
+    # never wired. A 2y walk-forward backtest of the CURRENT config every
+    # Saturday: config drift vs measured edge surfaces within a week.
+    wr = cfg.get("schedule", "weekend_research", default="SAT 10:00")
+
+    def weekend_research_job():
+        c = current_config(store, mode)
+        try:
+            from .backtest import run_backtest
+            rep = run_backtest(c, years=2, tag="weekly_research")
+            slim = {"window": rep.get("window"), "n_trades": rep.get("n_trades"),
+                    "win_rate": rep.get("win_rate"),
+                    "overall": rep.get("overall"),
+                    "out_of_sample_30pct": rep.get("out_of_sample_30pct"),
+                    "benchmark_buy_hold_return": rep.get("benchmark_buy_hold_return"),
+                    "ran_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+            store.kv_set("research_report", slim)
+            store.audit("weekend_research", slim)
+            print(f"[scheduler] weekend research: {slim}")
+        except Exception as e:                  # noqa: BLE001
+            store.audit("scheduler_error", {"job": "weekend_research",
+                                            "error": str(e)[:300]})
+
+    try:
+        wd, hhmm = wr.split()
+        h2, m2 = hhmm.split(":")
+        sched.add_job(weekend_research_job,
+                      CronTrigger(day_of_week=wd.lower()[:3], hour=int(h2),
+                                  minute=int(m2), timezone=tz),
+                      misfire_grace_time=6 * 3600, id="weekend_research")
+    except ValueError:
+        store.audit("scheduler_error", {"job": "weekend_research",
+                                        "error": f"bad schedule string {wr!r}"})
 
     def _on_missed(event):
         """Watchdog (ROADMAP Sprint D): a scheduled scan was silently skipped

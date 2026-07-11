@@ -71,6 +71,14 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     # 1. data
     symbols = list(cfg.get("universe", "symbols", default=[]))
+    if refresh_data:
+        # Closed-market research precomputes the broad-to-active funnel. A
+        # missing/incomplete snapshot preserves the proven configured universe.
+        from .universe import symbols as tier_symbols
+        active = tier_symbols(store, "active")
+        if active:
+            symbols = active
+            cfg.data["universe"]["symbols"] = symbols
     # hypothesis watchlist merge (V4/D34): the active short-term hypothesis may
     # add a bounded set of symbols to this cycle's scan universe. In-memory
     # config mutation only — the file/override universe is untouched.
@@ -105,6 +113,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
             store.audit("live_quotes_failed", {"error": str(e)[:200]}, cycle_id)
     if live_px:
         store.audit("live_quotes", {"n": len(live_px)}, cycle_id)
+    ctx.live_px = live_px      # D40: intraday-aware nodes (gap) read these;
+    #                            empty in backtests → those nodes stay silent
 
     # 2. account + broker
     st("account", "reading account state from broker")
@@ -180,6 +190,12 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # 7. ensemble → forecast → portfolio
     st("ensemble", f"scoring {len(events)} signals across nodes")
     candidates = ensemble_mod.score(events, reg.regime, cfg, store, filters, ctx)
+    # The analog-neural graph is a bounded learned overlay. Specialist
+    # equations remain unchanged and the deterministic ensemble stays the
+    # fallback; an unvalidated graph has a zero live blend.
+    from .graph import blend_candidates
+    blend_candidates(candidates, events, reg.regime, cfg, store)
+    candidates.sort(key=lambda c: c.final_score, reverse=True)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:
         store.record_candidate(c, cycle_id)

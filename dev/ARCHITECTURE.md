@@ -93,3 +93,28 @@ either. No ORM — schema in `store.py`, plain SQL.
 - Pruning: auto-disable on negative live expectancy with n≥30, node drawdown breach,
   or cost > edge. Promotion (experimental→probation→production) requires human
   approval via GUI; the system only *proposes*.
+
+## Dual-network research plane (D41)
+
+Specialist equations also feed `graph.py`, a bounded analog-neural DAG:
+
+```text
+specialist base equation
+  → base scale + learned incoming edges + bias
+  → role-compatible activation
+  → interaction nodes
+  → 5d/21d outputs
+  → capped blend with deterministic ensemble
+  → portfolio → governor → execution
+```
+
+The graph learns connections, not hidden replacements for specialist logic.
+The governor, portfolio accounting, execution, and broker are structurally
+forbidden graph nodes. `neural.py` is a causal quantile TCN specialist inside
+the graph, with optional complete per-holding clones. Champions are immutable;
+research produces challengers and promotion swaps checkpoints atomically.
+
+`research.py` is the closed-market state machine. It derives due work from
+durable watermarks rather than owning a second queue system. `universe.py`
+maintains official catalog/research/active tiers and fails back to the committed
+universe. Market-hours cycles consume the last good active snapshot.
