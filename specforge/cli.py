@@ -98,21 +98,42 @@ def cmd_serve(args, cfg, store):
 
     import uvicorn
     from .app import create_app
-    # Refuse a real listener before create_app starts a second scheduler.
-    # Binding is the wrong probe: TIME_WAIT can reject a bind after a clean
-    # restart even though no process is serving (observed 2026-07-11).
+    # Pre-bind once and pass the socket into Uvicorn: choosing a fallback and
+    # releasing it before server startup creates a check-then-bind race.
+    listener = None
+    for port in range(args.port, args.port_range_end + 1):
+        candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            candidate.bind(("127.0.0.1", port))
+            candidate.listen(128)
+            listener = candidate
+            break
+        except OSError:
+            candidate.close()
+    if listener is None:
+        print(f"no free loopback port in {args.port}-{args.port_range_end}", file=sys.stderr)
+        return 2
+    effective_port = listener.getsockname()[1]
+    detail = {"mode": cfg.mode, "preferred_port": args.port,
+              "effective_port": effective_port,
+              "fallback": effective_port != args.port}
+    store.audit("service_starting", detail)
+    print(f"STONK_URL=http://127.0.0.1:{effective_port}", flush=True)
+    app = create_app(cfg, store)
+    server = uvicorn.Server(uvicorn.Config(
+        app, log_level="info" if args.verbose else "warning",
+        access_log=args.verbose))
     try:
-        with socket.create_connection(("127.0.0.1", args.port), timeout=.25):
-            print(f"port {args.port} is already serving — another Stonk Terminal "
-                  f"instance? `stonk tui` attaches to it; "
-                  f"scripts/check_health.py reports its health", file=sys.stderr)
-            return 2
-    except OSError:
+        server.run(sockets=[listener])
+    except KeyboardInterrupt:
         pass
-    store.audit("service_starting", {"mode": cfg.mode, "port": args.port})
-    uvicorn.run(create_app(cfg, store), host="127.0.0.1", port=args.port,
-                log_level="info" if args.verbose else "warning",
-                access_log=args.verbose)
+    finally:
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler and scheduler.running:
+            scheduler.shutdown(wait=False)
+        listener.close()
+        store.audit("service_stopped", {"mode": cfg.mode,
+                                         "effective_port": effective_port})
 
 
 def cmd_approve(args, cfg, store):
@@ -368,6 +389,8 @@ def main(argv=None):
     s.add_argument("--status", action="store_true")
     s.add_argument("--max-minutes", type=int, default=10)
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8420)
+    s.add_argument("--port-range-end", type=int, default=8420,
+                   help="last loopback port allowed for atomic startup fallback")
     s.add_argument("--verbose", action="store_true",
                    help="stream HTTP access logs (default is quiet; audit stays on disk)")
     s = sub.add_parser("approve"); s.add_argument("intent_id")

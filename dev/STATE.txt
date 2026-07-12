@@ -1,0 +1,14 @@
+PROTOCOL: GSPP
+PROTOCOL_VERSION: 1.0.0
+CURRENT_MILESTONE: M1a
+STATUS: ACTIVE
+LAST_USER_ACCEPTED_MILESTONE: M0
+NEXT_ALLOWED_MILESTONE: M1a
+CURRENT_SLICE: M1a reliability and operator observability
+LAST_UPDATED: 2026-07-12
+
+The local browser product is operational, but M1a has not reached
+CANDIDATE_FOR_ACCEPTANCE. Runtime progress, loopback binding, atomic bounded
+port fallback, liveness/readiness, same-origin mutation checks, and graceful
+scheduler shutdown are verified. Remaining gate evidence is tracked in
+dev/RELEASE_CHECKLIST.txt.

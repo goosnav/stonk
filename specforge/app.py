@@ -11,8 +11,8 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 
 from .config import OVERRIDES_KEY, ConfigError, apply_override, load_config
 from .data import MarketContext
@@ -58,6 +58,22 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     mode = cfg.mode
     quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
     app.state.started_at = datetime.now().astimezone()
+
+    @app.middleware("http")
+    async def same_origin_mutations(request: Request, call_next):
+        """Block browser cross-site writes to the loopback control plane.
+
+        Non-browser CLI calls normally omit Origin and remain supported. A
+        browser that supplies Origin must match the exact loopback server it
+        addressed; restrictive CORS headers alone do not stop form/fetch CSRF.
+        """
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            expected = f"{request.url.scheme}://{request.url.netloc}"
+            if origin and origin.rstrip("/") != expected:
+                return JSONResponse({"detail": "cross-origin mutation refused"},
+                                    status_code=403)
+        return await call_next(request)
 
     def _process() -> dict:
         now = datetime.now().astimezone()
@@ -201,6 +217,10 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         trading lives in /api/health; the monitor contract in /api/metrics."""
         return {"ok": True, "mode": mode, **_process()}
 
+    @app.get("/health/live")
+    def health_live():
+        return liveness()
+
     def _system_health():
         from .health import system_health
         sched = getattr(app.state, "scheduler", None)
@@ -215,6 +235,15 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         trading whenever we aren't. Broker probe is kv-cached 60s. `status`/
         `alerts` carry the app-health rollup (ok|degraded|stale|error)."""
         return _system_health()
+
+    @app.get("/health/ready")
+    def health_ready():
+        h = _system_health()
+        ready = h.get("status") not in {"error", "offline"}
+        payload = {"ready": ready, "mode": mode, "status": h.get("status"),
+                   "scheduler_alive": h.get("engine", {}).get("scheduler_alive"),
+                   **_process()}
+        return payload if ready else JSONResponse(payload, status_code=503)
 
     @app.get("/api/metrics")
     def metrics():
@@ -408,6 +437,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     @app.get("/api/costs")
     def costs():
         c = fresh_cfg()
+        from .ai import AIClient
         ai_cfg = c.get("ai", default={})
         prices = ai_cfg.get("prices", {}).get(ai_cfg.get("model", ""), {})
         n_stocks = len([s for s in c.get("universe", "symbols", default=[])
@@ -427,6 +457,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                         + c.get("execution", "slippage_bps", default=5)) * 2
         return {
             "ai_enabled": bool(ai_cfg.get("enabled")),
+            "ai_available": AIClient(c, store).available(),
             "ai_model": ai_cfg.get("model"),
             "ai_models": ai_cfg.get("models", {}),
             "ai_daily_budget_usd": ai_cfg.get("daily_budget_usd"),
@@ -783,7 +814,13 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def create_research_job(body: dict):
         from .research import enqueue_job
         try:
-            return enqueue_job(store, str(body.get("kind", "")),
+            kind = str(body.get("kind", ""))
+            if kind == "deep_research":
+                from .ai import AIClient
+                if not AIClient(fresh_cfg(), store).available():
+                    raise HTTPException(409, "Deep Research requires AI enabled, a configured "
+                                           "API key, and remaining daily/monthly budget")
+            return enqueue_job(store, kind,
                                body.get("payload") or {}, priority=10)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -842,7 +879,16 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             state = {"phase": "awaiting_cycle",
                      "detail": f"no {mode} cycle in this process yet; scheduler is armed",
                      "at": None, "trace": [], "mode": mode}
+        from .research import list_jobs
+        research_state = store.kv_get("research_state") or {"phase": "never_ran"}
+        research_jobs = list_jobs(store, 10)
         return {"state": state,
+                "processes": {
+                    "trading": {"state": state, "serial": True},
+                    "research": {"state": research_state,
+                                 "jobs": research_jobs,
+                                 "serial": True,
+                                 "detail": "one research task at a time; trading remains responsive"}},
                 "market": _market_clock(),
                 "interval_minutes": c.get("schedule", "scan_interval_minutes"),
                 "scan_times": c.get("schedule", "scans", default=[]),
@@ -866,6 +912,12 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     # ---------------- scheduler ----------------
     if with_scheduler:
         _start_scheduler(app, store, mode)
+
+        @app.on_event("shutdown")
+        def stop_scheduler():
+            scheduler = getattr(app.state, "scheduler", None)
+            if scheduler and scheduler.running:
+                scheduler.shutdown(wait=False)
     return app
 
 
@@ -1042,6 +1094,25 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         minutes=int(cfg.get("research", "interval_minutes", default=15))),
         next_run_time=datetime.now().astimezone() + timedelta(seconds=8),
         misfire_grace_time=600, id="research")
+
+    # Operator buttons should start promptly after the current atomic research
+    # unit finishes. Polling SQLite is cheap; the shared research mutex keeps
+    # this from overlapping autonomous backfill/training.
+    def operator_research_job():
+        from .health import _market_clock
+        if _market_clock()["open"]:
+            return                         # market-hours requests wait for close
+        try:
+            from .research import run_operator_job
+            run_operator_job(current_config(store, mode), store)
+        except Exception as e:             # noqa: BLE001
+            store.audit("scheduler_error", {"job": "operator_research",
+                                            "error": str(e)[:300]})
+
+    sched.add_job(operator_research_job, IntervalTrigger(seconds=5),
+                  next_run_time=datetime.now().astimezone() + timedelta(seconds=5),
+                  max_instances=1, coalesce=True, misfire_grace_time=30,
+                  id="operator_research")
 
     # D40: the weekend research loop — schedule slot existed since V1 but was
     # never wired. A 2y walk-forward backtest of the CURRENT config every

@@ -155,6 +155,15 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
               "scheduler_alive": scheduler_alive,
               "next_runs": next_runs or {}}
     research = store.kv_get("research_state") or {"phase": "never_ran"}
+    active_research_job = store.db.execute(
+        "SELECT id,kind,status,progress,requested_at,started_at FROM research_jobs "
+        "WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,"
+        "priority DESC,requested_at LIMIT 1").fetchone()
+    if active_research_job:
+        import json as _job_json
+        active_research_job = dict(active_research_job)
+        active_research_job["progress"] = _job_json.loads(
+            active_research_job["progress"] or "{}")
     if scheduler_alive is False:
         operational_state = "offline"
         operational_detail = "scheduler is not running"
@@ -164,6 +173,9 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
     elif market["open"]:
         operational_state = "trading"
         operational_detail = "autonomous trading loop is active"
+    elif active_research_job and active_research_job.get("status") == "running":
+        operational_state = "researching"
+        operational_detail = f"{active_research_job['kind']} is running"
     elif research.get("phase") not in ("idle", "caught_up", "never_ran"):
         operational_state = "researching"
         operational_detail = research.get("detail") or "closed-market research is running"
@@ -172,7 +184,8 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
         operational_detail = "scheduler is armed; market is closed"
     engine.update(operational_state=operational_state,
                   operational_detail=operational_detail,
-                  research_state=research)
+                  research_state=research,
+                  active_research_job=active_research_job)
 
     bench = cfg.get("universe", "benchmark", default="SPY")
     newest = store.latest_bar_date(bench)

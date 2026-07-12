@@ -47,6 +47,18 @@
   #actionrail { width:100%; display:flex; gap:6px; align-items:center;
                 border-top:1px solid var(--line); padding-top:5px; }
   #actionstate { margin-left:auto; color:var(--dim); font-size:10.5px; }
+  .spinner { display:inline-block; width:10px; height:10px; border:1px solid var(--dim);
+             border-top-color:var(--cyan); border-radius:50% !important;
+             animation:spin .8s linear infinite; vertical-align:-1px; margin-right:5px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion:reduce) { .spinner { animation:none; border-color:var(--cyan); } }
+  .progress { width:180px; height:5px; display:inline-block; background:#20242a;
+              border:1px solid var(--line); vertical-align:1px; margin:0 6px; }
+  .progress > i { display:block; height:100%; background:var(--cyan); }
+  .process-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:9px; }
+  .process-lane { border:1px solid var(--line); padding:7px 9px; min-height:62px; }
+  .process-lane.running { border-color:var(--cyan); }
+  .feed-stale { opacity:.72; }
   /* alerts */
   #alerts { padding:0 12px; }
   .alert { margin:6px 0; padding:5px 10px; border:1px solid var(--red);
@@ -120,9 +132,9 @@
   <div id="readiness">…</div>
   <div id="actionrail" aria-label="Operator actions">
     <button id="tradecycle" class="primary" onclick="scanNow()" title="Run the ordinary governed trade cycle. Available only while the market is open.">Run trade cycle</button>
-    <button onclick="queueResearch('discover')" title="Rank the broad research universe using deterministic cached-data signals. Never places orders.">Discover opportunities</button>
-    <button onclick="queueResearch('deep_research')" title="Use the configured, budget-limited AI to deeply evaluate the top five discoveries.">Deep-research top 5</button>
-    <button onclick="queueResearch('train_holdings')" title="Queue one bounded full-network challenger for each current holding. Never mutates a champion.">Train holdings</button>
+    <button data-job-kind="discover" onclick="queueResearch('discover',this)" title="Rank the broad research universe using deterministic cached-data signals. Never places orders.">Discover opportunities</button>
+    <button id="deepresearch" data-job-kind="deep_research" onclick="queueResearch('deep_research',this)" title="Use the configured, budget-limited AI to deeply evaluate the top five discoveries.">Deep-research top 5</button>
+    <button data-job-kind="train_holdings" onclick="queueResearch('train_holdings',this)" title="Queue one bounded full-network challenger for each current holding. Never mutates a champion.">Train holdings</button>
     <span id="actionstate">no operator jobs</span>
   </div>
 </div>
@@ -198,10 +210,11 @@
     <p class="explain">Live position of the autonomous loop, stamped at every phase transition (updates every 3s). SLEEPING = market closed but the engine is alive; IDLE = between cycles, waiting for the next tick.</p>
     <div id="eng_strip" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">—</div>
     <div id="eng_detail" class="dim" style="margin-top:8px;font-size:11.5px">—</div>
+    <div id="eng_processes" class="process-grid">—</div>
   </section>
   <section>
     <h2>Cadence — is it actually running?</h2>
-    <p class="explain">The loop runs a full cycle on this interval during market hours. The cycle lock guarantees one cycle at a time, so Scan Now during a running cycle is a safe no-op.</p>
+    <p class="explain">The loop runs a full cycle on this interval during market hours. The cycle lock guarantees one cycle at a time, so Run trade cycle during a running cycle is a safe no-op.</p>
     <table class="kv"><tbody id="eng_cadence"></tbody></table>
   </section>
   <section>
@@ -357,9 +370,25 @@ const pct = (v,d=1) => v==null ? '—' : (v*100).toFixed(d)+'%';
 const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
 function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';
   setTimeout(()=>t.style.display='none',4500);}
-async function api(p,o){const r=await fetch(p,o);
-  if(!r.ok){toast('error: '+(await r.text()).slice(0,300));throw new Error(p);}return r.json();}
+async function api(p,o={}){
+  const method=(o.method||'GET').toUpperCase(), attempts=method==='GET'?2:1;
+  let last;
+  for(let i=0;i<attempts;i++){
+    const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),20000);
+    try{
+      const r=await fetch(p,{...o,signal:controller.signal}); clearTimeout(timer);
+      if(!r.ok){const detail=(await r.text()).slice(0,300);throw new Error(`${p}: ${r.status} ${detail}`);}
+      return await r.json();
+    }catch(e){clearTimeout(timer);last=e;if(i+1<attempts)await new Promise(r=>setTimeout(r,500));}
+  }
+  const err=new Error(`connection interrupted while loading ${p}: ${last?.message||last}`);
+  err.network=true; throw err;
+}
 async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
+async function researchPost(kind){
+  try{return await post('/api/research/jobs',{kind});}
+  catch(first){await new Promise(r=>setTimeout(r,700));return post('/api/research/jobs',{kind});}
+}
 
 /* tabs */
 document.querySelectorAll('#tabs div').forEach(t=>t.onclick=()=>{
@@ -665,6 +694,10 @@ async function saveRisk(){
 }
 async function refreshCosts(){
   const c = await api('/api/costs');
+  $('deepresearch').disabled=!c.ai_available;
+  $('deepresearch').title=c.ai_available
+    ?'Use the configured, budget-limited AI to deeply evaluate the top five discoveries.'
+    :'Enable AI, configure an API key, and retain budget in Config before running Deep Research.';
   $('ai_enabled').checked=c.ai_enabled;$('ai_model').value=c.ai_model||'';
   $('ai_model_news').value=(c.ai_models||{}).headline_classification||'';
   $('ai_model_hypo').value=(c.ai_models||{}).hypothesis||'';
@@ -861,21 +894,33 @@ async function scanNow(){
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
-async function queueResearch(kind){
+async function queueResearch(kind,button){
   const names={discover:'opportunity discovery',deep_research:'deep research',
                train_holdings:'holding training'};
-  const job=await post('/api/research/jobs',{kind});
-  toast(`${names[kind]} ${job.status}: ${job.id}`);
-  refreshJobs();
+  button.disabled=true;button.dataset.original=button.textContent;
+  button.innerHTML='<span class="spinner"></span>QUEUING';
+  try{
+    const job=await researchPost(kind);
+    toast(`${names[kind]} ${job.status}: ${job.id}`);
+    await refreshJobs();
+  }catch(e){toast(`Could not queue ${names[kind]}. ${e.message}`);}
+  finally{button.disabled=false;button.textContent=button.dataset.original;}
 }
+const progressFraction=p=>Math.max(0,Math.min(1,
+  Number.isFinite(Number(p?.fraction))?Number(p.fraction):(p?.total?(p.index-1)/p.total:0)));
 async function refreshJobs(){
   const jobs=await api('/api/research/jobs?limit=8');
   const active=jobs.find(j=>j.status==='running'||j.status==='queued');
-  if(!active){ $('actionstate').textContent=jobs[0]
-      ? `last ${jobs[0].kind}: ${jobs[0].status}`:'no operator jobs'; return; }
-  const p=active.progress||{};
-  $('actionstate').innerHTML=`<span class="${active.status==='running'?'pos':''}">${active.kind} · ${active.status}</span>`+
-    (p.symbol?` · ${p.symbol} ${p.index||0}/${p.total||0}`:'');
+  if(!active){
+    const last=jobs[0], detail=last&&(last.error||(last.result||{}).reason);
+    $('actionstate').innerHTML=last
+      ? `last ${last.kind}: <span class="${last.status==='failed'?'neg':''}">${last.status}</span>${detail?' · '+String(detail).slice(0,140):''}`
+      :'no operator jobs'; return;
+  }
+  const p=active.progress||{}, fraction=progressFraction(p);
+  $('actionstate').innerHTML=`${active.status==='running'?'<span class="spinner"></span>':''}<span class="${active.status==='running'?'pos':''}">${active.kind} · ${active.status}</span>`+
+    `<span class="progress"><i style="width:${Math.round(fraction*100)}%"></i></span>`+
+    (p.symbol?`${p.symbol} ${p.index||0}/${p.total||0}`:'waiting for research worker');
 }
 /* ---------- engine state machine (D39) ---------- */
 const ENG_PHASES=['sleeping','data','quotes','account','risk_gate','settle',
@@ -895,6 +940,13 @@ async function refreshEngine(){
       letter-spacing:.06em;${on?'font-weight:700;background:#1f1408':''}">${p.replace('_',' ')}</div>`;
   }).join(arrow);
   $('eng_detail').textContent=s.detail||'—';
+  const processes=e.processes||{}, research=processes.research||{}, rstate=research.state||{};
+  const activeJob=(research.jobs||[]).find(j=>j.status==='running'), queued=(research.jobs||[]).filter(j=>j.status==='queued');
+  const jp=activeJob?.progress||{}, jf=progressFraction(jp);
+  const rp=rstate.progress||{}, rf=rp.target?Math.max(0,Math.min(1,Number(rp.ready||0)/rp.target)):0;
+  const autonomousRunning=!['idle','caught_up','never_ran','error'].includes(rstate.phase);
+  $('eng_processes').innerHTML=`<div class="process-lane ${running?'running':''}"><b>TRADING LOOP</b><br><span class="${running?'pos':'dim'}">${(s.phase||'unknown').replace('_',' ')}</span><br><span class="dim">${s.detail||'—'}</span></div>`+
+    `<div class="process-lane ${activeJob||autonomousRunning?'running':''}"><b>RESEARCH WORKER</b><br>${activeJob?`<span class="spinner"></span><span class="pos">${activeJob.kind}</span> · ${jp.phase||'working'} ${jp.symbol||''} ${jp.index||''}/${jp.total||''}<br><span class="progress"><i style="width:${Math.round(jf*100)}%"></i></span>${jp.epoch?` epoch ${jp.epoch}/${jp.max_epochs} · loss ${jp.best_loss}`:''}`:`${autonomousRunning?'<span class="spinner"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${rstate.phase||'idle'} · ${rstate.detail||'waiting'}</span>${rp.target?`<br><span class="progress"><i style="width:${Math.round(rf*100)}%"></i></span>${rp.ready||0}/${rp.target}`:''}`}<br><span class="dim">${queued.length} queued · single worker prevents CPU/DB collisions</span></div>`;
   const m=e.market||{}, runs=Object.entries(e.next_runs||{});
   $('eng_cadence').innerHTML=[
     ['loop interval', e.interval_minutes?`every ${e.interval_minutes} min during market hours`
@@ -915,10 +967,10 @@ async function refreshEngine(){
 // fail gracefully: a dead feed renders an explicit error in its panel,
 // never a stale silent value
 async function guard(fn, panelId){
-  try { await fn(); }
+  try { await fn(); const el=document.getElementById(panelId);if(el)el.classList.remove('feed-stale'); }
   catch(e){ const el=document.getElementById(panelId);
-    if(el) el.innerHTML = '<span class="feed-error">-- FEED ERROR: '
-      + String(e.message||e).slice(0,120) + ' --</span>'; }
+    if(e.network){if(el)el.classList.add('feed-stale');toast(String(e.message||e).slice(0,180)+' · retrying automatically');return;}
+    if(el) el.innerHTML = '<span class="feed-error">-- '+String(e.message||e).slice(0,180)+' --</span>'; }
 }
 let lastGraph=null;
 function showGraphNode(id){
@@ -986,9 +1038,11 @@ refreshAll();
 setInterval(()=>{guard(refreshEngine,'eng_strip');},3000);
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{guard(refreshJobs,'actionstate');},5000);
-setInterval(()=>{refreshMarket();},30000);
-setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
-  refreshCosts();refreshAudit();refreshSteering();refreshToday();refreshDecisions();},60000);
+setInterval(()=>{guard(refreshMarket,'strip');},30000);
+setInterval(()=>{guard(refreshCandidates,'candidates');guard(refreshTrades,'trades');
+  guard(refreshCurve,'curve');guard(refreshMC,'mcnote');guard(refreshCosts,'ai');
+  guard(refreshAudit,'audit');guard(refreshSteering,'steering');guard(refreshToday,'todaybox');
+  guard(refreshDecisions,'decisions');},60000);
 </script>
 </body>
 </html>

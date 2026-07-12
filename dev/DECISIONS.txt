@@ -1,0 +1,30 @@
+DECISION-20260712-001: Separate trading and research process truth
+STATUS: Accepted
+CONTEXT:
+Transient browser fetch failures made completed or running research look dead.
+DECISION:
+Expose trading-loop and serial research-worker states independently, persist
+operator job progress, and keep model training outside the trading state path.
+CONSEQUENCES:
+The UI can show parallel conceptual flows while one bounded research worker
+prevents CPU and SQLite collisions. Trading remains responsive and governed.
+ALTERNATIVES REJECTED:
+Inferring work from button state or streaming raw server logs.
+REVERSAL TRIGGER:
+A future worker architecture provides a stronger durable process contract.
+
+DECISION-20260712-002: Atomic bounded loopback port fallback
+STATUS: Accepted
+CONTEXT:
+M1a requires recovery when the preferred web port belongs to another process.
+DECISION:
+Pre-bind the first available 127.0.0.1 port in an explicit bounded range and
+pass that socket to Uvicorn. Never terminate the unrelated listener.
+CONSEQUENCES:
+The macOS launcher scans the same bounded range for the authenticated product
+identity and opens the effective URL. CLI callers retain a single-port default
+unless they explicitly supply --port-range-end.
+ALTERNATIVES REJECTED:
+Failing on any collision; probing then releasing a port before Uvicorn binds.
+REVERSAL TRIGGER:
+A platform launcher owns and passes a pre-bound socket/runtime-state contract.

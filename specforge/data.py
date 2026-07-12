@@ -46,7 +46,10 @@ def fetch_stooq(symbol: str) -> list[dict]:
 
 def fetch_yfinance(symbol: str, period: str = "max") -> list[dict]:
     import yfinance as yf
-    df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
+    # Yahoo spells listed share classes BRK-B/AGM-A while official catalogs
+    # and brokers use BRK.B/AGM.A.
+    yahoo_symbol = symbol if symbol.startswith("^") else symbol.replace(".", "-")
+    df = yf.Ticker(yahoo_symbol).history(period=period, interval="1d", auto_adjust=True)
     if df.empty:
         return []
     out = []

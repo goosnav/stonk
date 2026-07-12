@@ -283,7 +283,8 @@ def _walk_forward_metrics(cfg, ds: dict) -> dict:
 
 
 def train_challenger(cfg, store, symbols: list[str] | None = None,
-                     symbol: str | None = None, max_seconds: int | None = None) -> dict:
+                     symbol: str | None = None, max_seconds: int | None = None,
+                     progress=None) -> dict:
     try:
         import torch
     except ImportError:
@@ -330,7 +331,8 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     te = np.flatnonzero(ds["masks"]["test"])
     best, best_loss, stale = None, float("inf"), 0
     started = time.time()
-    for epoch in range(int(cfg.get("neural", "max_epochs", default=50))):
+    max_epochs = int(cfg.get("neural", "max_epochs", default=50))
+    for epoch in range(max_epochs):
         model.train()
         for idx in tr[torch.randperm(len(tr))].split(512):
             opt.zero_grad()
@@ -350,6 +352,10 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
             best = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             stale += 1
+        if progress:
+            progress({"epoch": epoch + 1, "max_epochs": max_epochs,
+                      "best_loss": round(best_loss, 6), "patience": stale,
+                      "fraction": (epoch + 1) / max_epochs})
         if stale >= int(cfg.get("neural", "patience", default=5)) or \
                 (max_seconds and time.time() - started >= max_seconds):
             break

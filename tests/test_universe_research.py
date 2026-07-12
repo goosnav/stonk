@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from specforge.montecarlo import block_bootstrap
 from specforge.research import (cancel_job, deep_research, discover_opportunities,
                                 enqueue_job, latest_sec_filing, list_jobs,
-                                resolve_forecasts)
+                                resolve_forecasts, run_operator_job)
 from specforge.universe import parse_directory, refresh_membership, symbols
 
 
@@ -18,6 +18,8 @@ def test_official_directory_parser_filters_non_companies():
            "TEST|Test Issue|Q|Y|N|100|N|N\n" \
            "FUND|Fund ETF|Q|N|N|100|Y|N\n" \
            "WRT|Issuer Warrant|Q|N|N|100|N|N\n" \
+           "WRTS|Issuer Warrants|Q|N|N|100|N|N\n" \
+           "RGHT|Issuer Rights|Q|N|N|100|N|N\n" \
            "ADR|World Depositary Shares|Q|N|N|100|N|N\n" \
            "File Creation Time: 0101200012:00|||||||\n"
     rows = parse_directory(text)
@@ -39,6 +41,15 @@ def test_tier_snapshot_uses_liquidity_and_history(cfg, store):
     result = refresh_membership(cfg, store)
     assert result["research"] == 2 and result["active"] == 2
     assert len(symbols(store, "research")) == 2
+
+
+def test_tier_rerank_preserves_discovery_shortlist(cfg, store):
+    as_of = store.latest_bar_date("SPY")
+    store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                     (as_of, "AAA", "shortlist", 1, "test", "{}"))
+    store.db.commit()
+    refresh_membership(cfg, store, as_of)
+    assert symbols(store, "shortlist") == ["AAA"]
 
 
 def test_shadow_forecast_resolution(cfg, store):
@@ -92,6 +103,8 @@ def test_research_job_api_contract(cfg, store):
     assert client.get("/api/research/jobs").json()[0]["kind"] == "train_holdings"
     cancelled = client.post(f"/api/research/jobs/{created.json()['id']}/cancel")
     assert cancelled.json()["status"] == "cancelled"
+    engine = client.get("/api/engine").json()
+    assert "trading" in engine["processes"] and "research" in engine["processes"]
 
 
 def test_discovery_persists_exactly_25_without_ai(cfg, store):
@@ -115,6 +128,13 @@ def test_discovery_persists_exactly_25_without_ai(cfg, store):
 def test_deep_research_fails_closed_when_ai_disabled(cfg, store):
     result = deep_research(cfg, store)
     assert result["status"] == "skipped" and "AI" in result["reason"]
+
+
+def test_deep_research_job_runs_discovery_dependency_first(cfg, store):
+    deep = enqueue_job(store, "deep_research")
+    result = run_operator_job(cfg, store)
+    assert result["kind"] == "discover"
+    assert next(j for j in list_jobs(store) if j["id"] == deep["id"])["status"] == "queued"
 
 
 def test_latest_sec_filing_extracts_narrative_and_source_hash():

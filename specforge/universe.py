@@ -13,7 +13,8 @@ import httpx
 NASDAQ = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 SEC = "https://www.sec.gov/files/company_tickers.json"
-BAD_NAME = re.compile(r"\b(warrant|right|unit|preferred|preference|beneficial interest)\b", re.I)
+BAD_NAME = re.compile(
+    r"\b(warrants?|rights?|units?|preferred|preference|beneficial interest)\b", re.I)
 SYMBOL = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
@@ -121,7 +122,10 @@ def refresh_membership(cfg, store, as_of: str | None = None) -> dict:
     # universe and current holdings).
     active_symbols = active_symbols[:active_n]
     with store.db:
-        store.db.execute("DELETE FROM universe_membership WHERE as_of=?", (as_of,))
+        # Reranking broad tiers must not erase the separately produced
+        # opportunity shortlist for the same date while deep research uses it.
+        store.db.execute("DELETE FROM universe_membership WHERE as_of=? "
+                         "AND tier IN ('research','active')", (as_of,))
         for rank, m in enumerate(research, 1):
             store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
                              (as_of, m["symbol"], "research", rank, "liquidity",

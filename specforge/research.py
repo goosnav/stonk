@@ -64,7 +64,8 @@ def _job(row) -> dict:
 
 def list_jobs(store, limit: int = 20) -> list[dict]:
     return [_job(r) for r in store.db.execute(
-        "SELECT * FROM research_jobs ORDER BY requested_at DESC LIMIT ?", (limit,))]
+        "SELECT * FROM research_jobs ORDER BY COALESCE(completed_at,requested_at) DESC LIMIT ?",
+        (limit,))]
 
 
 def cancel_job(store, job_id: str) -> dict:
@@ -194,7 +195,9 @@ def deep_research(cfg, store, limit: int = 5, progress=None) -> dict:
     completed, skipped = [], []
     for index, sym in enumerate(syms, 1):
         if progress:
-            progress({"symbol": sym, "index": index, "total": len(syms)})
+            progress({"phase": "filing + AI analysis", "symbol": sym,
+                      "index": index, "total": len(syms),
+                      "fraction": (index - 1) / max(1, len(syms))})
         inst = store.db.execute("SELECT * FROM instruments WHERE symbol=?", (sym,)).fetchone()
         facts = [dict(r) for r in store.db.execute(
             "SELECT tag,period_end,filed,value,unit,form,accession FROM filing_facts "
@@ -239,8 +242,17 @@ def train_holdings(cfg, store, progress=None) -> dict:
     results = {}
     for index, symbol in enumerate(holdings, 1):
         if progress:
-            progress({"symbol": symbol, "index": index, "total": len(holdings)})
-        results[symbol] = neural.train_challenger(cfg, store, symbol=symbol, max_seconds=180)
+            progress({"phase": "prepare", "symbol": symbol, "index": index,
+                      "total": len(holdings), "fraction": (index - 1) / max(1, len(holdings))})
+        def neural_progress(step):
+            if progress:
+                progress({"phase": "training", "symbol": symbol, "index": index,
+                          "total": len(holdings),
+                          **step,
+                          "fraction": ((index - 1) + step.get("fraction", 0)) /
+                                      max(1, len(holdings))})
+        results[symbol] = neural.train_challenger(
+            cfg, store, symbol=symbol, max_seconds=180, progress=neural_progress)
     return {"status": "completed", "holdings": len(holdings), "results": results}
 
 
@@ -251,6 +263,13 @@ def run_operator_job(cfg, store) -> dict | None:
         "ORDER BY priority DESC,requested_at LIMIT 1").fetchone()
     if not row:
         return None
+    if row["kind"] == "deep_research":
+        from .universe import symbols
+        if not symbols(store, "shortlist"):
+            enqueue_job(store, "discover", priority=int(row["priority"]) + 1)
+            row = store.db.execute(
+                "SELECT * FROM research_jobs WHERE status='queued' "
+                "ORDER BY priority DESC,requested_at LIMIT 1").fetchone()
     if not _LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "research worker busy"}
     jid, kind = row["id"], row["kind"]
@@ -258,10 +277,17 @@ def run_operator_job(cfg, store) -> dict | None:
     with store.db:
         store.db.execute("UPDATE research_jobs SET status='running',started_at=?,attempts=attempts+1 "
                          "WHERE id=?", (now, jid))
+    _stamp(store, f"job:{kind}", f"operator job {kind} started",
+           job={"id": jid, "kind": kind, "status": "running", "progress": {}})
     try:
         def progress(value):
             store.db.execute("UPDATE research_jobs SET progress=? WHERE id=?",
                              (json.dumps(value), jid)); store.db.commit()
+            detail = (f"{kind}: {value.get('symbol', '')} "
+                      f"{value.get('index', '')}/{value.get('total', '')}").strip()
+            _stamp(store, f"job:{kind}", detail,
+                   job={"id": jid, "kind": kind, "status": "running",
+                        "progress": value})
         result = (discover_opportunities(cfg, store) if kind == "discover" else
                   deep_research(cfg, store, progress=progress) if kind == "deep_research" else
                   train_holdings(cfg, store, progress))
@@ -272,6 +298,10 @@ def run_operator_job(cfg, store) -> dict | None:
                               json.dumps(result), jid))
         store.audit("research_job_completed", {"id": jid, "kind": kind,
                                                 "status": result.get("status")})
+        _stamp(store, "idle", "waiting for the next closed-market research tick",
+               last_task={"phase": f"job:{kind}", "detail": result.get("status"),
+                          "completed_at": datetime.now().astimezone().isoformat(
+                              timespec="seconds")})
         return {"job": jid, "kind": kind, **result}
     except Exception as exc:
         from .health import _redact
@@ -281,6 +311,8 @@ def run_operator_job(cfg, store) -> dict | None:
                              "WHERE id=?", (datetime.now().astimezone().isoformat(
                                  timespec="seconds"), error, jid))
         store.audit("research_job_failed", {"id": jid, "kind": kind, "error": error})
+        _stamp(store, "error", f"operator job {kind} failed: {error}",
+               job={"id": jid, "kind": kind, "status": "failed"})
         return {"job": jid, "kind": kind, "status": "failed", "error": error}
     finally:
         _LOCK.release()

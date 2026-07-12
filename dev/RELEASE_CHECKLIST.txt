@@ -1,0 +1,37 @@
+STONK TERMINAL M1a RELEASE EVIDENCE
+Updated: 2026-07-12
+State: ACTIVE — NOT YET CANDIDATE_FOR_ACCEPTANCE
+
+Verified in this slice
+[x] Backend binds to 127.0.0.1.
+[x] Preferred-port collision falls back atomically within a bounded range.
+[x] Existing listener is never terminated.
+[x] /health/live and /health/ready return sanitized process/readiness state.
+[x] Cross-origin browser mutations are rejected.
+[x] Ctrl-C shuts down the scheduler without a traceback or orphan listener.
+[x] Operator jobs are durable, deduplicated, and visible with progress.
+[x] Browser UI retries transient GET failures and preserves last good state.
+[x] Full offline suite: 114 passed on macOS arm64, 2026-07-12.
+[x] Live smoke: broker connected, scheduler alive, no kill switches or alerts.
+[x] Local macOS app bundle has a valid ad-hoc signature.
+
+Required before CANDIDATE_FOR_ACCEPTANCE
+[ ] Persist effective host/port/PID/start/session metadata outside the repo.
+[ ] Add a per-launch unguessable session token to privileged local endpoints.
+[ ] Move config, DB, logs, cache, exports, and backups to platform app-data;
+    preserve and verify migration from the current repository paths.
+[ ] Add migration integrity checks and an intentionally induced recovery test.
+[ ] Add sanitized support-bundle export and inspect its contents for secrets.
+[ ] Complete GUI secret replace/test/delete workflow with owner-only storage.
+[ ] Provide start.command, start.sh, and start.ps1 first-run wizard behavior
+    from a release zip, with exact locked dependency installation.
+[ ] Run clean-user/clean-machine extraction, interrupted setup, restart,
+    browser-open failure, and preserved-state acceptance tests.
+[ ] Record artifact checksum, supported platforms, rollback, and known issues.
+[ ] Obtain explicit user acceptance.
+
+M1b/public distribution note
+The current .app launches the source checkout and existing virtual environment.
+It is not a frozen M1b package. Apple Gatekeeper distribution additionally
+requires a real Developer ID signature and notarization; ad-hoc signing is
+local verification only.

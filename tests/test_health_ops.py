@@ -161,6 +161,18 @@ def test_closed_market_scheduler_is_idle_not_dead(cfg, store, monkeypatch):
     assert h["engine"]["operational_state"] == "offline"
 
 
+def test_running_operator_job_surfaces_as_researching(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    now = _now_iso()
+    store.db.execute("INSERT INTO research_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                     ("j1", "train_holdings", "running", 10, now, now, None,
+                      "{}", '{"symbol":"AAPL","index":1,"total":7}', None, None, 1))
+    store.db.commit()
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["engine"]["operational_state"] == "researching"
+    assert h["engine"]["active_research_job"]["progress"]["symbol"] == "AAPL"
+
+
 # ---------------- endpoints ----------------
 
 def test_liveness_endpoint_is_dependency_free(client):
@@ -169,6 +181,19 @@ def test_liveness_endpoint_is_dependency_free(client):
     body = r.json()
     assert body["ok"] is True and body["pid"] > 0 and body["uptime_s"] >= 0
     assert body["mode"] == "paper"
+
+
+def test_m1a_health_aliases_and_cross_origin_write_guard(client):
+    live = client.get("/health/live")
+    ready = client.get("/health/ready")
+    assert live.status_code == 200 and live.json()["ok"] is True
+    assert ready.status_code == 200 and ready.json()["ready"] is True
+    refused = client.post("/api/research/jobs", json={"kind": "discover"},
+                          headers={"Origin": "https://malicious.example"})
+    assert refused.status_code == 403
+    allowed = client.post("/api/research/jobs", json={"kind": "discover"},
+                          headers={"Origin": "http://testserver"})
+    assert allowed.status_code == 200
 
 
 def test_metrics_contract_healthy(client, cfg, store, monkeypatch):
