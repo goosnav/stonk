@@ -248,9 +248,11 @@ def test_live_health_reports_learned_stack_shadow_without_blocking_baseline(cfg,
 def test_running_operator_job_surfaces_as_researching(cfg, store, monkeypatch):
     monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
     now = _now_iso()
-    store.db.execute("INSERT INTO research_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                     ("j1", "train_holdings", "running", 10, now, now, None,
-                      "{}", '{"symbol":"AAPL","index":1,"total":7}', None, None, 1))
+    store.db.execute(
+        "INSERT INTO research_jobs(id,kind,status,priority,requested_at,started_at,payload,"
+        "progress,attempts,state,resource_class,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("j1", "train_holdings", "running", 10, now, now, "{}",
+         '{"symbol":"AAPL","index":1,"total":7}', 1, "running", "training", now))
     store.db.commit()
     h = system_health(cfg, store, scheduler_alive=True)
     assert h["engine"]["operational_state"] == "researching"
@@ -467,7 +469,8 @@ def test_scheduler_registers_premarket_session_probe(cfg, store):
         jobs = {job.id for job in app.state.scheduler.get_jobs()}
         assert "broker_session_check" in jobs
         assert "research" in jobs
-        assert "operator_research" in jobs
+        assert {"operator_discovery", "operator_intelligence",
+                "operator_training"} <= jobs
     finally:
         app.state.stopping = True
         app.state.scheduler.shutdown(wait=False)

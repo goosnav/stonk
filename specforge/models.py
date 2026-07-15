@@ -103,6 +103,9 @@ class TradeCandidate:
     strategy_contribution: float = 0.0
     learned_contribution: float = 0.0
     strategy_mandate_id: Optional[str] = None
+    entry_mode: str = "normal"       # normal | probe
+    size_multiplier: float = 1.0     # probe = 25% of otherwise computed target
+    entry_mode_reason: Optional[str] = None
     # option-only fields
     option_symbol: Optional[str] = None
     option_details: Optional[dict] = None

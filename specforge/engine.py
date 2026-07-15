@@ -154,7 +154,7 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         if due:
             from .research import enqueue_job
             enqueue_job(store, "deep_research", {"reason": "six-hour evidence refresh"},
-                        priority=1)
+                        priority=1, requested_by="autonomous")
             store.kv_set("evidence_refresh_requested_at",
                          datetime.now().astimezone().isoformat(timespec="seconds"))
 
@@ -215,7 +215,11 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         registry = build_registry(cfg, ai_client=AIClient(cfg, store))
     events = []
     filters = []
-    node_states = {"macro_regime": "running"}
+    node_states = {node_id: "unavailable" for node_id, node_cfg in
+                   (cfg.get("nodes", default={}) or {}).items()
+                   if node_cfg.get("enabled")}
+    node_states["macro_regime"] = "running"
+    symbol_states = {}
     for node in registry.values():
         if node.role == "filter":
             filters.append(node)
@@ -228,7 +232,10 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
             node_states[node.id] = "blocked"
             store.audit("node_degraded", {"node": node.id, "error": str(e)}, cycle_id)
             continue
-        node_states[node.id] = "running" if node_events else "neutral"
+        node_states[node.id] = ("running" if node_events else
+                                "unavailable" if node.degraded_reason else
+                                "verified_neutral")
+        symbol_states[node.id] = dict(getattr(node, "symbol_states", {}) or {})
         for ev in node_events:
             store.record_signal(ev, cycle_id)
         events.extend(node_events)
@@ -237,30 +244,40 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # signed point-in-time outputs are real specialist activations for the
     # outer graph and historical replay.
     graph_events = list(events)
-    graph_symbols = sorted({e.symbol for e in events})
+    graph_symbols = sorted(set(ctx.universe) | {e.symbol for e in events})
     for node in filters:
+        filter_states = {}
         for symbol in graph_symbols:
             try:
                 event = node.graph_signal(ctx, symbol) if hasattr(node, "graph_signal") else None
             except Exception as exc:  # one missing issuer must not erase every symbol
                 store.audit("filter_graph_degraded", {"node": node.id, "symbol": symbol,
                                                        "error": str(exc)[:160]}, cycle_id)
+                filter_states[symbol] = "blocked"
                 continue
             if event:
                 store.record_signal(event, cycle_id)
                 graph_events.append(event)
+                filter_states[symbol] = "running"
+            else:
+                filter_states[symbol] = "unavailable"
+        symbol_states[node.id] = filter_states
+        node_states[node.id] = ("running" if any(
+            state == "running" for state in filter_states.values()) else "unavailable")
 
     # 7. ensemble → forecast → portfolio
     st("ensemble", f"scoring {len(events)} signals across nodes")
     ensemble_events = ([e for e in events if e.node_id != "neural"]
                        if model_state["effective_blend"] else events)
-    candidates = ensemble_mod.score(ensemble_events, reg.regime, cfg, store, filters, ctx)
+    candidates = ensemble_mod.score(ensemble_events, reg.regime, cfg, store, filters, ctx,
+                                    node_states=node_states,
+                                    symbol_states=symbol_states)
     # The analog-neural graph is a bounded learned overlay. Specialist
     # equations remain unchanged and the deterministic ensemble stays the
     # fallback; an unvalidated graph has a zero live blend.
     from .graph import blend_candidates
     blend_candidates(candidates, graph_events, reg.regime, cfg, store, cycle_id,
-                     node_states=node_states)
+                     node_states=node_states, symbol_states=symbol_states)
     required_graph_nodes = {n["id"] for n in default_topology()["nodes"]
                             if n["role"] in ("alpha", "gate")}
     failed_nodes = sorted(n for n, state in node_states.items()
@@ -272,7 +289,16 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     candidates.sort(key=lambda c: c.final_score, reverse=True)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:
+        if c.expected_return <= 0:
+            c.risk_flags.append("nonpositive_after_cost_expected_return")
         store.record_candidate(c, cycle_id)
+    rejected_edge = [c.symbol for c in candidates if c.expected_return <= 0]
+    if rejected_edge:
+        store.audit("candidates_rejected_nonpositive_edge", {
+            "symbols": rejected_edge,
+            "reason": "post-forecast expected return must remain positive after costs",
+        }, cycle_id)
+    candidates = [c for c in candidates if c.expected_return > 0]
 
     st("sizing", f"{len(candidates)} candidates → position sizing")
     account = broker.get_account()             # refresh after exits

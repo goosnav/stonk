@@ -25,6 +25,9 @@ class SignalNode(ABC):
         self.base_weight = float(node_cfg.get("weight", 0.0))
         self.status = node_cfg.get("status", "experimental")
         self.degraded_reason: str | None = None   # set when data source failed
+        # Per-symbol truth used by scoring/graph APIs. A missing event can mean
+        # verified neutral or unavailable data; callers must not guess.
+        self.symbol_states: dict[str, str] = {}
 
     @abstractmethod
     def compute(self, ctx: MarketContext) -> list[SignalEvent]:

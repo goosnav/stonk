@@ -20,8 +20,14 @@ class Node(SignalNode):
         preds, meta = neural.predict_today(ctx.cfg, ctx.store, ctx)
         if not preds:
             self.degraded_reason = meta.get("silent")
+            for symbol in ctx.universe:
+                if not symbol.startswith("^"):
+                    self.symbol_states[symbol] = "unavailable"
             return []
         events = []
+        for symbol in ctx.universe:
+            if not symbol.startswith("^"):
+                self.symbol_states[symbol] = "verified_neutral"
         for sym, forecast in preds.items():
             view = forecast.get(str(self.horizon_days)) or forecast.get("21")
             if not view:
@@ -47,4 +53,5 @@ class Node(SignalNode):
                           f"ckpt {meta.get('checkpoint_age_days')}d old"],
                 data_as_of=datetime.strptime(ctx.as_of, "%Y-%m-%d"),
                 node_id=self.id, node_version=self.version))
+            self.symbol_states[sym] = "running"
         return events

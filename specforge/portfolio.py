@@ -35,13 +35,16 @@ def rebalance_plan(candidates: list[TradeCandidate], account: AccountState,
     deploy = min(float(cfg.get("risk", "max_account_deployment", default=.70)),
                  1 - float(cfg.get("risk", "min_cash_reserve", default=.30)))
     cap = float(cfg.get("risk", "max_single_equity_position", default=.08))
-    ranked = [c for c in candidates if c.side == "buy"][:max_positions]
+    # Defense in depth: a score cannot fund a trade when its calibrated return
+    # estimate is non-positive after modeled costs.
+    ranked = [c for c in candidates if c.side == "buy" and c.expected_return > 0][
+        :max_positions]
     raw = {}
     for c in ranked:
         atr = ctx.atr_pct(c.symbol) or .03
         scenario = ((ctx.store.kv_get("research_scenarios") or {}).get("candidates") or {}).get(c.symbol, {})
         scale = max(0.0, float(scenario.get("recommended_scale", 1)))
-        raw[c.symbol] = max(.001, c.final_score * max(.001, c.expected_return) / atr) * scale
+        raw[c.symbol] = max(0.0, c.final_score * c.expected_return / atr) * scale
     total = sum(raw.values()) or 1.0
     weights = {s: min(cap, deploy * v / total) for s, v in raw.items()}
     # Redistribute unused capped weight without ever exceeding the cap.
@@ -52,6 +55,13 @@ def rebalance_plan(candidates: list[TradeCandidate], account: AccountState,
         for s in weights:
             if weights[s] < cap:
                 weights[s] += min(cap - weights[s], missing * (cap - weights[s]) / room)
+    # A dossierless probe is exactly 25% of the target the full model would
+    # otherwise assign. Freed capacity remains cash; normalization must not
+    # inflate the probe back to a normal position.
+    by_candidate = {c.symbol: c for c in ranked}
+    weights = {symbol: weight * max(0.0, min(1.0,
+               float(by_candidate[symbol].size_multiplier)))
+               for symbol, weight in weights.items()}
 
     by_symbol = {c.symbol: c for c in candidates}
     outside = ctx.store.kv_get("rebalance_outside_counts", {}) or {}
@@ -79,7 +89,11 @@ def rebalance_plan(candidates: list[TradeCandidate], account: AccountState,
                for s in held_symbols} if ranked else {s: int(outside.get(s, 0))
                                                        for s in held_symbols}
     ctx.store.kv_set("rebalance_outside_counts", outside)
-    top_unheld = max((c.final_score for c in ranked if c.symbol not in held_symbols), default=0.0)
+    # Probes may spend existing cash but never justify selling a holding to
+    # fund an evidence-incomplete idea.
+    top_unheld = max((c.final_score for c in ranked
+                      if c.symbol not in held_symbols and c.entry_mode == "normal"),
+                     default=0.0)
     max_turnover = account.equity * float(cfg.get(
         "risk", "max_rebalance_turnover_per_cycle", default=.30))
     sells, deferred_sells, turnover = [], [], 0.0
@@ -98,7 +112,8 @@ def rebalance_plan(candidates: list[TradeCandidate], account: AccountState,
             from .ensemble import ETF_SYMBOLS
             if p.symbol not in ETF_SYMBOLS:
                 from .evidence import latest_dossier
-                dossier = latest_dossier(ctx.store, p.symbol, ctx.as_of)
+                dossier = latest_dossier(ctx.store, p.symbol, ctx.as_of,
+                                          ctx.as_of if getattr(ctx, "historical", False) else None)
                 if not dossier or dossier.get("status") != "ready":
                     deferred_sells.append({
                         "symbol": p.symbol,

@@ -118,14 +118,14 @@ nodes:
   # status: experimental | probation | production | disabled
   momentum:        {enabled: true,  weight: 0.30, status: production,  horizon_days: 20}
   sector_rotation: {enabled: true,  weight: 0.20, status: production,  horizon_days: 20}
-  # reversal defaulted OFF: flat expectancy across two independent 10y
-  # backtests (dev/DECISIONS.md D18) — re-enable only if paper data disagrees
-  reversal:        {enabled: false, weight: 0.10, status: experimental, horizon_days: 5}
+  # Automated learning may deemphasize these analyses to their configured
+  # floor. Only a human action in the toggle panel may turn one off entirely.
+  reversal:        {enabled: true,  weight: 0.10, status: experimental, horizon_days: 5}
   earnings_drift:  {enabled: true,  weight: 0.25, status: probation,   horizon_days: 20}
   quality_value:   {enabled: true,  role: filter, status: production}
   news_sentiment:  {enabled: false, weight: 0.05, status: experimental, horizon_days: 5, ai: true, max_symbols_per_cycle: 12}
-  congress_trades: {enabled: false, weight: 0.05, status: experimental, horizon_days: 60}
-  insider:         {enabled: false, weight: 0.05, status: experimental, horizon_days: 40}
+  congress_trades: {enabled: true,  weight: 0.05, status: experimental, horizon_days: 60}
+  insider:         {enabled: true,  weight: 0.05, status: experimental, horizon_days: 40}
   options_vol:     {enabled: false, weight: 0.05, status: experimental, horizon_days: 30}
   # deterministic reader of the ACTIVE short-term hypothesis (V4/D34); the AI
   # generation step is separate + post-close. Needs hypothesis.enabled too.
@@ -152,9 +152,11 @@ ensemble:
   conflict_dispersion_penalty: 0.5 # score dispersion across nodes shrinks conviction
   weight_learning:                 # self-improvement bounds (governor enforces)
     enabled: true
-    min_multiplier: 0.3
-    max_multiplier: 2.0
-    min_trades_before_update: 20
+    min_multiplier: 0.25           # compatibility alias; per-status floors win
+    production_floor: 0.50         # automation never zeros an enabled analysis
+    experimental_floor: 0.25
+    max_multiplier: 1.50
+    min_trades_before_update: 50
     shrinkage: 0.7                 # Bayesian shrink toward zero edge
     regime_min_n: 30               # trades per (node, regime) cell before a regime multiplier applies
 
@@ -163,6 +165,13 @@ ensemble:
 evidence:
   company_families: {business: 0.30, catalyst: 0.20, quality: 0.15, context: 0.15, price: 0.20}
   etf_families: {context: 0.50, price: 0.50}
+  node_priors:
+    business: {business_fundamentals: 1.0}
+    catalyst: {company_catalyst: 0.50, earnings_drift: 0.25, news_sentiment: 0.10, insider: 0.075, congress_trades: 0.075}
+    quality: {quality_value: 1.0}
+    context: {sector_rotation: 0.45, macro_regime: 0.45, hypothesis: 0.10}
+    price: {momentum: 0.40, reversal: 0.20, gap: 0.15, vol_contraction: 0.25}
+  dossierless_probe_min_score: 0.25
   quality_node_weight: 1.0
 
 # Learned connections between the auditable specialist equations. The graph
@@ -171,6 +180,8 @@ analog_graph:
   enabled: true
   live_blend: 0.50               # automatic ramp uses 10% → 25% → this ceiling
   max_topology_trials_per_snapshot: 24
+  # Soft-prune redundant connections only. An enabled specialist always keeps
+  # a nonzero path; only the human node toggle can eliminate an analysis type.
   prune_contribution_pct: 0.01
   shadow_sessions: 30
 

@@ -42,7 +42,11 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
                      prices: dict[str, float]) -> None:
     from .execution import score_bucket   # local import avoids cycle
     for c in candidates:
-        analogs = store.analog_returns(score_bucket(c.final_score), c.regime)
+        analogs = store.analog_returns(
+            score_bucket(c.final_score), c.regime,
+            evidence_version=c.evidence_version,
+            horizon_days=c.horizon_days,
+            asset_type=c.asset_type)
         if len(analogs) >= MIN_ANALOGS:
             mean, lo, hi = _bootstrap_ci(analogs)
             # shrink ensemble estimate toward the measured analog mean

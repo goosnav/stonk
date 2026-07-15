@@ -6,10 +6,13 @@
 #   ./scripts/restart_live.sh          # guarded restart
 #   ./scripts/restart_live.sh --force  # skip the market-hours guard
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 
 PORT=8420
 mkdir -p logs
+touch logs/runtime-live.log
+chmod 600 logs/runtime-live.log
 
 if [ "${1:-}" != "--force" ]; then
   # ponytail: coarse guard — weekday 09:30-16:30 ET blocks, holidays not

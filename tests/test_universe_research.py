@@ -170,6 +170,8 @@ def test_discovery_persists_exactly_25_without_ai(cfg, store):
     result = discover_opportunities(cfg, store)
     assert result["status"] == "completed" and len(result["shortlist"]) == 25
     assert len(symbols(store, "shortlist")) == 25
+    assert {item["sleeve"] for item in result["shortlist"]} >= {
+        "combined", "quality", "catalyst", "exploration"}
 
 
 def test_deep_research_fails_closed_when_ai_disabled(cfg, store):
@@ -182,6 +184,47 @@ def test_deep_research_job_runs_discovery_dependency_first(cfg, store):
     result = run_operator_job(cfg, store)
     assert result["kind"] == "discover"
     assert next(j for j in list_jobs(store) if j["id"] == deep["id"])["status"] == "queued"
+
+
+def test_deep_research_refreshes_a_stale_shortlist(cfg, store):
+    with store.db:
+        store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                         ("2026-01-01", "AAA", "shortlist", 1, "old", "{}"))
+        store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                         ("2026-01-02", "AAA", "research", 1, "new", "{}"))
+    store.kv_set("discovery_status", {"status": "completed", "as_of": "2026-01-01"})
+    deep = enqueue_job(store, "deep_research")
+    persisted = store.db.execute(
+        "SELECT depends_on_id FROM research_jobs WHERE id=?", (deep["id"],)).fetchone()
+    dependency = store.db.execute(
+        "SELECT kind FROM research_jobs WHERE id=?", (persisted["depends_on_id"],)).fetchone()
+    assert dependency["kind"] == "discover"
+
+
+def test_waiting_job_backs_off_without_consuming_attempts(cfg, store, monkeypatch):
+    job = enqueue_job(store, "train_global")
+    monkeypatch.setattr("specforge.research._market_open", lambda: False)
+    monkeypatch.setattr("specforge.research.train_global",
+                        lambda *_args, **_kwargs: {"status": "waiting", "reason": "more data"})
+    result = run_operator_job(cfg, store)
+    assert result["status"] == "waiting"
+    row = store.db.execute("SELECT attempts,next_retry_at FROM research_jobs WHERE id=?",
+                           (job["id"],)).fetchone()
+    assert row["attempts"] == 1 and row["next_retry_at"]
+    assert run_operator_job(cfg, store) is None
+    assert store.db.execute("SELECT attempts FROM research_jobs WHERE id=?",
+                            (job["id"],)).fetchone()["attempts"] == 1
+
+
+def test_holding_training_does_not_swallow_cancellation(cfg, store, monkeypatch):
+    from specforge.research import train_holdings
+    monkeypatch.setattr("specforge.research._compatible_global", lambda _store: True)
+    monkeypatch.setattr(store, "open_positions", lambda mode=None: [{"symbol": "AAA"}])
+    monkeypatch.setattr("specforge.neural.train_challenger",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            InterruptedError("cancelled")))
+    with __import__("pytest").raises(InterruptedError):
+        train_holdings(cfg, store)
 
 
 def test_latest_sec_filing_extracts_narrative_and_source_hash():
@@ -238,6 +281,7 @@ def test_holding_training_isolates_one_symbol_failure(cfg, store, monkeypatch):
     from specforge.research import train_holdings
     monkeypatch.setattr(store, "open_positions", lambda mode=None: [
         {"symbol": "AAA"}, {"symbol": "BBB"}])
+    monkeypatch.setattr("specforge.research._compatible_global", lambda _store: True)
 
     def train(_cfg, _store, symbol=None, **_kwargs):
         if symbol == "AAA":

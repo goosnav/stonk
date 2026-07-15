@@ -20,13 +20,29 @@ ETF_SYMBOLS = {"SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV",
 NODE_FAMILY = {
     "business_fundamentals": "business",
     "company_catalyst": "catalyst",
+    "news_sentiment": "catalyst",
+    "earnings_drift": "catalyst",
+    "insider": "catalyst",
+    "congress_trades": "catalyst",
     "quality_value": "quality",
     "sector_rotation": "context",
     "macro_regime": "context",
+    "hypothesis": "context",
     "momentum": "price",
     "reversal": "price",
     "gap": "price",
     "vol_contraction": "price",
+}
+DEFAULT_NODE_PRIORS = {
+    "business": {"business_fundamentals": 1.0},
+    "catalyst": {"company_catalyst": .50, "earnings_drift": .25,
+                 "news_sentiment": .10, "insider": .075,
+                 "congress_trades": .075},
+    "quality": {"quality_value": 1.0},
+    "context": {"sector_rotation": .45, "macro_regime": .45,
+                "hypothesis": .10},
+    "price": {"momentum": .40, "reversal": .20, "gap": .15,
+              "vol_contraction": .25},
 }
 
 DEFAULT_COMPANY_FAMILIES = {
@@ -59,8 +75,22 @@ def _detail(event: SignalEvent, family: str, node_weight: float) -> dict:
     }
 
 
+def _node_priors(cfg, family: str, is_etf: bool) -> dict[str, float]:
+    raw = (cfg.get("evidence", "node_priors", family, default=None) or
+           DEFAULT_NODE_PRIORS.get(family, {}))
+    # ETFs have no company evidence families; the caller's family map already
+    # filters them. Human-disabled nodes are the only nodes removed entirely.
+    enabled = cfg.get("nodes", default={}) or {}
+    values = {node: max(0.0, float(weight)) for node, weight in raw.items()
+              if enabled.get(node, {}).get("enabled", node == "macro_regime")}
+    total = sum(values.values())
+    return {node: value / total for node, value in values.items()} if total else {}
+
+
 def score(events: list[SignalEvent], regime: str, cfg, store: Store,
-          filters: list, ctx: MarketContext) -> list[TradeCandidate]:
+          filters: list, ctx: MarketContext,
+          node_states: dict[str, str] | None = None,
+          symbol_states: dict[str, dict[str, str]] | None = None) -> list[TradeCandidate]:
     by_symbol: dict[str, list[SignalEvent]] = {}
     for e in events:
         by_symbol.setdefault(e.symbol, []).append(e)
@@ -72,6 +102,7 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
 
     candidates = []
     snapshots = {}
+    node_states, symbol_states = node_states or {}, symbol_states or {}
     for symbol in sorted(set(by_symbol) | set(ctx.universe)):
         sigs = by_symbol.get(symbol, [])
         is_etf = symbol in ETF_SYMBOLS
@@ -82,55 +113,96 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
             family = NODE_FAMILY.get(s.node_id)
             if not family or family not in family_weights:
                 continue
-            w = s_node_weight(s.node_id, cfg, store, regime)
-            if w <= 0:
+            priors = _node_priors(cfg, family, is_etf)
+            prior = priors.get(s.node_id, 0.0)
+            if prior <= 0:
                 continue
+            multiplier = s_node_multiplier(s.node_id, cfg, store, regime)
+            w = prior * multiplier
             grouped.setdefault(family, []).append((s, w))
-            details.append(_detail(s, family, w))
+            detail = _detail(s, family, w)
+            detail.update(prior_weight=round(prior, 6),
+                          reliability_multiplier=round(multiplier, 6))
+            details.append(detail)
 
         # Deterministic SEC quality is a scored family input as well as the
         # existing guardrail. It is evaluated once here and is point-in-time.
         for f in filters:
             event = f.graph_signal(ctx, symbol) if hasattr(f, "graph_signal") else None
             if event and "quality" in family_weights:
-                w = max(.01, float(cfg.get("evidence", "quality_node_weight", default=1.0)))
+                priors = _node_priors(cfg, "quality", is_etf)
+                prior = priors.get("quality_value", 1.0)
+                multiplier = s_node_multiplier("quality_value", cfg, store, regime)
+                w = prior * multiplier
                 grouped.setdefault("quality", []).append((event, w))
-                details.append(_detail(event, "quality", w))
+                detail = _detail(event, "quality", w)
+                detail.update(prior_weight=round(prior, 6),
+                              reliability_multiplier=round(multiplier, 6))
+                details.append(detail)
 
         # Regime is always explicit evidence rather than an invisible global
         # switch. It shares the context family with sector-relative evidence.
         if "context" in family_weights:
             macro = REGIME_ACTIVATION.get(regime, 0.0)
+            macro_prior = _node_priors(cfg, "context", is_etf).get("macro_regime", .5)
+            macro_multiplier = s_node_multiplier("macro_regime", cfg, store, regime)
             details.append({"node": "macro_regime", "family": "context",
                             "direction": "long" if macro >= 0 else "avoid",
                             "magnitude": abs(macro), "confidence": 1.0,
-                            "signed_alpha": macro, "node_weight": 1.0,
+                            "signed_alpha": macro,
+                            "node_weight": round(macro_prior * macro_multiplier, 6),
+                            "prior_weight": round(macro_prior, 6),
+                            "reliability_multiplier": round(macro_multiplier, 6),
                             "data_as_of": ctx.as_of,
                             "evidence": [f"market regime {regime}"], "state": "running"})
-            grouped.setdefault("context", []).append((SignalEvent(
+            macro_event = SignalEvent(
                 symbol=symbol, direction="long" if macro >= 0 else "avoid",
                 score=abs(macro), confidence=1.0, horizon_days=21,
                 expected_return=0.0, expected_volatility=0.0,
                 downside_estimate=0.0, evidence=[f"market regime {regime}"],
                 data_as_of=__import__("datetime").datetime.strptime(ctx.as_of, "%Y-%m-%d"),
-                node_id="macro_regime"), 1.0))
+                node_id="macro_regime")
+            grouped.setdefault("context", []).append(
+                (macro_event, macro_prior * macro_multiplier))
 
         family_scores: dict[str, float] = {}
         expected_parts: list[tuple[float, float]] = []
+        coverage = 0.0
         for family, family_weight in family_weights.items():
             members = grouped.get(family, [])
+            priors = _node_priors(cfg, family, is_etf)
+            present_nodes = {event.node_id for event, _ in members}
+            available_nodes = set(present_nodes)
+            for node, prior in priors.items():
+                if node in present_nodes:
+                    continue
+                state = (symbol_states.get(node, {}).get(symbol) or
+                         node_states.get(node) or "unavailable")
+                if state == "neutral":
+                    state = "verified_neutral"
+                if state in ("running", "verified_neutral", "deemphasized"):
+                    available_nodes.add(node)
+                details.append({"node": node, "family": family, "state": state,
+                                "signed_alpha": 0.0, "prior_weight": round(prior, 6),
+                                "reliability_multiplier": round(
+                                    s_node_multiplier(node, cfg, store, regime), 6),
+                                "family_contribution": 0.0,
+                                "evidence": ["no directional event" if state ==
+                                             "verified_neutral" else "required data unavailable"]})
+            available_prior = sum(priors.get(node, 0.0) for node in available_nodes)
+            coverage += family_weight * min(1.0, available_prior)
             if not members:
-                details.append({"node": family, "family": family, "state": "unavailable",
-                                "signed_alpha": 0.0, "family_contribution": 0.0,
-                                "evidence": ["no current evidence"]})
                 continue
-            denom = sum(w for _, w in members) or 1.0
-            value = sum(signed_alpha(event) * w for event, w in members) / denom
+            # Priors are normalized across the complete enabled family, not
+            # across only the evidence that happened to be available. Missing
+            # AI/event evidence therefore cannot donate weight to momentum or
+            # any surviving singleton.
+            value = sum(signed_alpha(event) * w for event, w in members)
             family_scores[family] = value
             for event, w in members:
                 expected_parts.append((direction_sign(event.direction) *
                                        abs(event.expected_return),
-                                       family_weight * w * event.confidence / denom))
+                                       family_weight * w * event.confidence))
             for detail in details:
                 if detail.get("family") == family and detail.get("state") == "running":
                     detail["family_weight"] = family_weight
@@ -141,16 +213,24 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
                             "evidence": [f"{len(members)} evidence node(s)"]})
 
         raw = sum(family_weights[f] * value for f, value in family_scores.items())
-        coverage = sum(family_weights[f] for f in family_scores)
-
-        # conflict penalty: dispersion of per-node directional scores
-        per_node = [d["signed_alpha"] for d in details
-                    if d.get("state") == "running" and not d.get("node", "").startswith("family:")]
-        dispersion = statistics.pstdev(per_node) if len(per_node) > 1 else 0.0
-        conflict = max(0.0, 1.0 - disp_pen * dispersion)
-        production_score = raw * conflict
+        # Conflict is opposing weighted evidence, not unequal magnitude among
+        # evidence that agrees. +1.0 and +0.1 are confirmation, not conflict.
+        node_contributions = [family_weights[family] * signed_alpha(event) * weight
+                              for family, members in grouped.items()
+                              for event, weight in members]
+        positive = sum(v for v in node_contributions if v > 0)
+        negative = -sum(v for v in node_contributions if v < 0)
+        opposing_mass = (2 * min(positive, negative) / (positive + negative)
+                          if positive + negative else 0.0)
+        conflict = max(0.0, 1.0 - disp_pen * opposing_mass)
+        # Conflicts reduce positive conviction. They must never make negative
+        # evidence less negative and accidentally rescue an avoid case.
+        production_score = raw * conflict if raw > 0 else raw
         # horizon/expectation: confidence-weighted average of contributing nodes
-        longs = [s for s in sigs if s.direction in ("long", "long_call")]
+        contributing_ids = {event.node_id for members in grouped.values()
+                            for event, _ in members}
+        longs = [s for s in sigs if s.node_id in contributing_ids and
+                 s.direction in ("long", "long_call")]
         if raw <= 0 or not longs:
             details.append({"node": "strategy_context", "family": "strategy",
                             "state": "blocked", "signed_alpha": 0.0,
@@ -201,6 +281,29 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
         if any(not f.passes(ctx, symbol) for f in filters):
             continue
 
+        entry_mode, size_multiplier, entry_reason = "normal", 1.0, None
+        if not is_etf:
+            from .evidence import latest_dossier
+            dossier = latest_dossier(store, symbol, ctx.as_of,
+                                      ctx.as_of if getattr(ctx, "historical", False) else None)
+            if not dossier or dossier.get("status") != "ready":
+                probe_min = float(cfg.get("evidence", "dossierless_probe_min_score",
+                                          default=.25))
+                required = all(name in family_scores for name in
+                               ("quality", "context", "price"))
+                if production_score < probe_min or not required or exp_gross - friction <= 0:
+                    continue
+                entry_mode, size_multiplier = "probe", .25
+                entry_reason = "PROBE — DOSSIER PENDING"
+                if not ctx.offline:
+                    try:
+                        from .research import enqueue_job
+                        enqueue_job(store, "deep_research",
+                                    {"reason": "probe dossier", "symbol": symbol},
+                                    priority=5, requested_by="autonomous")
+                    except Exception:
+                        pass                    # scoring never fails over queue telemetry
+
         vol = statistics.median([s.expected_volatility for s in longs]) if longs else 0.05
         candidates.append(TradeCandidate(
             id=new_id(), symbol=symbol, asset_type="equity", side="buy",
@@ -223,6 +326,8 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
             production_score=round(production_score, 6),
             strategy_contribution=round(strategy_value, 6),
             strategy_mandate_id=strategy.get("mandate_id"),
+            entry_mode=entry_mode, size_multiplier=size_multiplier,
+            entry_mode_reason=entry_reason,
         ))
     candidates.sort(key=lambda c: c.final_score, reverse=True)
     store.kv_set("evidence_last_scores", {"schema": "evidence.v2", "as_of": ctx.as_of,
@@ -232,10 +337,30 @@ def score(events: list[SignalEvent], regime: str, cfg, store: Store,
 
 def s_node_weight(node_id: str, cfg, store: Store, regime: str | None = None) -> float:
     base = float(cfg.get("nodes", node_id, "weight", default=0.0) or 0.0)
+    return base * s_node_multiplier(node_id, cfg, store, regime)
+
+
+def s_node_multiplier(node_id: str, cfg, store: Store,
+                      regime: str | None = None) -> float:
+    """Learned reliability with a non-zero floor for every enabled analysis.
+
+    Only an operator toggle removes a node in `_node_priors`. Attribution may
+    soften a node, but cannot turn a configured analysis into dead code.
+    """
+    status = str(cfg.get("nodes", node_id, "status", default="production"))
+    floor = float(cfg.get("ensemble", "weight_learning",
+                          "experimental_floor" if status == "experimental"
+                          else "production_floor",
+                          default=.25 if status == "experimental" else .50))
+    ceiling = float(cfg.get("ensemble", "weight_learning", "max_multiplier",
+                            default=1.5))
     # regime-conditioned multiplier replaces the global one when attribution
     # has a meaningful sample for this (node, regime) cell — see attribution.py
+    value = None
     if regime:
         rm = (store.kv_get("regime_multipliers", {}) or {}).get(node_id, {})
         if regime in rm:
-            return base * rm[regime]
-    return base * store.get_weight_multiplier(node_id)
+            value = float(rm[regime])
+    if value is None:
+        value = float(store.get_weight_multiplier(node_id))
+    return max(floor, min(ceiling, value))

@@ -2,9 +2,9 @@
 
 Runs post-close. For each node: rolling scorecard from closed trades it
 contributed to, then a Bayesian-shrunk weight multiplier update bounded to
-[min_multiplier, max_multiplier] (config ensemble.weight_learning). The system
-may ONLY move multipliers and auto-disable clearly failing nodes; promotions
-and anything else on the §12.2 list require a human.
+non-zero, status-specific floors and a maximum (config
+ensemble.weight_learning).  Automated learning may deemphasize an analysis,
+but only a human change in the toggle panel may remove it from the model.
 
 Multiplier math (deliberately simple, upgrade path = regime-conditioned
 multipliers once per-regime samples are meaningful):
@@ -22,9 +22,6 @@ from datetime import datetime
 
 from .store import Store
 
-MIN_TRADES_TO_DISABLE = 30
-
-
 def _sd(v: list[float]) -> float:
     m = sum(v) / len(v)
     return math.sqrt(sum((r - m) ** 2 for r in v) / max(1, len(v) - 1)) or 1e-9
@@ -32,21 +29,49 @@ def _sd(v: list[float]) -> float:
 
 def node_scorecard(store: Store, node_id: str,
                    sources: tuple = ("paper", "live")) -> dict:
-    trades = [t for t in store.trades()
-              if t["source"] in sources and node_id in json.loads(t["nodes"] or "[]")]
-    if not trades:
-        return {"node_id": node_id, "n": 0}
-    rets = [t["ret"] for t in trades]
+    observations = []
+    for trade in store.trades():
+        if trade["source"] not in sources or not trade.get("entry_candidate_id"):
+            continue
+        row = store.db.execute("SELECT payload FROM candidates WHERE id=?",
+                               (trade["entry_candidate_id"],)).fetchone()
+        if not row:
+            continue
+        try:
+            candidate = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        detail = next((item for item in candidate.get("evidence_details", [])
+                       if item.get("node") == node_id and
+                       item.get("state") == "running"), None)
+        if not detail:
+            continue
+        signed = float(detail.get("signed_alpha", 0) or 0)
+        if not signed:
+            continue
+        # Direction-aware marginal correctness: evidence opposing a losing
+        # long was useful and must not be punished for the trade it warned
+        # against. This is a conservative sign-aligned proxy until enough
+        # exact leave-one-node-out portfolio replays accumulate.
+        aligned_return = float(trade["ret"]) * signed
+        observations.append((trade, aligned_return, signed))
+    if not observations:
+        return {"node_id": node_id, "n": 0,
+                "attribution_basis": "signed_entry_contribution_only"}
+    trades = [item[0] for item in observations]
+    rets = [item[1] for item in observations]
     n = len(rets)
     wins = [r for r in rets if r > 0]
     mean = sum(rets) / n
     sd = _sd(rets)
     gross_loss = -sum(r for r in rets if r <= 0)
     by_regime: dict[str, list[float]] = {}
-    for t in trades:
-        by_regime.setdefault(t["regime"] or "unknown", []).append(t["ret"])
+    for t, aligned, _signed in observations:
+        by_regime.setdefault(t["regime"] or "unknown", []).append(aligned)
     return {
         "node_id": node_id, "n": n,
+        "attribution_basis": "signed_entry_contribution_only",
+        "mean_entry_signed_alpha": round(sum(item[2] for item in observations) / n, 5),
         "expectancy": round(mean, 5),
         "hit_rate": round(len(wins) / n, 3),
         "avg_win": round(sum(wins) / len(wins), 4) if wins else None,
@@ -64,7 +89,6 @@ def update_weights(cfg, store: Store, log=print) -> dict:
     wl = cfg.get("ensemble", "weight_learning", default={}) or {}
     if not wl.get("enabled", True):
         return {}
-    lo = wl.get("min_multiplier", 0.3)
     hi = wl.get("max_multiplier", 2.0)
     min_n = wl.get("min_trades_before_update", 20)
     shrink_n = max(1, int(min_n * (wl.get("shrinkage", 0.7) / (1 - wl.get("shrinkage", 0.7)))))
@@ -73,6 +97,15 @@ def update_weights(cfg, store: Store, log=print) -> dict:
     for node_id, ncfg in (cfg.get("nodes", default={}) or {}).items():
         if ncfg.get("role") in ("filter", "gate"):
             continue
+        status = str(ncfg.get("status", "experimental"))
+        lo = float(wl.get("experimental_floor", wl.get("min_multiplier", .25))
+                   if status == "experimental" else
+                   wl.get("production_floor", wl.get("min_multiplier", .50)))
+        if lo <= 0:
+            # Configuration mistakes must not create a hidden automated off
+            # switch. A literal zero is reserved for the human `enabled`
+            # toggle and is enforced again at score time.
+            lo = .25 if status == "experimental" else .50
         card = node_scorecard(store, node_id)
         store.db.execute("INSERT OR REPLACE INTO node_stats VALUES(?,?,?)",
                          (node_id, datetime.now().date().isoformat(),
@@ -105,15 +138,7 @@ def update_weights(cfg, store: Store, log=print) -> dict:
         elif node_id in all_rm:            # sample fell below threshold (e.g. window change)
             del all_rm[node_id]
             store.kv_set("regime_multipliers", all_rm)
-        action = "updated"
-        # auto-disable is allowed (§12.1) when the live evidence is damning
-        if n >= MIN_TRADES_TO_DISABLE and card["expectancy"] < 0 and edge < -0.1:
-            store.kv_set(f"node_auto_disabled_{node_id}",
-                         {"at": datetime.now().isoformat(), "card": card})
-            ov = store.kv_get("config_overrides", {}) or {}
-            ov.setdefault("nodes", {}).setdefault(node_id, {})["enabled"] = False
-            store.kv_set("config_overrides", ov)
-            action = "AUTO-DISABLED (negative expectancy on meaningful sample)"
+        action = "deemphasized" if mult <= lo + 1e-9 else "updated"
         results[node_id] = {"multiplier": mult, "action": action}
         log(f"attribution: {node_id} n={n} expectancy={card['expectancy']} "
             f"→ multiplier {mult:.2f} ({action})")

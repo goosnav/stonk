@@ -92,8 +92,9 @@ either. No ORM — schema in `store.py`, plain SQL.
 - Nightly: recompute node scorecards (hit rate, expectancy, IC, drawdown, by-regime).
 - Weight update: `w_new = clamp(base_w × shrunk_expectancy_multiplier, bounds)`,
   shrinkage toward zero edge until `min_trades_before_update` reached.
-- Pruning: auto-disable on negative live expectancy with n≥30, node drawdown breach,
-  or cost > edge. Promotion (experimental→probation→production) requires human
+- Pruning: automatically deemphasize toward a status-specific nonzero floor on
+  negative live expectancy or cost exceeding edge; only the operator toggle
+  can fully disable a node. Promotion (experimental→probation→production) requires human
   approval via GUI; the system only *proposes*.
 
 ## Dual-network research plane (D41)

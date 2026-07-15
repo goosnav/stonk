@@ -43,7 +43,7 @@ Also: **`business-suite/trading-algorithm-lab` is a shallow overlap — fold any
 - Secrets: move tokens to encrypted storage with a documented first-run flow.
 
 ### Sprint 3 — Learning loop goes live (2 weeks, gated on ~1 month of trade data)
-- Sprint C items from dev/ROADMAP.md: scorecard-driven weight updates on real fills, auto-disable of negative nodes, human-gated promotions exercised end-to-end.
+- Sprint C items from dev/ROADMAP.md: scorecard-driven, nonzero-floor weight updates on real fills and human-only node disable/promotion exercised end-to-end.
 - Walk-forward re-validation cron + decay alerts.
 - Monthly tear-sheet export.
 

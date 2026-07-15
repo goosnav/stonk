@@ -56,4 +56,5 @@ def store(cfg):
     s.upsert_bars("SPY", synth_bars(daily_drift=0.0008), "test")
     vix = [{**r, "close": 15.0, "open": 15, "high": 16, "low": 14} for r in synth_bars()]
     s.upsert_bars("^VIX", vix, "test")
-    return s
+    yield s
+    s.close()

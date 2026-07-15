@@ -18,6 +18,8 @@ from .models import SignalEvent, new_id, signed_alpha
 FORBIDDEN = {"risk_governor", "execution", "broker", "portfolio"}
 MAX_LAYER = 4
 MAX_FAN_IN = 8
+MIN_SPECIALIST_EDGE_WEIGHT = 0.02
+MIN_SPECIALIST_BASE_SCALE = 0.05
 
 
 def default_topology() -> dict:
@@ -34,7 +36,7 @@ def default_topology() -> dict:
         *(dict(id=n, layer=2, role="alpha", activation="tanh", base_scale=1.0,
                bias=0.0) for n in ("sector_rotation", "gap", "company_catalyst",
                                    "news_sentiment", "congress_trades", "insider",
-                                   "strategy_context")),
+                                   "hypothesis", "strategy_context")),
         dict(id="macro_regime", layer=2, role="gate", activation="sigmoid",
              base_scale=1.0, bias=0.0),
         # learned interaction and output units
@@ -58,13 +60,13 @@ def default_topology() -> dict:
             "catalyst_confirmation", 0.30)
     connect(["business_fundamentals", "quality_value"],
             "fundamental_confirmation", 0.22)
-    connect(["sector_rotation", "macro_regime", "strategy_context"],
+    connect(["sector_rotation", "macro_regime", "hypothesis", "strategy_context"],
             "risk_adjusted_conviction", 0.20)
     connect(["trend_confirmation", "catalyst_confirmation",
              "risk_adjusted_conviction"], "output_5d", 0.33)
     connect(["trend_confirmation", "fundamental_confirmation",
              "risk_adjusted_conviction"], "output_21d", 0.33)
-    out = {"schema": "stonk.graph.v4", "nodes": list(nodes), "edges": edges,
+    out = {"schema": "stonk.graph.v5", "nodes": list(nodes), "edges": edges,
            "excluded_experimental": []}
     validate(out)
     return out
@@ -98,13 +100,29 @@ def validate(topology: dict) -> None:
                    {"tanh", "leaky_relu"})
         if n.get("activation") not in allowed:
             raise ValueError(f"activation incompatible with {n['role']}")
+    outputs = {n["id"] for n in nodes if n["role"] == "output"}
+    for node in (n for n in nodes if n["role"] in ("alpha", "gate")):
+        seen, frontier, found = set(), [node["id"]], False
+        while frontier:
+            current = frontier.pop()
+            if current in outputs:
+                found = True; break
+            if current in seen:
+                continue
+            seen.add(current)
+            frontier.extend(e["target"] for e in edges
+                            if e["source"] == current and not e.get("pruned"))
+        if not found:
+            raise ValueError(f"analysis node {node['id']} has no forecast path")
 
 
 def _activate(kind: str, value: float) -> float:
     if kind == "tanh":
         return math.tanh(value)
     if kind == "sigmoid":
-        return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, value))))
+        # Signed gate: unavailable/neutral input (0) must remain neutral (0),
+        # not become a bullish +0.5 vote.  Negative gate evidence is retained.
+        return 2.0 / (1.0 + math.exp(-max(-30.0, min(30.0, value)))) - 1.0
     if kind == "leaky_relu":
         return value if value >= 0 else 0.05 * value
     return value
@@ -192,7 +210,31 @@ def mutate(topology: dict, seed: int = 0) -> dict:
     nodes, edges = out["nodes"], out["edges"]
     action = rng.choice(("remove", "add", "move", "activation"))
     if action == "remove" and edges:
-        edges.pop(rng.randrange(len(edges)))
+        # Structure search may remove redundancy, never an analysis type's
+        # last route to the forecast. Only the human node toggle owns complete
+        # elimination.
+        specialists = {node["id"] for node in nodes
+                       if node["role"] in ("alpha", "gate")}
+        outputs = {node["id"] for node in nodes if node["role"] == "output"}
+        def reaches_output(source, candidate_edges):
+            seen, frontier = set(), [source]
+            while frontier:
+                current = frontier.pop()
+                if current in outputs:
+                    return True
+                if current in seen:
+                    continue
+                seen.add(current)
+                frontier.extend(e["target"] for e in candidate_edges
+                                if e["source"] == current)
+            return False
+        removable = []
+        for index in range(len(edges)):
+            candidate = edges[:index] + edges[index + 1:]
+            if all(reaches_output(source, candidate) for source in specialists):
+                removable.append(index)
+        if removable:
+            edges.pop(rng.choice(removable))
     elif action == "add":
         existing = {(e["source"], e["target"]) for e in edges}
         pairs = [(a["id"], b["id"]) for a in nodes for b in nodes
@@ -265,7 +307,7 @@ def fit_weights(topology: dict, bases: list[dict[str, float]], targets,
                 if e["target"] == n["id"] and not e.get("pruned"):
                     z = z + edge_w[ei] * acts[e["source"]]
             if n["activation"] == "tanh": z = torch.tanh(z)
-            elif n["activation"] == "sigmoid": z = torch.sigmoid(z)
+            elif n["activation"] == "sigmoid": z = 2.0 * torch.sigmoid(z) - 1.0
             elif n["activation"] == "leaky_relu": z = torch.nn.functional.leaky_relu(z, .05)
             acts[n["id"]] = z
         return torch.stack((acts["output_5d"], acts["output_21d"]), dim=1)
@@ -288,19 +330,99 @@ def fit_weights(topology: dict, bases: list[dict[str, float]], targets,
     if best:
         with torch.no_grad():
             for p, v in zip(params, best): p.copy_(v)
+    original_weights = [float(e.get("weight", 0.0)) for e in topology["edges"]]
     for i, e in enumerate(out["edges"]): e["weight"] = round(float(edge_w[i].detach()), 6)
     for i, n in enumerate(nodes):
         n["base_scale"] = round(float(scales[i].detach()), 6)
         n["bias"] = round(float(biases[i].detach()), 6)
-    # Contribution-normalized pruning within each target; signed weak edges
-    # disappear but remain in the topology so mutation can regrow them.
+        if n["role"] in ("alpha", "gate") and abs(n["base_scale"]) < \
+                MIN_SPECIALIST_BASE_SCALE:
+            original_node = next(item for item in topology["nodes"]
+                                 if item["id"] == n["id"])
+            original = float(original_node.get("base_scale", 1.0))
+            n["base_scale"] = round(math.copysign(
+                MIN_SPECIALIST_BASE_SCALE, n["base_scale"] or original or 1.0), 6)
+            n["deemphasized"] = True
+    # Contribution-normalized soft pruning.  Interaction redundancy may be
+    # pruned, but an enabled specialist is never allowed to lose its last path
+    # through the model.  That final edge retains a small signed floor and is
+    # labelled `deemphasized`; only the operator's node toggle can eliminate an
+    # analysis type.
     for target in {e["target"] for e in out["edges"]}:
         group = [e for e in out["edges"] if e["target"] == target]
         denom = sum(abs(e["weight"]) for e in group) or 1.0
-        for e in group: e["pruned"] = abs(e["weight"]) / denom < prune_pct
+        for e in group:
+            e["pruned"] = abs(e["weight"]) / denom < prune_pct
+            e["deemphasized"] = bool(e["pruned"])
+    node_by_id = {n["id"]: n for n in nodes}
+    for source in {e["source"] for e in out["edges"]}:
+        if node_by_id[source]["role"] not in ("alpha", "gate"):
+            continue
+        outgoing = [e for e in out["edges"] if e["source"] == source]
+        if any(not e.get("pruned") for e in outgoing):
+            continue
+        keep = max(outgoing, key=lambda e: abs(e["weight"]))
+        idx = out["edges"].index(keep)
+        sign_source = keep["weight"] if keep["weight"] else original_weights[idx]
+        keep["weight"] = round(math.copysign(
+            max(abs(keep["weight"]), MIN_SPECIALIST_EDGE_WEIGHT),
+            sign_source or 1.0), 6)
+        keep["pruned"] = False
+        keep["deemphasized"] = True
+    outputs = {n["id"] for n in nodes if n["role"] == "output"}
+    def active_path(source):
+        frontier, seen = [source], set()
+        while frontier:
+            current = frontier.pop()
+            if current in outputs:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            frontier.extend(e["target"] for e in out["edges"]
+                            if e["source"] == current and not e.get("pruned"))
+        return False
+    def structural_path(source):
+        frontier = [(source, [])]
+        while frontier:
+            current, path = frontier.pop()
+            if current in outputs:
+                return path
+            for edge in out["edges"]:
+                if edge["source"] == current and edge not in path:
+                    frontier.append((edge["target"], path + [edge]))
+        return []
+    for node in (n for n in nodes if n["role"] in ("alpha", "gate")):
+        if active_path(node["id"]):
+            continue
+        for edge in structural_path(node["id"]):
+            idx = out["edges"].index(edge)
+            sign_source = edge["weight"] if edge["weight"] else original_weights[idx]
+            edge["weight"] = round(math.copysign(
+                max(abs(edge["weight"]), MIN_SPECIALIST_EDGE_WEIGHT),
+                sign_source or 1.0), 6)
+            edge["pruned"] = False
+            edge["deemphasized"] = True
+    def frozen_forward(inp):
+        """Inference from the exact finalized topology saved/deployed live."""
+        acts = {}
+        for idx, n in enumerate(nodes):
+            z = float(n["base_scale"]) * inp[:, idx] + float(n["bias"])
+            for e in out["edges"]:
+                if e["target"] == n["id"] and not e.get("pruned"):
+                    z = z + float(e["weight"]) * acts[e["source"]]
+            if n["activation"] == "tanh": z = torch.tanh(z)
+            elif n["activation"] == "sigmoid": z = 2.0 * torch.sigmoid(z) - 1.0
+            elif n["activation"] == "leaky_relu":
+                z = torch.nn.functional.leaky_relu(z, .05)
+            acts[n["id"]] = z
+        return torch.stack((acts["output_5d"], acts["output_21d"]), dim=1)
     with torch.no_grad():
-        validation_pred = forward(X[split1:split2]).numpy()
-        test = forward(X[split2:]).numpy()
+        validation_tensor = frozen_forward(X[split1:split2])
+        validation_pred = validation_tensor.numpy()
+        test = frozen_forward(X[split2:]).numpy()
+        finalized_validation_loss = float(torch.nn.functional.huber_loss(
+            validation_tensor, Y[split1:split2], delta=.05))
     truth = Y[split2:].numpy()
     validation_truth = Y[split1:split2].numpy()
     corrs = [_safe_corr(test[:, i], truth[:, i]) for i in range(2)]
@@ -311,11 +433,20 @@ def fit_weights(topology: dict, bases: list[dict[str, float]], targets,
         coverage[f"coverage_{h}d"] = round(float(np.mean(
             (truth[:, i] >= test[:, i] + lo) &
             (truth[:, i] <= test[:, i] + hi))), 3) if len(residual) else 0.0
-    metrics = {"validation_huber": round(best_loss, 6),
+    # Exact parity guard between the vectorized evaluator used for metrics and
+    # the scalar evaluator used in live graph activation.
+    parity = 0.0
+    for row_index in range(min(16, len(bases))):
+        live = evaluate(out, bases[row_index])["outputs"]
+        frozen = frozen_forward(X[row_index:row_index + 1]).detach().numpy()[0]
+        parity = max(parity, abs(live[5] - float(frozen[0])),
+                     abs(live[21] - float(frozen[1])))
+    metrics = {"validation_huber": round(finalized_validation_loss, 6),
                "test_ic_5d": round(corrs[0], 4), "test_ic_21d": round(corrs[1], 4),
                "n_train": split1, "n_validation": split2 - split1,
                "n_test": len(X) - split2,
                "pruned_edges": sum(bool(e.get("pruned")) for e in out["edges"]),
+               "live_evaluator_parity_max_abs": round(parity, 9),
                **coverage}
     validate(out)
     return out, metrics
@@ -380,6 +511,20 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
             cutoff = np.quantile(pred[:, i], .9)
             extra[f"net_alpha_{h}d"] = round(
                 float(truth[pred[:, i] >= cutoff, i].mean() - .0016), 5)
+        daily = []
+        for day in np.unique(fold_dates):
+            mask = fold_dates == day
+            if mask.sum() < 8:
+                continue
+            cutoff = np.quantile(pred[mask, 1], .9)
+            daily.append(float(truth[mask, 1][pred[mask, 1] >= cutoff].mean() - .0016))
+        if daily:
+            curve = np.cumprod(1 + np.asarray(daily))
+            drawdown = float(np.max(1 - curve / np.maximum.accumulate(curve)))
+            annualized = float(np.mean(daily) * 252 / 21)
+            sharpe = float(np.mean(daily) / (np.std(daily) + 1e-9) * np.sqrt(252 / 21))
+            extra.update(portfolio_utility=round(annualized - .5 * drawdown, 5),
+                         oos_sharpe=round(sharpe, 4), max_drawdown=round(drawdown, 5))
         fold_metrics.append({"fold": index + 1, "train": len(train_idx),
                              "train_end": train_last, "test_start": test_first,
                              "embargo": embargo, "embargo_unit": "sessions",
@@ -394,20 +539,28 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
                    median_fold_ic_5d=round(float(np.median(
                        [f["ic_5d"] for f in fold_metrics])), 4),
                    median_fold_ic_21d=round(float(np.median(
-                       [f["ic_21d"] for f in fold_metrics])), 4))
+                       [f["ic_21d"] for f in fold_metrics])), 4),
+                   portfolio_utility=round(float(np.median(
+                       [f.get("portfolio_utility", -1) for f in fold_metrics])), 5),
+                   oos_sharpe=round(float(np.median(
+                       [f.get("oos_sharpe", -99) for f in fold_metrics])), 4))
     return learned, metrics
 
 
 def blend_candidates(candidates, events, regime: str, cfg, store,
                      cycle_id: str | None = None,
-                     node_states: dict[str, str] | None = None) -> None:
+                     node_states: dict[str, str] | None = None,
+                     symbol_states: dict[str, dict[str, str]] | None = None) -> None:
     """Apply the validated graph as a capped score blend, in place."""
     champ = champion(store)
     blend = activation_state(cfg, store)["effective_blend"]
     if champ["status"] != "champion":
         blend = 0.0
     snapshots = {}
-    node_states = node_states or {}
+    node_states, symbol_states = node_states or {}, symbol_states or {}
+    enabled = {node_id for node_id, node_cfg in
+               (cfg.get("nodes", default={}) or {}).items()
+               if node_cfg.get("enabled")}
     by_symbol = sorted({e.symbol for e in events} | {c.symbol for c in candidates} |
                        set(cfg.get("universe", "symbols", default=[])))
     for symbol in by_symbol:
@@ -417,19 +570,29 @@ def blend_candidates(candidates, events, regime: str, cfg, store,
         bases["strategy_context"] = float(strategy.get("value", 0.0))
         snapshots[symbol] = evaluate(
             champ["topology"], bases)
-        snapshots[symbol]["node_states"] = {
-            n["id"]: (("running" if strategy.get("state") == "running" else "unavailable")
-                      if n["id"] == "strategy_context" else
-                      node_states.get(n["id"], "unavailable")
-                      if n["role"] in ("alpha", "gate") else "running")
-            for n in champ["topology"]["nodes"]}
+        snapshots[symbol]["node_states"] = {}
+        for n in champ["topology"]["nodes"]:
+            node_id = n["id"]
+            if n["role"] not in ("alpha", "gate"):
+                state = "running"
+            elif node_id == "strategy_context":
+                state = ("running" if strategy.get("state") == "running"
+                         else "verified_neutral")
+            elif node_id == "macro_regime":
+                state = "running"
+            elif node_id not in enabled:
+                state = "human_disabled"
+            else:
+                state = (symbol_states.get(node_id, {}).get(symbol) or
+                         node_states.get(node_id, "unavailable"))
+            snapshots[symbol]["node_states"][node_id] = state
         snapshots[symbol]["activation_complete"] = not any(
             state in ("unavailable", "blocked")
             for state in snapshots[symbol]["node_states"].values())
     for c in candidates:
         result = snapshots[c.symbol]
         graph_score = math.tanh(float(result["outputs"][21]))
-        if blend:
+        if blend and result["activation_complete"]:
             prior = c.final_score
             c.final_score = round((1 - blend) * prior + blend * graph_score, 4)
             c.learned_contribution = round(c.final_score - prior, 6)
@@ -475,6 +638,11 @@ def maybe_promote(cfg, store) -> dict:
         return {"action": "none"}
     from .neural import shadow_metrics
     sm, metrics = shadow_metrics(store, row["id"]), json.loads(row["metrics"] or "{}")
+    tcn = store.db.execute(
+        "SELECT id FROM model_runs WHERE kind='global_tcn' AND status='champion' "
+        "AND incompatibility_reason IS NULL ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    temporal_compatible = bool(tcn and metrics.get("temporal_model_id") == tcn["id"])
     hs = sm["horizons"]
     folds = metrics.get("folds") or []
     fold_gate = len(folds) >= 5 and \
@@ -490,10 +658,21 @@ def maybe_promote(cfg, store) -> dict:
         for h in (5, 21))
     coverage = metrics.get("sample_coverage") or {}
     required = [n["id"] for n in default_topology()["nodes"]
-                if n["role"] in ("alpha", "gate") and n["id"] != "strategy_context"]
+                if n["role"] in ("alpha", "gate") and
+                (n["id"] == "macro_regime" or
+                 (n["id"] != "strategy_context" and
+                  cfg.get("nodes", n["id"], "enabled", default=False)))]
     coverage_passed = all(coverage.get(node, 0) >= (.9 if node == "macro_regime" else .01)
                           for node in required)
-    offline_passed = offline_passed and coverage_passed
+    current_row = store.db.execute(
+        "SELECT metrics FROM graph_versions WHERE status='champion' AND id<>? "
+        "ORDER BY created_at DESC LIMIT 1", (row["id"],)).fetchone()
+    current_metrics = json.loads(current_row["metrics"] or "{}") if current_row else {}
+    utility_passed = metrics.get("portfolio_utility", -1) > 0 and \
+        metrics.get("portfolio_utility", -1) >= current_metrics.get("portfolio_utility", -1) and \
+        metrics.get("oos_sharpe", -99) >= current_metrics.get("oos_sharpe", -99)
+    offline_passed = (offline_passed and coverage_passed and temporal_compatible and
+                      utility_passed)
     passed = offline_passed and sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0
@@ -527,6 +706,13 @@ def activation_state(cfg, store, refresh_checkpoints: bool = True) -> dict:
                 "block_reason": f"BLOCKED: {missing}",
                 "graph_id": graph_row["id"] if graph_row else None,
                 "global_tcn_id": tcn["id"] if tcn else None}
+    graph_metrics = json.loads(graph_row["metrics"] or "{}")
+    trained_with = graph_metrics.get("temporal_model_id")
+    if trained_with != tcn["id"]:
+        return {"stage": 0, "effective_blend": 0.0, "ready": False,
+                "block_reason": "BLOCKED: GRAPH/TCN checkpoint mismatch",
+                "graph_id": graph_row["id"], "global_tcn_id": tcn["id"],
+                "graph_temporal_model_id": trained_with}
     try:
         validate(json.loads(graph_row["topology"]))
     except Exception as exc:

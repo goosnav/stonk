@@ -186,11 +186,16 @@ def persist_dossier(store, symbol: str, as_of: str | None, sources: dict,
     return result
 
 
-def latest_dossier(store, symbol: str, as_of: str | None = None) -> dict | None:
+def latest_dossier(store, symbol: str, as_of: str | None = None,
+                   available_at: str | None = None) -> dict | None:
     q = "SELECT * FROM company_evidence WHERE symbol=?"
     args: list = [symbol.upper()]
     if as_of:
         q += " AND (as_of IS NULL OR as_of<=?)"; args.append(as_of)
+    if available_at:
+        # `as_of` is the market-data snapshot, not the publication time.  A
+        # dossier produced later must never leak into an earlier replay.
+        q += " AND substr(created_at,1,10)<=substr(?,1,10)"; args.append(available_at)
     q += " ORDER BY created_at DESC LIMIT 1"
     row = store.db.execute(q, args).fetchone()
     if not row:

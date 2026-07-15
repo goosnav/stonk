@@ -324,6 +324,7 @@ class Executor:
             "source": self.cfg.mode if self.cfg.mode == "live" else "paper",
             "exit_reason": reason,
             "regime": entry_cand.regime if entry_cand else regime,
+            "entry_candidate_id": position.get("candidate_id") or None,
         })
         remaining = max(0, position["qty"] - sold_qty)
         self.store.audit("position_closed" if remaining <= 1e-8 else "position_trimmed", {

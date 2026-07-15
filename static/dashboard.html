@@ -293,7 +293,7 @@
 <div class="page" data-page="switchboard" style="display:none">
   <section class="wide">
     <h2>Signal switchboard</h2>
-    <p class="explain">Each node is one strategy. Base weight × learned multiplier = its ensemble voice. Expectancy/win-rate come from closed trades it contributed to. The engine can only nudge multipliers within 0.3–2.0× and auto-disable clear losers — promotions are yours.</p>
+    <p class="explain">Each node is one strategy. Base weight × learned multiplier = its ensemble voice. Expectancy/win-rate come from closed trades it contributed to. Automation may deemphasize an enabled analysis only to its visible nonzero floor; this human toggle is the sole way to remove one completely.</p>
     <table id="nodes"><thead><tr><th>on</th><th>node</th><th>what it does</th><th>status</th><th>base w</th><th>learned ×</th><th>trades</th><th>expectancy</th><th>win</th></tr></thead><tbody></tbody></table>
   </section>
   <section class="wide">
@@ -370,7 +370,7 @@
 <div class="page" data-page="model" style="display:none">
   <section class="wide">
     <h2>Model shape — <span id="model_regime">…</span></h2>
-    <p class="explain">The selected analog-neural DAG. Every box is an auditable specialist equation or interaction. Initial-prior edges are gray; validated learned edges use green/red for positive/negative contribution, dashed means pruned, and node intensity is this symbol's latest activation. The governor remains outside the graph.</p>
+    <p class="explain">The selected analog-neural DAG. Every box is an auditable specialist equation or interaction. Initial-prior edges are gray; validated learned edges use green/red for positive/negative contribution. Dashed learned edges are redundant/pruned or protected low-weight paths; every enabled specialist retains a nonzero route. The governor remains outside the graph.</p>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <label>symbol <input id="graph_symbol" value="SPY" maxlength="10" style="width:80px" onchange="refreshModel()"></label>
       <label>horizon <select id="graph_horizon" onchange="refreshModel()"><option value="5">5 days</option><option value="21" selected>21 days</option></select></label>
@@ -438,9 +438,9 @@ async function api(p,o={}){
 }
 async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
 async function put(p,b){return api(p,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
-async function researchPost(kind){
-  try{return await post('/api/research/jobs',{kind});}
-  catch(first){await new Promise(r=>setTimeout(r,700));return post('/api/research/jobs',{kind});}
+async function researchPost(kind,force=false){
+  try{return await post('/api/research/jobs',{kind,force});}
+  catch(first){await new Promise(r=>setTimeout(r,700));return post('/api/research/jobs',{kind,force});}
 }
 
 /* tabs */
@@ -705,10 +705,10 @@ async function refreshNodes(){
          onchange="post('/api/nodes/${n.id}',{enabled:this.checked}).then(refreshNodes)"></td>
     <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
     <td class="dim" style="font-size:11.5px;max-width:340px">${NODE_DESC[n.id]||''}</td>
-    <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}${n.degraded?` <span class="neg" title="${String(n.degraded).replace(/"/g,'&quot;')}">⚠ degraded</span>`:''}</td>
+    <td><span class="badge ${n.status}">${n.status||''}</span> <span class="dim">${esc(n.learning_state||'full')}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}${n.degraded?` <span class="neg" title="${String(n.degraded).replace(/"/g,'&quot;')}">⚠ degraded</span>`:''}</td>
     <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
          onchange="post('/api/nodes/${n.id}',{weight:parseFloat(this.value)})">`}</td>
-    <td>${(n.weight_multiplier??1).toFixed(2)}</td><td>${n.n_trades}</td>
+    <td title="Automation floor ${Number(n.automated_floor||0).toFixed(2)}; only this checkbox can set zero">${n.enabled?(n.weight_multiplier??1).toFixed(2):'0.00 HUMAN OFF'}</td><td>${n.n_trades}</td>
     <td class="${cls(n.expectancy)}">${n.expectancy==null?'—':pct(n.expectancy)}</td>
     <td>${n.win_rate==null?'—':pct(n.win_rate,0)}</td></tr>`).join('');
   const props = await api('/api/proposals');
@@ -1047,14 +1047,15 @@ async function scanNow(){
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
-async function queueResearch(kind,button){
+async function queueResearch(kind,button,force=false){
   const names={discover:'opportunity discovery',deep_research:'deep research',
                train_holdings:'holding training'};
   button.disabled=true;button.dataset.original=button.textContent;
   button.innerHTML='<span class="spinner"></span>QUEUING';
   try{
-    const job=await researchPost(kind);
-    toast(`${names[kind]} ${job.status}: ${job.id}`);
+    if(force&&!confirm('Run bounded training now? Trading cycles retain priority and model promotion gates remain enforced.'))return;
+    const job=await researchPost(kind,force);
+    toast(`${names[kind]} ${job.state||job.status}: ${job.id}${job.wait_reason?' · '+job.wait_reason:''}`);
     await refreshJobs();
   }catch(e){toast(`Could not queue ${names[kind]}. ${e.message}`);}
   finally{button.disabled=false;button.textContent=button.dataset.original;}
@@ -1063,17 +1064,19 @@ const progressFraction=p=>Math.max(0,Math.min(1,
   Number.isFinite(Number(p?.fraction))?Number(p.fraction):(p?.total?(p.index-1)/p.total:0)));
 async function refreshJobs(){
   const jobs=await api('/api/research/jobs?limit=8');
-  const active=jobs.find(j=>j.status==='running'||j.status==='queued');
-  if(!active){
+  const active=jobs.filter(j=>j.status==='running'||j.status==='queued');
+  if(!active.length){
     const last=jobs[0], detail=last&&(last.error||(last.result||{}).reason);
     $('actionstate').innerHTML=last
       ? `last ${last.kind}: <span class="${last.status==='failed'?'neg':''}">${last.status}</span>${detail?' · '+String(detail).slice(0,140):''}`
       :'no operator jobs'; return;
   }
-  const p=active.progress||{}, fraction=progressFraction(p);
-  $('actionstate').innerHTML=`${active.status==='running'?'<span class="spinner"></span>':''}<span class="${active.status==='running'?'pos':''}">${active.kind} · ${active.status}</span>`+
-    `<span class="progress"><i style="width:${Math.round(fraction*100)}%"></i></span>`+
-    (p.symbol?`${p.symbol} ${p.index||0}/${p.total||0}`:'waiting for research worker');
+  $('actionstate').innerHTML=active.map(job=>{
+    const p=job.progress||{}, fraction=progressFraction(p), running=job.status==='running';
+    const wait=job.wait_reason||({waiting_window:'market close',waiting_dependency:'dependency',retry_wait:'retry backoff'}[job.state])||'';
+    const detail=p.symbol?`${p.symbol} ${p.index||0}/${p.total||0}`:(p.phase||wait||`queue #${job.queue_position||'?'}`);
+    return `<span style="display:inline-block;min-width:150px">${running?'<span class="spinner"></span>':''}<span class="${running?'pos':'dim'}">${job.kind} · ${job.state||job.status}</span><span class="progress"><i style="width:${Math.round(fraction*100)}%"></i></span>${esc(detail)}</span>`;
+  }).join('');
 }
 /* ---------- engine state machine (D39) ---------- */
 const ENG_PHASES=['sleeping','data','quotes','account','risk_gate','settle',
@@ -1095,14 +1098,24 @@ async function refreshEngine(){
   $('eng_detail').textContent=s.detail||'—';
   const processes=e.processes||{}, research=processes.research||{}, rstate=research.state||{};
   const intelligence=processes.intelligence||{}, istate=intelligence.state||{};
-  const activeJob=(research.jobs||[]).find(j=>j.status==='running'), queued=(research.jobs||[]).filter(j=>j.status==='queued');
-  const jp=activeJob?.progress||{}, jf=progressFraction(jp);
   const rp=rstate.progress||{}, rf=rp.target?Math.max(0,Math.min(1,Number(rp.ready||0)/rp.target)):0;
   const autonomousRunning=!['idle','caught_up','never_ran','error'].includes(rstate.phase);
   const activeIntel=(intelligence.jobs||[]).find(j=>j.status==='running'), queuedIntel=(intelligence.jobs||[]).filter(j=>j.status==='queued');
   const ip=activeIntel?.progress||{}, inf=progressFraction(ip), intelRunning=!!activeIntel;
+  const operatorJobs=research.jobs||[];
+  const operatorLane=(resource,label)=>{
+    const job=operatorJobs.find(j=>j.resource_class===resource&&j.status==='running')||
+              operatorJobs.find(j=>j.resource_class===resource&&j.status==='queued');
+    if(!job)return `<div class="process-lane"><b>${label}</b><br><span class="dim">idle · no queued work</span></div>`;
+    const p=job.progress||{}, f=progressFraction(p), running=job.status==='running';
+    const wait=job.wait_reason||({waiting_window:'market close',waiting_dependency:'dependency',retry_wait:'retry backoff'}[job.state])||'queued';
+    return `<div class="process-lane ${running?'running':''}"><b>${label}</b><br>${running?'<span class="spinner"></span>':''}<span class="${running?'pos':'dim'}">${job.kind} · ${job.state||job.status}</span><br><span class="progress"><i style="width:${Math.round(f*100)}%"></i></span><span class="dim">${esc(p.phase||wait)} ${esc(p.symbol||'')} ${p.index||''}${p.total?'/'+p.total:''}${p.epoch?' · epoch '+p.epoch+'/'+p.max_epochs:''}</span></div>`;
+  };
   $('eng_processes').innerHTML=`<div class="process-lane ${running?'running':''}"><b>TRADING LOOP</b><br><span class="${running?'pos':'dim'}">${(s.phase||'unknown').replace('_',' ')}</span><br><span class="dim">${s.detail||'—'}</span></div>`+
-    `<div class="process-lane ${activeJob||autonomousRunning?'running':''}"><b>RESEARCH WORKER</b><br>${activeJob?`<span class="spinner"></span><span class="pos">${activeJob.kind}</span> · ${jp.phase||'working'} ${jp.symbol||''} ${jp.index||''}/${jp.total||''}<br><span class="progress"><i style="width:${Math.round(jf*100)}%"></i></span>${jp.epoch?` epoch ${jp.epoch}/${jp.max_epochs} · loss ${jp.best_loss}`:''}`:`${autonomousRunning?'<span class="spinner"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${rstate.phase||'idle'} · ${rstate.detail||'waiting'}</span>${rp.target?`<br><span class="progress"><i style="width:${Math.round(rf*100)}%"></i></span>${rp.ready||0}/${rp.target}`:''}`}<br><span class="dim">${queued.length} queued · one CPU/DB unit at a time</span></div>`+
+    operatorLane('discovery','DISCOVERY LANE')+
+    operatorLane('intelligence','DEEP-RESEARCH LANE')+
+    operatorLane('training','PYTORCH TRAINING LANE')+
+    `<div class="process-lane ${autonomousRunning?'running':''}"><b>AUTONOMOUS RESEARCH</b><br>${autonomousRunning?'<span class="spinner"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${rstate.phase||'idle'} · ${rstate.detail||'waiting'}</span>${rp.target?`<br><span class="progress"><i style="width:${Math.round(rf*100)}%"></i></span>${rp.ready||0}/${rp.target}`:''}</div>`+
     `<div class="process-lane ${intelRunning?'running':''}"><b>INTELLIGENCE WORKER</b><br>${intelRunning?`<span class="spinner"></span><span class="pos">${activeIntel.kind}</span> · ${ip.phase||'working'} ${ip.completed??''}/${ip.total??''}<br><span class="progress"><i style="width:${Math.round(inf*100)}%"></i></span>`:`<span class="dim">${istate.phase||'idle'} · ${istate.detail||'waiting'}</span>`}<br><span class="dim">${queuedIntel.length} queued · one sandboxed provider call at a time</span></div>`;
   const m=e.market||{}, runs=Object.entries(e.next_runs||{});
   $('eng_cadence').innerHTML=[
@@ -1154,7 +1167,7 @@ async function refreshModel(){
   layers.forEach((layer,li)=>{const ns=topo.nodes.filter(n=>n.layer===layer);ns.forEach((n,i)=>{
     pos[n.id]={x:25+li*260,y:45+i*Math.min(70,520/Math.max(1,ns.length))};});});
   const edge=e=>{const a=pos[e.source],b=pos[e.target],w=Number(e.weight||0),c=g.topology_provenance==='initial_prior'?'#606873':w>=0?'var(--green)':'var(--red)';
-    if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .25 : .8}" ${e.pruned?'stroke-dasharray="4,4"':''}><title>${e.source} → ${e.target}: ${w.toFixed(4)}${e.pruned?' pruned':''}</title></path>`};
+    if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .20 : e.deemphasized ? .45 : .8}" ${(e.pruned||e.deemphasized)?'stroke-dasharray="4,4"':''}><title>${e.source} → ${e.target}: ${w.toFixed(4)}${e.pruned?' pruned redundant edge':e.deemphasized?' deemphasized; protected nonzero path':''}</title></path>`};
   const box=n=>{const p=pos[n.id],a=snap[n.id]||{},v=Math.min(1,Math.abs(Number(a.value||0))),stroke=n.role==='output'?'var(--cyan)':n.role==='gate'?'var(--amber)':'#7d8799';
     const state=g.node_state?.[n.id]||'unavailable';
     return `<g onclick="showGraphNode('${n.id}')" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${n.id}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${state} · ${a.value==null?'neutral':Number(a.value).toFixed(3)}</text></g>`};
@@ -1171,7 +1184,7 @@ async function refreshModel(){
     `<div style="margin-top:4px"><span class="badge">SEC FEATURES</span> point-in-time coverage ${fc.covered||0}/${fc.total||0}</div>`+
     `<div style="margin-top:4px"><span class="badge">COMPANY DOSSIERS</span> ready ${cec.ready||0} · unsupported ${cec.unsupported||0} · AI month ${fmt$(ceb.spent_month_usd||0)} / ${fmt$(ceb.monthly_budget_usd||0)} · remaining ${fmt$(ceb.remaining_month_usd||0)}</div>`+
     `<div style="margin-top:4px"><span class="badge">GLOBAL TCN</span> ${nu ? `${nu.status||'—'} · ${nu.data_as_of||'—'} · ${JSON.stringify(nu.metrics||{}).slice(0,180)}`:'no challenger yet'}</div>`+
-    `<div style="margin-top:4px"><span class="badge">BASELINE GATE</span> ${Object.keys(baselines).length?`${nm.beats_baselines?'PASS':'NOT PASSED'} · ${esc(JSON.stringify(baselines).slice(0,220))}`:'awaiting compatible 28-feature challenger'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">BASELINE GATE</span> ${Object.keys(baselines).length?`${nm.beats_baselines?'PASS':'NOT PASSED'} · ${esc(JSON.stringify(baselines).slice(0,220))}`:`awaiting compatible ${(temporal.features||[]).length||'current-schema'}-feature challenger`}</div>`+
     `<div style="margin-top:4px"><span class="badge">TCN SHAPE</span> ${arch.window||60} sessions → ${(arch.blocks||[]).map(b=>`Conv1d 32 k3 d${b.dilation}`).join(' → ')} + all-feature context fusion → 5d/21d quantiles + P(+)</div>`+
     `<div style="margin-top:4px"><span class="badge">HOLDING NETS</span> ${held.length?held.map(h=>`${h.symbol}: ${h.run?h.run.status:'none'} · ${h.bars}/1250 bars · blend ${Math.round((h.effective_blend||0)*100)}%`).join('<br>'):'no live holdings'}</div>`+
     `<div style="margin-top:4px"><span class="badge">WALK-FORWARD</span> ${rr

@@ -9,33 +9,121 @@ from __future__ import annotations
 import json
 import hashlib
 import html
+import inspect
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 _LOCK = threading.Lock()
-JOB_KINDS = {"discover", "deep_research", "train_holdings"}
+_RESOURCE_LOCKS = {name: threading.Lock() for name in
+                   ("discovery", "intelligence", "training")}
+JOB_KINDS = {"discover", "deep_research", "train_global", "train_holdings"}
+PUBLIC_JOB_KINDS = {"discover", "deep_research", "train_holdings"}
+JOB_POLICY = {
+    "discover": ("market_safe", "discovery"),
+    "deep_research": ("market_safe", "intelligence"),
+    "train_global": ("closed_market", "training"),
+    "train_holdings": ("closed_market", "training"),
+}
+LEASE_SECONDS = 90
 SEC_HEADERS = {"User-Agent": "Stonk Terminal research contact=local-user"}
 
 
-def _acquire_lease(store, seconds: int) -> str | None:
+def _iso_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_progress(fn, *args, progress=None, **kwargs):
+    """Pass structured progress without breaking legacy research extensions."""
+    signature = inspect.signature(fn)
+    accepts = "progress" in signature.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in signature.parameters.values())
+    if accepts:
+        kwargs["progress"] = progress
+    return fn(*args, **kwargs)
+
+
+def _market_open() -> bool:
+    from .health import _market_clock
+    return bool(_market_clock()["open"])
+
+
+def _next_closed_eligibility() -> str:
+    """The first safe instant after today's session, exchange-calendar aware."""
+    now = datetime.now().astimezone()
+    if not _market_open():
+        return now.isoformat(timespec="seconds")
+    try:
+        import exchange_calendars as xcals
+        import pandas as pd
+        cal = xcals.get_calendar("XNYS")
+        minute = pd.Timestamp(now).tz_convert("UTC").floor("min")
+        close = cal.next_close(minute)
+        return close.tz_convert(now.tzinfo).to_pydatetime().isoformat(timespec="seconds")
+    except Exception:
+        return now.replace(hour=16, minute=10, second=0, microsecond=0).isoformat(
+            timespec="seconds")
+
+
+def _compatible_global(store) -> bool:
+    from .neural import refresh_compatibility
+    refresh_compatibility(store)
+    return bool(store.db.execute(
+        "SELECT 1 FROM model_runs WHERE kind='global_tcn' "
+        "AND status IN ('champion','challenger') AND incompatibility_reason IS NULL LIMIT 1"
+    ).fetchone())
+
+
+def _discovery_current(store) -> bool:
+    """A shortlist is usable only for the newest settled research snapshot."""
+    status = store.kv_get("discovery_status") or {}
+    shortlist_as_of = str(status.get("as_of") or "")
+    membership = store.db.execute(
+        "SELECT MAX(as_of) d FROM universe_membership WHERE tier='research'"
+    ).fetchone()
+    membership_as_of = str(membership["d"] or "") if membership else ""
+    bars_as_of = str(store.latest_bar_date("SPY") or "")
+    required = max((d for d in (membership_as_of, bars_as_of) if d), default="")
+    return bool(shortlist_as_of and shortlist_as_of >= required and
+                store.db.execute(
+                    "SELECT 1 FROM universe_membership WHERE tier='shortlist' "
+                    "AND as_of=? LIMIT 1", (shortlist_as_of,)).fetchone())
+
+
+def _active_job(store, kind: str):
+    return store.db.execute(
+        "SELECT * FROM research_jobs WHERE kind=? AND status IN ('queued','running') "
+        "ORDER BY priority DESC,requested_at LIMIT 1", (kind,)).fetchone()
+
+
+def _acquire_lease(store, seconds: int, resource: str = "research") -> str | None:
     """Cross-process SQLite lease; the thread lock alone cannot guard CLI+GUI."""
     owner = f"{os.getpid()}:{threading.get_ident()}"
     now = time.time()
     try:
         store.db.execute("BEGIN IMMEDIATE")
-        row = store.db.execute("SELECT value FROM kv WHERE key='research_worker_lease'").fetchone()
+        key = f"research_worker_lease:{resource}"
+        row = store.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         lease = json.loads(row["value"]) if row else {}
         if float(lease.get("expires_at", 0)) > now:
             store.db.commit()
             return None
         value = json.dumps({"owner": owner, "acquired_at": now,
                             "expires_at": now + max(60, seconds)})
-        store.db.execute("INSERT INTO kv(key,value) VALUES('research_worker_lease',?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,))
+        store.db.execute("INSERT INTO kv(key,value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         store.db.commit()
         return owner
     except Exception:
@@ -43,18 +131,36 @@ def _acquire_lease(store, seconds: int) -> str | None:
         raise
 
 
-def _release_lease(store, owner: str | None) -> None:
+def _release_lease(store, owner: str | None, resource: str = "research") -> None:
     if not owner:
         return
     try:
         store.db.execute("BEGIN IMMEDIATE")
-        row = store.db.execute("SELECT value FROM kv WHERE key='research_worker_lease'").fetchone()
+        key = f"research_worker_lease:{resource}"
+        row = store.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         lease = json.loads(row["value"]) if row else {}
         if lease.get("owner") == owner:
-            store.db.execute("DELETE FROM kv WHERE key='research_worker_lease'")
+            store.db.execute("DELETE FROM kv WHERE key=?", (key,))
         store.db.commit()
     except Exception:
         store.db.rollback()
+
+
+def _renew_lease(store, owner: str | None, resource: str, seconds: int) -> bool:
+    if not owner:
+        return False
+    key, now = f"research_worker_lease:{resource}", time.time()
+    try:
+        store.db.execute("BEGIN IMMEDIATE")
+        row = store.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        lease = json.loads(row["value"]) if row else {}
+        if lease.get("owner") != owner:
+            store.db.rollback(); return False
+        lease["expires_at"] = now + max(60, seconds)
+        store.db.execute("UPDATE kv SET value=? WHERE key=?", (json.dumps(lease), key))
+        store.db.commit(); return True
+    except Exception:
+        store.db.rollback(); return False
 
 
 def _stamp(store, phase: str, detail: str, **extra) -> dict:
@@ -72,22 +178,94 @@ def _missing_history(store, limit: int) -> list[str]:
 
 
 def enqueue_job(store, kind: str, payload: dict | None = None,
-                priority: int = 10) -> dict:
-    """Durable, deduplicated operator request. Long work never blocks HTTP."""
+                priority: int = 10, requested_by: str = "operator",
+                force: bool = False) -> dict:
+    """Durable, deduplicated request with truthful execution eligibility.
+
+    An operator poke upgrades an autonomous duplicate instead of disappearing
+    behind it.  Deep research and holding training materialize their dependency
+    now, so the UI can explain what it is actually waiting for.
+    """
     if kind not in JOB_KINDS:
         raise ValueError(f"unknown research job: {kind}")
-    existing = store.db.execute(
-        "SELECT * FROM research_jobs WHERE kind=? AND status IN ('queued','running') "
-        "ORDER BY requested_at LIMIT 1", (kind,)).fetchone()
+    payload = payload or {}
+    run_policy, resource_class = JOB_POLICY[kind]
+    # Training is deliberately never forced through the market-hours resource
+    # boundary.  A manual poke raises priority, but execution still waits for
+    # the exchange to close so it cannot contend with a live trading cycle.
+    if force and resource_class == "training" and _market_open():
+        raise ValueError("market-hours forced training is disabled; the job will run after close")
+    dependency_id = None
+    if kind == "deep_research":
+        if not _discovery_current(store):
+            dependency_id = enqueue_job(
+                store, "discover", priority=priority + 1,
+                requested_by=requested_by)["id"]
+    elif kind == "train_holdings" and not _compatible_global(store):
+        dependency_id = enqueue_job(
+            store, "train_global", priority=priority + 1,
+            requested_by=requested_by, force=force)["id"]
+    existing = _active_job(store, kind)
     if existing:
+        # A human request is a real control-plane event: raise priority, change
+        # the policy only when force was explicit, and retain the durable ID.
+        existing_payload = json.loads(existing["payload"] or "{}")
+        requested_symbols = set(existing_payload.get("symbols") or [])
+        requested_symbols.update(payload.get("symbols") or [])
+        if payload.get("symbol"):
+            requested_symbols.add(str(payload["symbol"]).upper())
+        if requested_symbols:
+            existing_payload["symbols"] = sorted(requested_symbols)
+        if requested_by == "operator":
+            now = _iso_now()
+            with store.db:
+                store.db.execute(
+                    "UPDATE research_jobs SET priority=MAX(priority,?),requested_by='operator',"
+                    "run_policy=?,resource_class=?,depends_on_id=COALESCE(?,depends_on_id),"
+                    "eligible_at=?,wait_reason=?,updated_at=?,payload=? WHERE id=?",
+                    (priority, run_policy, resource_class, dependency_id,
+                     _next_closed_eligibility() if run_policy == "closed_market" else now,
+                     "market_close" if run_policy == "closed_market" and _market_open()
+                     else "dependency" if dependency_id else None,
+                     now, json.dumps(existing_payload), existing["id"]))
+        elif requested_symbols:
+            with store.db:
+                store.db.execute("UPDATE research_jobs SET payload=?,updated_at=? WHERE id=?",
+                                 (json.dumps(existing_payload), _iso_now(), existing["id"]))
+        if requested_by == "operator":
+            store.audit("research_job_poked", {"id": existing["id"], "kind": kind,
+                                                "force": force})
+        existing = store.db.execute(
+            "SELECT * FROM research_jobs WHERE id=?", (existing["id"],)).fetchone()
         return _job(existing)
     from .models import new_id
-    now, jid = datetime.now().astimezone().isoformat(timespec="seconds"), new_id()
-    with store.db:
-        store.db.execute("INSERT INTO research_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                         (jid, kind, "queued", priority, now, None, None,
-                          json.dumps(payload or {}), json.dumps({}), None, None, 0))
-    store.audit("research_job_queued", {"id": jid, "kind": kind})
+    now, jid = _iso_now(), new_id()
+    eligible_at = _next_closed_eligibility() if run_policy == "closed_market" else now
+    wait_reason = ("market_close" if run_policy == "closed_market" and _market_open()
+                   else "dependency" if dependency_id else None)
+    state = "waiting_dependency" if dependency_id else \
+        "waiting_window" if wait_reason == "market_close" else "queued"
+    try:
+        with store.db:
+            store.db.execute(
+                "INSERT INTO research_jobs(id,kind,status,priority,requested_at,started_at,"
+                "completed_at,payload,progress,result,error,attempts,state,requested_by,"
+                "run_policy,resource_class,depends_on_id,eligible_at,wait_reason,max_attempts,"
+                "updated_at,dedup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (jid, kind, "queued", priority, now, None, None, json.dumps(payload),
+                 json.dumps({}), None, None, 0, state, requested_by, run_policy,
+                 resource_class, dependency_id, eligible_at, wait_reason, 2, now,
+                 f"{kind}:{hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]}"))
+    except sqlite3.IntegrityError:
+        # The partial unique index is the final cross-thread/process arbiter.
+        raced = _active_job(store, kind)
+        if raced:
+            return _job(raced)
+        raise
+    store.audit("research_job_queued", {"id": jid, "kind": kind,
+                                         "requested_by": requested_by,
+                                         "run_policy": run_policy,
+                                         "depends_on_id": dependency_id})
     return _job(store.db.execute("SELECT * FROM research_jobs WHERE id=?", (jid,)).fetchone())
 
 
@@ -97,6 +275,7 @@ def _job(row) -> dict:
     out = dict(row)
     for key in ("payload", "progress", "result"):
         out[key] = json.loads(out[key] or "{}")
+    out["state"] = out.get("state") or out.get("status") or "queued"
     # A job may finish between its last atomic progress callback and the final
     # status write. Terminal rows must never look like work is still loading.
     if out.get("status") in ("completed", "partial"):
@@ -108,9 +287,17 @@ def _job(row) -> dict:
 
 
 def list_jobs(store, limit: int = 20) -> list[dict]:
-    return [_job(r) for r in store.db.execute(
-        "SELECT * FROM research_jobs ORDER BY COALESCE(completed_at,requested_at) DESC LIMIT ?",
-        (limit,))]
+    rows = [_job(r) for r in store.db.execute(
+        "SELECT * FROM research_jobs ORDER BY "
+        "CASE WHEN status IN ('running','queued') THEN 0 ELSE 1 END,"
+        "CASE WHEN kind='train_global' THEN 1 ELSE 0 END,"
+        "priority DESC,COALESCE(completed_at,requested_at) DESC LIMIT ?", (limit,))]
+    for row in rows:
+        row["internal"] = row.get("kind") == "train_global"
+    active = [r for r in rows if r.get("status") in ("queued", "running")]
+    for index, row in enumerate(active, 1):
+        row["queue_position"] = index
+    return rows
 
 
 def cancel_job(store, job_id: str) -> dict:
@@ -118,35 +305,60 @@ def cancel_job(store, job_id: str) -> dict:
         row = store.db.execute("SELECT * FROM research_jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             raise ValueError("unknown research job")
-        if row["status"] != "queued":
-            raise ValueError("only queued research jobs can be cancelled")
-        store.db.execute("UPDATE research_jobs SET status='cancelled',completed_at=? WHERE id=?",
-                         (datetime.now().astimezone().isoformat(timespec="seconds"), job_id))
+        now = _iso_now()
+        if row["status"] == "running":
+            store.db.execute(
+                "UPDATE research_jobs SET state='cancelling',cancel_requested_at=?,"
+                "updated_at=? WHERE id=? AND status='running'", (now, now, job_id))
+        elif row["status"] == "queued":
+            store.db.execute(
+                "UPDATE research_jobs SET status='cancelled',state='cancelled',"
+                "completed_at=?,updated_at=? WHERE id=? AND status='queued'",
+                (now, now, job_id))
+        else:
+            raise ValueError("only queued or running research jobs can be cancelled")
     store.audit("research_job_cancelled", {"id": job_id})
     return _job(store.db.execute("SELECT * FROM research_jobs WHERE id=?", (job_id,)).fetchone())
 
 
 def recover_jobs(store) -> int:
-    """A daemon restart requeues one interrupted unit; a second failure stops."""
+    """Recover only expired/dead work; never duplicate a live worker."""
+    now = datetime.now().astimezone()
     with store.db:
-        lease = store.db.execute(
-            "SELECT value FROM kv WHERE key='research_worker_lease'").fetchone()
-        if lease:
+        retry = failed = 0
+        for row in store.db.execute(
+                "SELECT * FROM research_jobs WHERE status='running'").fetchall():
+            expiry = _parse_time(row["lease_expires_at"])
+            pid_alive = False
             try:
-                pid = int(str(json.loads(lease["value"]).get("owner", "0")).split(":")[0])
-                os.kill(pid, 0)
-            except (ValueError, ProcessLookupError):
-                store.db.execute("DELETE FROM kv WHERE key='research_worker_lease'")
-        retry = store.db.execute("UPDATE research_jobs SET status='queued',started_at=NULL "
-                                 "WHERE status='running' AND attempts<2").rowcount
-        store.db.execute("UPDATE research_jobs SET status='failed',completed_at=?,"
-                         "error='interrupted twice; inspect logs before retrying' "
-                         "WHERE status='running' AND attempts>=2",
-                         (datetime.now().astimezone().isoformat(timespec="seconds"),))
+                pid = int(str(row["worker_id"] or "0").split(":")[0])
+                os.kill(pid, 0); pid_alive = True
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+            if pid_alive and expiry and expiry > now:
+                continue
+            if int(row["attempts"] or 0) < int(row["max_attempts"] or 2):
+                store.db.execute(
+                    "UPDATE research_jobs SET status='queued',state='retry_wait',"
+                    "started_at=NULL,worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL,"
+                    "next_retry_at=?,updated_at=? WHERE id=? AND status='running'",
+                    ((now + timedelta(seconds=30)).isoformat(timespec="seconds"),
+                     now.isoformat(timespec="seconds"), row["id"])); retry += 1
+            else:
+                store.db.execute(
+                    "UPDATE research_jobs SET status='failed',state='failed',completed_at=?,"
+                    "error='worker interrupted repeatedly; inspect sanitized logs',updated_at=? "
+                    "WHERE id=? AND status='running'",
+                    (now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"),
+                     row["id"])); failed += 1
+        # The legacy coarse lease is no longer authoritative after row leases.
+        store.db.execute("DELETE FROM kv WHERE key='research_worker_lease'")
+    if retry or failed:
+        store.audit("research_jobs_recovered", {"requeued": retry, "failed": failed})
     return retry
 
 
-def discover_opportunities(cfg, store) -> dict:
+def discover_opportunities(cfg, store, progress=None) -> dict:
     """Broad, deterministic, cached-data-only ranking. Never touches a broker."""
     from .data import MarketContext
     from .nodes import build_registry
@@ -154,16 +366,41 @@ def discover_opportunities(cfg, store) -> dict:
     syms = symbols(store, "research")
     if not syms:
         return {"status": "waiting", "reason": "research universe is empty"}
+    if progress:
+        progress({"phase": "load_universe", "index": 0, "total": len(syms),
+                  "fraction": 0.02})
     old = cfg.data["universe"]["symbols"]
     cfg.data["universe"]["symbols"] = syms
     try:
-        ctx = MarketContext(store, cfg)
+        # Discovery is deliberately cache-only. Provider refreshes are
+        # separate resumable tasks; a button press must not fan out hundreds
+        # of synchronous yfinance/SEC requests.
+        ctx = MarketContext(store, cfg, offline=True)
         registry = build_registry(cfg)
-        allowed = {"momentum", "reversal", "vol_contraction", "sector_rotation", "gap"}
+        # Discovery reads every broker-free cached analysis that can influence
+        # production, not merely the technical starter set. Missing evidence
+        # remains a named zero contribution; it never donates its budget to
+        # momentum or another available node.
+        allowed = {"momentum", "reversal", "vol_contraction", "sector_rotation",
+                   "gap", "earnings_drift", "business_fundamentals",
+                   "company_catalyst", "insider", "congress_trades", "neural",
+                   "hypothesis"}
         events = []
-        for node_id, node in registry.items():
+        selected = [(node_id, node) for node_id, node in registry.items()
+                    if node_id in allowed]
+        for index, (node_id, node) in enumerate(selected, 1):
             if node_id in allowed:
                 events.extend(node.compute(ctx))
+            if progress:
+                progress({"phase": "specialists", "specialist": node_id,
+                          "index": index, "total": len(selected),
+                          "fraction": .05 + .55 * index / max(1, len(selected))})
+        quality = registry.get("quality_value")
+        if quality and hasattr(quality, "graph_signal"):
+            for symbol in syms:
+                event = quality.graph_signal(ctx, symbol)
+                if event:
+                    events.append(event)
     finally:
         cfg.data["universe"]["symbols"] = old
     components: dict[str, list[dict]] = {s: [] for s in syms}
@@ -173,16 +410,37 @@ def discover_opportunities(cfg, store) -> dict:
         components.setdefault(event.symbol, []).append(
             {"node": event.node_id, "score": round(signed, 5),
              "evidence": event.evidence[:2]})
+    from .ensemble import _node_priors
+    from .nodes.quality_value import ETFISH
+    def fixed_priors(families):
+        out = {}
+        for family, family_weight in families.items():
+            members = _node_priors(cfg, family, family in ("context", "price"))
+            for node, node_weight in members.items():
+                out[node] = float(family_weight) * float(node_weight)
+        return out
+    company_priors = fixed_priors(
+        cfg.get("evidence", "company_families", default={}) or {})
+    etf_priors = fixed_priors(
+        cfg.get("evidence", "etf_families", default={}) or {})
     latest = store.latest_bar_date(cfg.get("universe", "benchmark", default="SPY"))
+    membership_date_row = store.db.execute(
+        "SELECT MAX(as_of) d FROM universe_membership WHERE tier='research'").fetchone()
+    membership_date = membership_date_row["d"] if membership_date_row else None
     membership = {r["symbol"]: json.loads(r["metrics"] or "{}") for r in store.db.execute(
         "SELECT symbol,metrics FROM universe_membership WHERE as_of=? AND tier='research'",
-        (latest,))}
+        (membership_date,))}
     names = {r["symbol"]: r["name"] or "" for r in store.db.execute(
         "SELECT symbol,name FROM instruments")}
     ranked = []
     for sym in syms:
         comps = components.get(sym, [])
-        alpha = sum(c["score"] for c in comps) / max(1, len(comps))
+        symbol_priors = etf_priors if sym in ETFISH else company_priors
+        by_node = {c["node"]: c for c in comps}
+        fixed_weight = sum(symbol_priors.values()) or 1.0
+        alpha = sum(by_node.get(node, {}).get("score", 0.0) * weight
+                    for node, weight in symbol_priors.items()) / fixed_weight
+        unavailable = [node for node in symbol_priors if node not in by_node]
         dv = float((membership.get(sym) or {}).get("dollar_volume") or 0)
         liquidity = min(1.0, max(0.0, __import__("math").log10(max(1, dv)) / 10))
         from .strategy import discovery_adjustment
@@ -191,23 +449,60 @@ def discover_opportunities(cfg, store) -> dict:
         if strategic:
             comps.append({"node": "strategy_context", "score": round(strategic, 5),
                           "evidence": ["active Strategy AI mandate"]})
-        ranked.append((score, sym, comps, dv))
+        ranked.append((score, sym, comps, dv, unavailable))
+    if progress:
+        progress({"phase": "rank", "index": len(syms), "total": len(syms),
+                  "fraction": .80})
     ranked.sort(reverse=True)
-    top = ranked[:25]
+    # Acquisition sleeves prevent a momentum feedback loop where only the
+    # already-obvious technical leaders ever earn fundamental/news research.
+    selected: list[tuple[tuple, str]] = []
+    seen: set[str] = set()
+    def add_sleeve(items, label: str, limit: int):
+        for item in items:
+            if item[1] in seen:
+                continue
+            selected.append((item, label)); seen.add(item[1])
+            if sum(1 for _, sleeve in selected if sleeve == label) >= limit:
+                break
+    add_sleeve(ranked, "combined", 13)
+    def component_score(item, nodes):
+        return sum(float(c.get("score", 0)) for c in item[2]
+                   if c.get("node") in nodes)
+    quality_ranked = sorted(ranked, key=lambda item: (
+        component_score(item, {"quality_value", "business_fundamentals"}), item[3]),
+        reverse=True)
+    catalyst_ranked = sorted(ranked, key=lambda item: (
+        component_score(item, {"company_catalyst", "earnings_drift", "insider",
+                               "congress_trades"}), item[3]), reverse=True)
+    exploration_ranked = sorted(ranked, key=lambda item: (len(item[4]), item[3]),
+                                reverse=True)
+    add_sleeve(quality_ranked, "quality", 4)
+    add_sleeve(catalyst_ranked, "catalyst", 4)
+    add_sleeve(exploration_ranked, "exploration", 4)
+    add_sleeve(ranked, "combined_fill", 25 - len(selected))
+    top = selected[:25]
     with store.db:
         store.db.execute("DELETE FROM universe_membership WHERE as_of=? AND tier='shortlist'",
                          (latest,))
-        for rank, (score, sym, comps, dv) in enumerate(top, 1):
+        for rank, ((score, sym, comps, dv, unavailable), sleeve) in enumerate(top, 1):
             metrics = {"opportunity_score": round(score, 5), "components": comps,
                        "dollar_volume": dv,
-                       "reason": "deterministic specialist ranking; research only"}
+                       "membership_as_of": membership_date,
+                       "research_sleeve": sleeve,
+                       "unavailable": unavailable,
+                       "reason": "fixed-budget multi-source evidence ranking; research only"}
             store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
                              (latest, sym, "shortlist", rank, "opportunity_score",
                               json.dumps(metrics)))
     result = {"status": "completed", "as_of": latest, "examined": len(syms),
-              "shortlist": [{"symbol": s, "score": round(v, 5)} for v, s, _, _ in top]}
+              "shortlist": [{"symbol": item[1], "score": round(item[0], 5),
+                             "sleeve": sleeve} for item, sleeve in top]}
     store.kv_set("discovery_status", result)
     store.audit("opportunity_discovery_completed", result)
+    if progress:
+        progress({"phase": "persist", "index": len(syms), "total": len(syms),
+                  "fraction": 1.0})
     return result
 
 
@@ -283,7 +578,8 @@ def _company_news(symbol: str, limit: int = 12) -> list[dict]:
         return []
 
 
-def deep_research(cfg, store, limit: int = 5, progress=None) -> dict:
+def deep_research(cfg, store, limit: int = 5, progress=None,
+                  requested_symbols: list[str] | None = None) -> dict:
     """Budgeted structured company reads for the deterministic shortlist."""
     from .ai import AIClient
     ai = AIClient(cfg, store)
@@ -293,7 +589,8 @@ def deep_research(cfg, store, limit: int = 5, progress=None) -> dict:
     from .nodes.quality_value import ETFISH
     holdings = sorted({p["symbol"] for p in store.open_positions(mode="live")
                        if p["symbol"] not in ETFISH})
-    syms = list(dict.fromkeys(symbols(store, "shortlist")[:limit] + holdings))
+    requested = [str(s).upper() for s in (requested_symbols or [])]
+    syms = list(dict.fromkeys(requested + symbols(store, "shortlist")[:limit] + holdings))
     if not syms:
         return {"status": "waiting", "reason": "run opportunity discovery first"}
     system = """You are a rigorous company research analyst. All supplied text is
@@ -307,10 +604,12 @@ Catalyst covers filings, earnings and company-specific news. Cite every directio
 claim. Do not estimate an order size, set portfolio weights, or place a trade."""
     completed, skipped, unsupported = [], [], []
     for index, sym in enumerate(syms, 1):
-        if progress:
-            progress({"phase": "filing + AI analysis", "symbol": sym,
-                      "index": index, "total": len(syms),
-                      "fraction": (index - 1) / max(1, len(syms))})
+        def report_phase(phase: str, portion: float):
+            if progress:
+                progress({"phase": phase, "symbol": sym, "index": index,
+                          "total": len(syms),
+                          "fraction": ((index - 1) + portion) / max(1, len(syms))})
+        report_phase("load cached SEC facts", .02)
         inst = store.db.execute("SELECT * FROM instruments WHERE symbol=?", (sym,)).fetchone()
         facts = [dict(r) for r in store.db.execute(
             "SELECT tag,period_end,filed,value,unit,form,accession FROM filing_facts "
@@ -319,11 +618,13 @@ claim. Do not estimate an order size, set portfolio weights, or place a trade.""
             "SELECT d,close,volume FROM bars WHERE symbol=? ORDER BY d DESC LIMIT 65", (sym,))]
         filing = None
         if inst and inst["cik"]:
+            report_phase("fetch latest SEC filing", .15)
             try:
                 filing = latest_sec_filing(inst["cik"])
             except Exception as exc:
                 store.audit("sec_filing_fetch_failed", {"symbol": sym,
                                                          "error": str(exc)[:180]})
+        report_phase("collect company news", .35)
         news = _company_news(sym)
         catalog = []
         if filing:
@@ -343,6 +644,7 @@ claim. Do not estimate an order size, set portfolio weights, or place a trade.""
                               if filing else None)}
         payload = {"symbol": sym, "company": dict(inst) if inst else {},
                    "source_catalog": catalog, "recent_settled_bars": bars}
+        report_phase("strategy intelligence memo", .55)
         report = ai.complete_json("investment_memo", "operator_deep_research", system,
                                   json.dumps(payload, default=str)[:90_000], 900)
         if not report:
@@ -350,6 +652,7 @@ claim. Do not estimate an order size, set portfolio weights, or place a trade.""
         from .models import new_id
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         from .evidence import persist_dossier
+        report_phase("validate and persist dossier", .90)
         dossier = persist_dossier(store, sym, sources["bars_as_of"], sources,
                                   facts, report)
         with store.db:
@@ -358,6 +661,7 @@ claim. Do not estimate an order size, set portfolio weights, or place a trade.""
                               json.dumps(sources), json.dumps(report), dossier["status"]))
         if dossier["status"] == "ready": completed.append(sym)
         else: unsupported.append({"symbol": sym, "error": dossier["error"]})
+        report_phase("symbol complete", 1.0)
     result = {"status": "completed" if completed and not unsupported else
                         "partial" if completed or unsupported else "skipped",
               "completed": completed, "unsupported": unsupported, "skipped": skipped}
@@ -367,6 +671,9 @@ claim. Do not estimate an order size, set portfolio weights, or place a trade.""
 
 def train_holdings(cfg, store, progress=None) -> dict:
     from . import neural
+    if not _compatible_global(store):
+        return {"status": "waiting", "reason": "compatible global TCN dependency not ready",
+                "holdings": 0, "results": {}}
     holdings = sorted({p["symbol"] for p in store.open_positions(mode="live")})
     results = {}
     for index, symbol in enumerate(holdings, 1):
@@ -383,95 +690,334 @@ def train_holdings(cfg, store, progress=None) -> dict:
         try:
             results[symbol] = neural.train_challenger(
                 cfg, store, symbol=symbol, max_seconds=180, progress=neural_progress)
+        except InterruptedError:
+            raise
         except Exception as exc:
             # One bad history must not discard completed work for other holdings.
             results[symbol] = {"status": "failed",
                                "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
             store.audit("holding_training_failed", {"symbol": symbol,
                                                       "error": results[symbol]["error"]})
-    failures = [s for s, result in results.items() if result.get("status") == "failed"]
-    return {"status": "partial" if failures else "completed",
-            "holdings": len(holdings), "failures": failures, "results": results}
+    failures = [s for s, result in results.items()
+                if result.get("status") == "failed" or "error" in result]
+    waiting = [s for s, result in results.items()
+               if result.get("status") in ("waiting", "caught_up")]
+    trained = [s for s, result in results.items()
+               if result.get("status") in ("challenger", "champion")]
+    status = ("completed" if not holdings else
+              "completed" if len(trained) == len(holdings) else
+              "partial" if trained else "waiting")
+    return {"status": status, "holdings": len(holdings), "trained": trained,
+            "waiting": waiting, "failures": failures, "results": results}
 
 
-def run_operator_job(cfg, store) -> dict | None:
-    """Run one queued job through the same global research mutex."""
-    row = store.db.execute(
+def train_global(cfg, store, progress=None) -> dict:
+    """Run the bounded schema-current global tournament for holding dependency.
+
+    Each trial writes an immutable checkpoint.  The job stops at the settled
+    snapshot cap; no champion is force-promoted.
+    """
+    from . import neural
+    from .universe import symbols
+    research_symbols = symbols(store, "research")
+    if len(research_symbols) < 25:
+        return {"status": "waiting", "reason":
+                f"need 25 research-ready symbols; have {len(research_symbols)}"}
+    cap = int(cfg.get("neural", "max_trials_per_snapshot", default=6))
+    completed = []
+    started = time.monotonic()
+    total_budget = int(cfg.get("research", "max_task_seconds", default=600))
+    for trial in range(cap):
+        remaining = total_budget - (time.monotonic() - started)
+        if remaining <= 10:
+            break
+        if progress:
+            progress({"phase": "global_tcn", "trial": trial + 1, "total": cap,
+                      "fraction": trial / max(1, cap)})
+
+        def neural_progress(value):
+            if progress:
+                progress({"phase": "global_tcn", "trial": trial + 1, "total": cap,
+                          **value,
+                          "fraction": (trial + float(value.get("fraction", 0))) /
+                                      max(1, cap)})
+        result = neural.train_challenger(
+            cfg, store, symbols=research_symbols, max_seconds=min(300, remaining),
+            progress=neural_progress)
+        if result.get("status") == "caught_up":
+            break
+        if "error" in result or result.get("status") in ("failed", "waiting"):
+            return {"status": "partial" if completed else "waiting",
+                    "trials": completed, "last": result}
+        completed.append(result)
+    neural.maybe_promote(cfg, store)
+    return {"status": "completed" if completed or _compatible_global(store) else "waiting",
+            "trials_completed": len(completed),
+            "budget_seconds": total_budget,
+            "compatible_global_available": _compatible_global(store),
+            "latest": completed[-1] if completed else None}
+
+
+def run_operator_job(cfg, store, resource_classes: set[str] | None = None) -> dict | None:
+    """Claim and run one eligible job with a renewable row lease.
+
+    Eligibility lives here—not in the GUI scheduler wrapper—so CLI, daemon,
+    restart recovery, and tests cannot disagree about market windows.
+    """
+    now = datetime.now().astimezone()
+    candidates = store.db.execute(
         "SELECT * FROM research_jobs WHERE status='queued' "
-        "ORDER BY priority DESC,requested_at LIMIT 1").fetchone()
+        "ORDER BY priority DESC,requested_at").fetchall()
+    row = None
+    for candidate in candidates:
+        resource = candidate["resource_class"] or JOB_POLICY[candidate["kind"]][1]
+        if resource_classes and resource not in resource_classes:
+            continue
+        dep_id = candidate["depends_on_id"]
+        # Self-heal requests written by older builds or imported support
+        # bundles: materialize prerequisites at claim time as well as enqueue
+        # time. This makes a queued request restart-safe across migrations.
+        if not dep_id and candidate["kind"] == "train_holdings" and \
+                not _compatible_global(store):
+            dep = enqueue_job(store, "train_global", priority=int(candidate["priority"]) + 1,
+                              requested_by=candidate["requested_by"] or "operator",
+                              force=(candidate["run_policy"] == "forced"))
+            dep_id = dep["id"]
+        elif not dep_id and candidate["kind"] == "deep_research":
+            if not _discovery_current(store):
+                dep = enqueue_job(store, "discover",
+                                  priority=int(candidate["priority"]) + 1,
+                                  requested_by=candidate["requested_by"] or "operator")
+                dep_id = dep["id"]
+        if dep_id and not candidate["depends_on_id"]:
+            with store.db:
+                store.db.execute(
+                    "UPDATE research_jobs SET depends_on_id=?,state='waiting_dependency',"
+                    "wait_reason=?,updated_at=? WHERE id=?",
+                    (dep_id, f"dependency:{dep_id}", _iso_now(), candidate["id"]))
+        if dep_id:
+            dep = store.db.execute("SELECT status,state FROM research_jobs WHERE id=?",
+                                   (dep_id,)).fetchone()
+            if not dep or dep["status"] in ("failed", "cancelled"):
+                with store.db:
+                    store.db.execute(
+                        "UPDATE research_jobs SET status='failed',state='failed',completed_at=?,"
+                        "error='dependency failed or was cancelled',updated_at=? WHERE id=?",
+                        (_iso_now(), _iso_now(), candidate["id"]))
+                continue
+            if dep["status"] not in ("completed", "partial"):
+                store.db.execute(
+                    "UPDATE research_jobs SET state='waiting_dependency',wait_reason=?,updated_at=? "
+                    "WHERE id=?", (f"dependency:{dep_id}", _iso_now(), candidate["id"]))
+                store.db.commit(); continue
+        retry_at = _parse_time(candidate["next_retry_at"])
+        if retry_at and retry_at > now:
+            store.db.execute(
+                "UPDATE research_jobs SET state='retry_wait',wait_reason='retry_backoff',"
+                "updated_at=? WHERE id=?", (_iso_now(), candidate["id"]))
+            store.db.commit(); continue
+        policy = candidate["run_policy"] or JOB_POLICY[candidate["kind"]][0]
+        if policy == "closed_market" and _market_open():
+            store.db.execute(
+                "UPDATE research_jobs SET state='waiting_window',wait_reason='market_close',"
+                "eligible_at=?,updated_at=? WHERE id=?",
+                (_next_closed_eligibility(), _iso_now(), candidate["id"]))
+            store.db.commit(); continue
+        row = candidate; break
     if not row:
         return None
-    if row["kind"] == "deep_research":
-        from .universe import symbols
-        if not symbols(store, "shortlist"):
-            enqueue_job(store, "discover", priority=int(row["priority"]) + 1)
-            row = store.db.execute(
-                "SELECT * FROM research_jobs WHERE status='queued' "
-                "ORDER BY priority DESC,requested_at LIMIT 1").fetchone()
-    if not _LOCK.acquire(blocking=False):
-        return {"status": "skipped", "reason": "research worker busy"}
+
+    resource = row["resource_class"] or JOB_POLICY[row["kind"]][1]
+    lock = _RESOURCE_LOCKS.setdefault(resource, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return {"status": "skipped", "reason": f"{resource} worker busy"}
+    lease_owner = None
+    worker = None
+    heartbeat_stop = threading.Event()
+    lease_lost = threading.Event()
+    heartbeat_thread = None
     try:
-        lease_owner = _acquire_lease(store, 30 * 60)
-    except Exception:
-        _LOCK.release()
-        raise
-    if not lease_owner:
-        _LOCK.release()
-        return {"status": "skipped", "reason": "research worker busy in another process"}
-    jid, kind = row["id"], row["kind"]
-    now = datetime.now().astimezone().isoformat(timespec="seconds")
-    with store.db:
-        store.db.execute("UPDATE research_jobs SET status='running',started_at=?,attempts=attempts+1 "
-                         "WHERE id=?", (now, jid))
-    _stamp(store, f"job:{kind}", f"operator job {kind} started",
-           job={"id": jid, "kind": kind, "status": "running", "progress": {}})
-    try:
-        current_progress = {}
+        lease_owner = _acquire_lease(store, LEASE_SECONDS, resource)
+        if not lease_owner:
+            return {"status": "skipped", "reason": f"{resource} worker busy in another process"}
+        jid, kind = row["id"], row["kind"]
+        worker = f"{os.getpid()}:{threading.get_ident()}:{resource}"
+        started = _iso_now()
+        expires = (datetime.now().astimezone() + timedelta(
+            seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
+        # Compare-and-swap claim: cancellation or another process may win, but
+        # never both.
+        with store.db:
+            claimed = store.db.execute(
+                "UPDATE research_jobs SET status='running',state='running',started_at=?,"
+                "updated_at=?,attempts=attempts+1,worker_id=?,heartbeat_at=?,"
+                "lease_expires_at=?,wait_reason=NULL,next_retry_at=NULL "
+                "WHERE id=? AND status='queued'",
+                (started, started, worker, started, expires, jid)).rowcount
+        if not claimed:
+            return {"status": "skipped", "reason": "job claimed or cancelled"}
+        def heartbeat_loop():
+            # Provider calls and a single Torch epoch may legitimately run
+            # longer than the lease. Renew independently of progress callbacks
+            # so another process can never steal a healthy atomic unit.
+            while not heartbeat_stop.wait(max(10, LEASE_SECONDS // 3)):
+                if not _renew_lease(store, lease_owner, resource, LEASE_SECONDS):
+                    lease_lost.set()
+                    return
+                heartbeat = _iso_now()
+                lease = (datetime.now().astimezone() + timedelta(
+                    seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
+                try:
+                    with store.db:
+                        store.db.execute(
+                            "UPDATE research_jobs SET heartbeat_at=?,lease_expires_at=?,"
+                            "updated_at=? WHERE id=? AND status='running' AND worker_id=?",
+                            (heartbeat, lease, heartbeat, jid, worker))
+                except Exception:
+                    pass
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop, name=f"stonk-{resource}-heartbeat", daemon=True)
+        heartbeat_thread.start()
+        _stamp(store, f"job:{kind}", f"operator job {kind} started",
+               job={"id": jid, "kind": kind, "status": "running", "progress": {}})
+        current_progress, last_progress_write = {}, 0.0
 
         def progress(value):
-            nonlocal current_progress
+            nonlocal current_progress, last_progress_write
+            if lease_lost.is_set():
+                raise InterruptedError("worker lease lost; stale worker fenced")
             current_progress = dict(value)
-            store.db.execute("UPDATE research_jobs SET progress=? WHERE id=?",
-                             (json.dumps(value), jid)); store.db.commit()
-            detail = (f"{kind}: {value.get('symbol', '')} "
-                      f"{value.get('index', '')}/{value.get('total', '')}").strip()
-            _stamp(store, f"job:{kind}", detail,
-                   job={"id": jid, "kind": kind, "status": "running",
-                        "progress": value})
-        result = (discover_opportunities(cfg, store) if kind == "discover" else
-                  deep_research(cfg, store, progress=progress) if kind == "deep_research" else
-                  train_holdings(cfg, store, progress))
-        terminal = "completed" if result.get("status") == "completed" else "partial"
-        final_progress = {**current_progress, "phase": terminal, "fraction": 1.0}
+            heartbeat = _iso_now()
+            lease = (datetime.now().astimezone() + timedelta(
+                seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
+            if not _renew_lease(store, lease_owner, resource, LEASE_SECONDS):
+                lease_lost.set()
+                raise InterruptedError("worker lease lost; stale worker fenced")
+            # A running cancel is cooperative and observed at every atomic
+            # progress boundary.
+            cancelling = store.db.execute(
+                "SELECT cancel_requested_at FROM research_jobs WHERE id=?", (jid,)).fetchone()
+            if cancelling and cancelling["cancel_requested_at"]:
+                raise InterruptedError("operator cancellation requested")
+            # Persist rich progress at most once per second; heartbeat/lease is
+            # still renewed at each callback.
+            write_progress = time.monotonic() - last_progress_write >= 1.0 or \
+                float(value.get("fraction", 0)) >= 1.0
+            with store.db:
+                updated = store.db.execute(
+                    "UPDATE research_jobs SET progress=CASE WHEN ? THEN ? ELSE progress END,"
+                    "heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE id=? AND status='running' "
+                    "AND worker_id=?",
+                    (1 if write_progress else 0, json.dumps(value), heartbeat, lease,
+                     heartbeat, jid, worker)).rowcount
+            if not updated:
+                lease_lost.set()
+                raise InterruptedError("job ownership changed; stale worker fenced")
+            if write_progress:
+                last_progress_write = time.monotonic()
+                detail = (f"{kind}: {value.get('phase', '')} {value.get('symbol', '')} "
+                          f"{value.get('index', '')}/{value.get('total', '')}").strip()
+                _stamp(store, f"job:{kind}", detail,
+                       job={"id": jid, "kind": kind, "status": "running",
+                            "progress": value})
+
+        job_payload = json.loads(row["payload"] or "{}")
+        requested_symbols = (job_payload.get("symbols") or
+                             ([job_payload["symbol"]] if job_payload.get("symbol") else []))
+        result = (_call_progress(discover_opportunities, cfg, store, progress=progress)
+                  if kind == "discover" else
+                  _call_progress(deep_research, cfg, store, progress=progress,
+                                 requested_symbols=requested_symbols)
+                  if kind == "deep_research" else
+                  _call_progress(train_global, cfg, store, progress=progress)
+                  if kind == "train_global" else
+                  _call_progress(train_holdings, cfg, store, progress=progress))
+        if lease_lost.is_set():
+            raise InterruptedError("worker lease lost before result commit")
+        result_status = result.get("status")
+        if result_status == "waiting":
+            # A truthful dependency/data wait is not terminal success.  Keep
+            # the durable request and expose why it did not advance.
+            with store.db:
+                updated = store.db.execute(
+                    "UPDATE research_jobs SET status='queued',state='waiting_dependency',"
+                    "started_at=NULL,worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL,"
+                    "wait_reason=?,result=?,progress=?,next_retry_at=?,updated_at=? "
+                    "WHERE id=? AND status='running' AND worker_id=?",
+                    (result.get("reason", "dependency not ready"), json.dumps(result),
+                     json.dumps(current_progress),
+                     (datetime.now().astimezone() + timedelta(minutes=5)).isoformat(
+                         timespec="seconds"), _iso_now(), jid, worker)).rowcount
+            if not updated:
+                raise InterruptedError("job ownership changed before wait commit")
+            return {"job": jid, "kind": kind, **result}
+        coarse = "completed" if result_status == "completed" else "partial"
+        state = "succeeded" if coarse == "completed" else "succeeded_with_warnings"
+        final_progress = {**current_progress, "phase": state, "fraction": 1.0}
         if final_progress.get("total") is not None:
             final_progress["index"] = final_progress["total"]
+        completed = _iso_now()
         with store.db:
-            store.db.execute("UPDATE research_jobs SET status=?,completed_at=?,result=?,progress=? "
-                             "WHERE id=?",
-                             (terminal,
-                              datetime.now().astimezone().isoformat(timespec="seconds"),
-                              json.dumps(result), json.dumps(final_progress), jid))
+            updated = store.db.execute(
+                "UPDATE research_jobs SET status=?,state=?,completed_at=?,result=?,progress=?,"
+                "updated_at=?,worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL "
+                "WHERE id=? AND status='running' AND worker_id=?",
+                (coarse, state, completed, json.dumps(result),
+                 json.dumps(final_progress), completed, jid, worker)).rowcount
+        if not updated:
+            raise InterruptedError("job ownership changed before terminal commit")
         store.audit("research_job_completed", {"id": jid, "kind": kind,
-                                                "status": result.get("status")})
-        _stamp(store, "idle", "waiting for the next closed-market research tick",
-               last_task={"phase": f"job:{kind}", "detail": result.get("status"),
-                          "completed_at": datetime.now().astimezone().isoformat(
-                              timespec="seconds")})
+                                                "status": result_status})
+        _stamp(store, "idle", "operator worker idle",
+               last_task={"phase": f"job:{kind}", "detail": result_status,
+                          "completed_at": completed})
         return {"job": jid, "kind": kind, **result}
+    except InterruptedError as exc:
+        if row:
+            jid, kind = row["id"], row["kind"]
+            with store.db:
+                store.db.execute(
+                    "UPDATE research_jobs SET status='cancelled',state='cancelled',completed_at=?,"
+                    "error=?,updated_at=?,worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL "
+                    "WHERE id=? AND status='running' AND worker_id=?",
+                    (_iso_now(), str(exc), _iso_now(), jid, worker))
+            return {"job": jid, "kind": kind, "status": "cancelled"}
+        return {"status": "cancelled"}
     except Exception as exc:
         from .health import _redact
         error = _redact(f"{type(exc).__name__}: {str(exc)[:240]}")
+        jid, kind = row["id"], row["kind"]
+        attempts = store.db.execute(
+            "SELECT attempts,max_attempts FROM research_jobs WHERE id=?", (jid,)).fetchone()
+        retryable = int(attempts["attempts"] or 0) < int(attempts["max_attempts"] or 2)
         with store.db:
-            store.db.execute("UPDATE research_jobs SET status='failed',completed_at=?,error=? "
-                             "WHERE id=?", (datetime.now().astimezone().isoformat(
-                                 timespec="seconds"), error, jid))
-        store.audit("research_job_failed", {"id": jid, "kind": kind, "error": error})
+            if retryable:
+                store.db.execute(
+                    "UPDATE research_jobs SET status='queued',state='retry_wait',started_at=NULL,"
+                    "next_retry_at=?,wait_reason='retryable failure',error=?,updated_at=?,"
+                    "worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL WHERE id=? "
+                    "AND status='running' AND worker_id=?",
+                    ((datetime.now().astimezone() + timedelta(seconds=30)).isoformat(
+                        timespec="seconds"), error, _iso_now(), jid, worker))
+            else:
+                store.db.execute(
+                    "UPDATE research_jobs SET status='failed',state='failed',completed_at=?,"
+                    "error=?,updated_at=?,worker_id=NULL,heartbeat_at=NULL,lease_expires_at=NULL "
+                    "WHERE id=? AND status='running' AND worker_id=?",
+                    (_iso_now(), error, _iso_now(), jid, worker))
+        store.audit("research_job_failed", {"id": jid, "kind": kind,
+                                             "error": error, "retryable": retryable})
         _stamp(store, "error", f"operator job {kind} failed: {error}",
-               job={"id": jid, "kind": kind, "status": "failed"})
-        return {"job": jid, "kind": kind, "status": "failed", "error": error}
+               job={"id": jid, "kind": kind,
+                    "status": "retry_wait" if retryable else "failed"})
+        return {"job": jid, "kind": kind,
+                "status": "retry_wait" if retryable else "failed", "error": error}
     finally:
-        _release_lease(store, lease_owner)
-        _LOCK.release()
+        heartbeat_stop.set()
+        if heartbeat_thread:
+            heartbeat_thread.join(timeout=2)
+        _release_lease(store, lease_owner, resource)
+        lock.release()
 
 
 def resolve_forecasts(store) -> int:
@@ -554,6 +1100,7 @@ def graph_samples(store) -> tuple[list[dict], list[list[float]]]:
             "SELECT COALESCE(json_extract(a.payload,'$.as_of'),substr(s.ts,1,10)) d,"
             "s.cycle_id,s.symbol,s.node_id,s.direction,s.score,s.confidence FROM signals s "
             "LEFT JOIN audit a ON a.cycle_id=s.cycle_id AND a.event_type='cycle_start' "
+            "WHERE s.node_version IS NOT NULL AND s.node_version!='legacy' "
             "ORDER BY d,s.symbol,s.node_id").fetchall()
         regimes = {r["cycle_id"]: r["regime"] for r in sample_store.db.execute(
             "SELECT cycle_id,json_extract(payload,'$.regime') regime FROM audit "
@@ -607,7 +1154,8 @@ def graph_samples(store) -> tuple[list[dict], list[list[float]]]:
     def signal_count(path):
         try:
             row = Store(path).db.execute(
-                "SELECT COUNT(*) n,COUNT(DISTINCT node_id) nodes FROM signals").fetchone()
+                "SELECT COUNT(*) n,COUNT(DISTINCT node_id) nodes FROM signals "
+                "WHERE node_version IS NOT NULL AND node_version!='legacy'").fetchone()
             return row["nodes"], row["n"]
         except Exception:
             return 0, 0
@@ -726,13 +1274,19 @@ def current_scenarios(cfg, store) -> dict:
 def run_next(cfg, store, max_seconds: int | None = None) -> dict:
     if not _LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "research task already running"}
+    training_lock = _RESOURCE_LOCKS["training"]
+    if not training_lock.acquire(blocking=False):
+        _LOCK.release()
+        return {"status": "skipped", "reason": "training/backfill lane busy"}
     max_seconds = max_seconds or int(cfg.get("research", "max_task_seconds", default=600))
     try:
-        lease_owner = _acquire_lease(store, max_seconds + 120)
+        lease_owner = _acquire_lease(store, max_seconds + 120, "training")
     except Exception:
+        training_lock.release()
         _LOCK.release()
         raise
     if not lease_owner:
+        training_lock.release()
         _LOCK.release()
         return {"status": "skipped", "reason": "research worker busy in another process"}
     try:
@@ -870,7 +1424,8 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
             # may remain false when Codex/Claude subscription calls are active.
             if cfg.get("intelligence", "enabled", default=False) or \
                     cfg.get("ai", "enabled", default=False):
-                enqueue_job(store, "deep_research", priority=1)
+                enqueue_job(store, "deep_research", priority=1,
+                            requested_by="autonomous")
             return {"task": "discovery", **result}
         if ready < floor:
             return {"task": "breadth_wait", "status": "waiting", "ready": ready,
@@ -943,7 +1498,8 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
                    last_task={"phase": state.get("phase"), "detail": state.get("detail"),
                               "completed_at": datetime.now().astimezone().isoformat(
                                   timespec="seconds")})
-        _release_lease(store, lease_owner)
+        _release_lease(store, lease_owner, "training")
+        training_lock.release()
         _LOCK.release()
 
 

@@ -71,6 +71,15 @@ def test_verified_dossier_is_consumed_by_live_node_and_api(cfg, store):
     assert body["dossier"]["fundamental_memo"]["stance"] == "attractive"
 
 
+def test_future_created_dossier_is_hidden_from_historical_replay(store):
+    sources = {"bars_as_of": "2026-07-15", "filings": [], "news": []}
+    dossier = persist_dossier(store, "AAA", "2026-07-15", sources, [], {})
+    store.db.execute("UPDATE company_evidence SET created_at='2026-07-15T12:00:00' WHERE id=?",
+                     (dossier["id"],))
+    store.db.commit()
+    assert latest_dossier(store, "AAA", "2026-07-14", "2026-07-14") is None
+    assert latest_dossier(store, "AAA", "2026-07-15", "2026-07-15")["id"] == dossier["id"]
+
 def test_legacy_backtests_remain_visible_but_not_live_analogs(store):
     base = {"symbol": "AAA", "entry_date": "2025-01-01", "exit_date": "2025-01-10",
             "entry_price": 10, "exit_price": 11, "qty": 1, "pnl": 1, "ret": .1,
@@ -80,3 +89,7 @@ def test_legacy_backtests_remain_visible_but_not_live_analogs(store):
     assert len(store.trades(source="backtest")) == 1
     assert store.trades(source="backtest")[0]["qualified"] == 0
     assert store.analog_returns("s2", "risk_on") == [-.02]
+    assert store.analog_returns("s2", "risk_on", evidence_version="evidence.v2",
+                                horizon_days=20, asset_type="equity") == [-.02]
+    assert store.analog_returns("s2", "risk_on", evidence_version="evidence.v3",
+                                horizon_days=20, asset_type="equity") == []

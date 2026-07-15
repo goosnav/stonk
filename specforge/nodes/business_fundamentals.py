@@ -19,10 +19,15 @@ class Node(SignalNode):
         for symbol in ctx.universe:
             if symbol in ETFISH or symbol.startswith("^"):
                 continue
-            dossier = latest_dossier(ctx.store, symbol, ctx.as_of)
+            dossier = latest_dossier(ctx.store, symbol, ctx.as_of,
+                                      ctx.as_of if getattr(ctx, "historical", False) else None)
             memo = (dossier or {}).get("fundamental_memo") or {}
-            if not memo or memo.get("stance") == "neutral":
+            if not memo:
+                self.symbol_states[symbol] = "unavailable"
                 missing += 1
+                continue
+            if memo.get("stance") == "neutral":
+                self.symbol_states[symbol] = "verified_neutral"
                 continue
             confidence = float(memo.get("confidence", 0))
             quality = float((dossier or {}).get("quality", 0))
@@ -41,6 +46,7 @@ class Node(SignalNode):
                 evidence=[f"{memo.get('thesis','')[:180]} [{citations}]"],
                 data_as_of=datetime.strptime(ctx.as_of, "%Y-%m-%d"),
                 node_id=self.id, node_version=self.version))
+            self.symbol_states[symbol] = "running"
         if missing:
             self.degraded_reason = f"no verified current dossier for {missing} symbol(s)"
         return events

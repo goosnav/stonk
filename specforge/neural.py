@@ -139,7 +139,9 @@ def _fundamental_series(store, symbol: str, index) -> dict[str, pd.Series]:
             "CommonStockSharesOutstanding")
     marks = ",".join("?" for _ in tags)
     rows = store.db.execute(
-        f"SELECT filed,period_end,tag,value FROM filing_facts WHERE cik=? AND tag IN ({marks}) "
+        f"SELECT filed,period_end,tag,value FROM filing_facts WHERE cik=? "
+        "AND form IN ('10-K','10-K/A') "
+        f"AND tag IN ({marks}) "
         "ORDER BY filed,period_end", (str(inst["cik"]), *tags)).fetchall()
     if not rows:
         return empty
@@ -364,8 +366,10 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -
     val_start = unique[int(len(unique) * 0.70)]
     embargo = max(horizons)
     val_pos, test_pos = unique.index(val_start), unique.index(test_start)
-    train_end = unique[max(0, val_pos - embargo)]
-    val_end = unique[max(val_pos, test_pos - embargo)]
+    # Strict embargo: a training target ending exactly on the first validation
+    # or test session is still leakage. Leave one additional settled session.
+    train_end = unique[max(0, val_pos - embargo - 1)]
+    val_end = unique[max(val_pos, test_pos - embargo - 1)]
     d = np.asarray(dates)
     masks = {"train": d <= train_end,
              "val": (d >= val_start) & (d <= val_end),
@@ -379,7 +383,8 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -
             "mean": mean, "std": std, "horizons": horizons,
             "target_scale": target_scale,
             "data_as_of": unique[-1], "train_end": train_end,
-            "val_start": val_start, "test_start": test_start}
+            "val_start": val_start, "val_end": val_end,
+            "test_start": test_start}
 
 
 def _make_model(n_features: int, n_horizons: int):
@@ -639,7 +644,7 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
     started = time.time()
     for fold in range(folds):
         train_pos = initial + fold * width
-        test_start_pos = train_pos + embargo
+        test_start_pos = train_pos + embargo + 1
         test_end_pos = sealed if fold == folds - 1 else min(sealed, test_start_pos + width)
         if test_start_pos >= test_end_pos:
             continue
@@ -785,7 +790,11 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     best, best_loss, stale = None, float("inf"), 0
     started = time.time()
     max_epochs = int(cfg.get("neural", "max_epochs", default=50))
-    final_trial = cap >= 5 and trials == cap - 1
+    sealed_epoch = str(market_snapshot)[:7]
+    sealed_key = (f"neural_sealed_inspection_{sealed_epoch}_{MODEL_SCHEMA}_"
+                  f"{FEATURE_HASH}_{ARCHITECTURE_HASH}")
+    sealed_available = not bool(store.kv_get(sealed_key, False))
+    final_trial = cap >= 5 and trials == cap - 1 and (bool(symbol) or sealed_available)
     # Preserve enough of the bounded final trial for the five chronological
     # folds; the ordinary validation challengers can use the whole budget.
     training_seconds = max_seconds * .4 if max_seconds and final_trial else max_seconds
@@ -830,6 +839,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
             break
     model.load_state_dict(best or model.state_dict()); model.eval()
     tournament_winner_id = None
+    winner_trial_spec = dict(trial_spec)
     if final_trial and not symbol:
         # Validation chooses the tournament winner. Only this cloned winner is
         # allowed to inspect the sealed test and walk-forward report folds.
@@ -856,6 +866,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                 model = prior_model.to(device)
                 winner_score, tournament_winner_id = float(score), row["id"]
                 winner_loss = float(prior_metrics.get("validation_objective", winner_loss))
+                winner_trial_spec = dict(prior_metrics.get("trial_spec") or trial_spec)
         best_loss = winner_loss
     eval_idx = te if final_trial else va.numpy()
     # Fit the transform on validation only; the sealed block and live calls
@@ -875,7 +886,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                        winner_score if final_trial and not symbol else _selection_score(metrics), 6),
                    tournament_key=tournament_key,
                    data_fingerprint=data_fingerprint,
-                   device=device, trial_spec=trial_spec,
+                   device=device, trial_spec=winner_trial_spec,
                    calibration_source="validation")
     if not symbol:
         metrics["baselines"] = _baseline_metrics(ds, eval_idx)
@@ -900,7 +911,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     if final_trial:
         remaining = None if max_seconds is None else max(5.0, max_seconds - (time.time() - started))
         walk_metrics, oos_predictions = _walk_forward_metrics(
-            cfg, ds, trial_spec=trial_spec, max_seconds=remaining)
+            cfg, ds, trial_spec=winner_trial_spec, max_seconds=remaining)
         metrics.update(walk_metrics)
         # The validation-selected final model has never seen the sealed block.
         # Its per-symbol sealed predictions are therefore legitimate OOS graph
@@ -939,7 +950,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                "mean": ds["mean"], "std": ds["std"],
                "target_scale": ds["target_scale"],
-               "calibration": calibration, "trial_spec": trial_spec,
+               "calibration": calibration, "trial_spec": winner_trial_spec,
                "features": FEATURES, "horizons": ds["horizons"],
                "active_features": active_features,
                "metrics": metrics, "trained_at": _now(), "data_as_of": snapshot,
@@ -966,6 +977,9 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                   "historical_oos", realized, FEATURE_HASH)
                  for as_of, owner, horizon, q10, q50, q90, probability, realized
                  in oos_predictions])
+    if final_trial and not symbol:
+        store.kv_set(sealed_key, {"model_id": rid, "inspected_at": _now(),
+                                  "market_snapshot": market_snapshot})
     status = {"id": rid, "kind": kind, "symbol": symbol, "status": "challenger",
               "data_as_of": snapshot, "metrics": metrics, "trial": trials + 1,
               "at": _now()}
@@ -1263,11 +1277,44 @@ def maybe_promote(cfg, store) -> dict:
             with store.db:
                 store.db.execute("UPDATE model_runs SET status='retired' WHERE id=?",
                                  (retired_id,))
+                predecessor = None
+                for candidate in store.db.execute(
+                        "SELECT * FROM model_runs WHERE kind='global_tcn' AND status='retired' "
+                        "AND id<>? AND incompatibility_reason IS NULL ORDER BY created_at DESC",
+                        (retired_id,)).fetchall():
+                    candidate_metrics = json.loads(candidate["metrics"] or "{}")
+                    candidate_age = (datetime.now().date() -
+                                     datetime.fromisoformat(candidate["created_at"]).date()).days
+                    if _offline_gate(candidate_metrics) and candidate_age <= int(
+                            cfg.get("neural", "max_checkpoint_age_days", default=7)):
+                        predecessor = candidate
+                        break
+                restored_graph = None
+                if predecessor:
+                    store.db.execute("UPDATE model_runs SET status='champion' WHERE id=?",
+                                     (predecessor["id"],))
+                    for graph_row in store.db.execute(
+                            "SELECT * FROM graph_versions WHERE status='retired' "
+                            "ORDER BY created_at DESC").fetchall():
+                        graph_metrics = json.loads(graph_row["metrics"] or "{}")
+                        if graph_metrics.get("temporal_model_id") == predecessor["id"]:
+                            store.db.execute(
+                                "UPDATE graph_versions SET status='retired' WHERE status='champion'")
+                            store.db.execute(
+                                "UPDATE graph_versions SET status='champion' WHERE id=?",
+                                (graph_row["id"],))
+                            restored_graph = graph_row["id"]
+                            break
             store.audit("neural_champion_rolled_back", {"id": retired_id,
                                                          "stale": stale,
                                                          "offline_gate_failed": integrity_failed,
+                                                         "restored": predecessor["id"] if predecessor else None,
+                                                         "restored_graph": restored_graph,
                                                          "metrics": sm})
-            return {"action": "rollback", "id": retired_id,
+            return {"action": "rollback_restore" if predecessor else "rollback",
+                    "id": retired_id,
+                    "restored": predecessor["id"] if predecessor else None,
+                    "restored_graph": restored_graph,
                     "offline_gate_failed": integrity_failed, "metrics": sm}
     row = store.db.execute("SELECT * FROM model_runs WHERE kind='global_tcn' "
                            "AND status='challenger' ORDER BY created_at DESC LIMIT 1").fetchone()

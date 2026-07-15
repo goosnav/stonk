@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 from .config import load_config
@@ -85,11 +87,20 @@ def cmd_backtest(args, cfg, store):
 
 
 def cmd_research(args, cfg, store):
-    from .research import run_next, status
-    if args.status:
-        print(json.dumps(status(store), indent=2, default=str))
+    from .research import (enqueue_job, list_jobs, run_next, run_operator_job,
+                           status)
+    if args.enqueue:
+        print(json.dumps(enqueue_job(store, args.enqueue,
+                                     requested_by="operator", force=args.force),
+                         indent=2, default=str))
+    elif args.jobs:
+        print(json.dumps(list_jobs(store, 50), indent=2, default=str))
+    elif args.status:
+        print(json.dumps(status(store, cfg), indent=2, default=str))
     else:
-        print(json.dumps(run_next(cfg, store, max_seconds=args.max_minutes * 60),
+        result = run_operator_job(cfg, store) or \
+            run_next(cfg, store, max_seconds=args.max_minutes * 60)
+        print(json.dumps(result,
                          indent=2, default=str))
 
 
@@ -98,6 +109,41 @@ def cmd_serve(args, cfg, store):
 
     import uvicorn
     from .app import create_app
+    instance_key = f"service_instance:{cfg.mode}"
+    instance_token = f"{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        store.db.execute("BEGIN IMMEDIATE")
+        row = store.db.execute("SELECT value FROM kv WHERE key=?", (instance_key,)).fetchone()
+        previous = json.loads(row["value"]) if row else {}
+        previous_pid = int(previous.get("pid", 0) or 0)
+        alive = False
+        if previous_pid and previous_pid != os.getpid():
+            try:
+                os.kill(previous_pid, 0); alive = True
+            except (ProcessLookupError, PermissionError):
+                pass
+        if alive:
+            store.db.rollback()
+            print(f"a {cfg.mode} Stonk service is already running (pid {previous_pid}); "
+                  "refusing to start a second trading scheduler", file=sys.stderr)
+            return 2
+        payload = json.dumps({"pid": os.getpid(), "token": instance_token})
+        store.db.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) "
+                         "DO UPDATE SET value=excluded.value", (instance_key, payload))
+        store.db.commit()
+    except Exception:
+        store.db.rollback()
+        raise
+    def release_instance():
+        try:
+            store.db.execute("BEGIN IMMEDIATE")
+            row = store.db.execute("SELECT value FROM kv WHERE key=?", (instance_key,)).fetchone()
+            current = json.loads(row["value"]) if row else {}
+            if current.get("token") == instance_token:
+                store.db.execute("DELETE FROM kv WHERE key=?", (instance_key,))
+            store.db.commit()
+        except Exception:
+            store.db.rollback()
     store.scrub_audit_history()
     # Pre-bind once and pass the socket into Uvicorn: choosing a fallback and
     # releasing it before server startup creates a check-then-bind race.
@@ -114,26 +160,43 @@ def cmd_serve(args, cfg, store):
             candidate.close()
     if listener is None:
         print(f"no free loopback port in {args.port}-{args.port_range_end}", file=sys.stderr)
+        release_instance()
         return 2
     effective_port = listener.getsockname()[1]
+    # Publish the bound port so alternate headless clients can attach instead
+    # of starting a second scheduler when the preferred port was occupied.
+    try:
+        store.db.execute("BEGIN IMMEDIATE")
+        row = store.db.execute("SELECT value FROM kv WHERE key=?", (instance_key,)).fetchone()
+        current = json.loads(row["value"]) if row else {}
+        if current.get("token") == instance_token:
+            current["effective_port"] = effective_port
+            store.db.execute("UPDATE kv SET value=? WHERE key=?",
+                             (json.dumps(current), instance_key))
+        store.db.commit()
+    except Exception:
+        store.db.rollback()
+        listener.close(); release_instance(); raise
     detail = {"mode": cfg.mode, "preferred_port": args.port,
               "effective_port": effective_port,
               "fallback": effective_port != args.port}
     store.audit("service_starting", detail)
     print(f"STONK_URL=http://127.0.0.1:{effective_port}", flush=True)
-    app = create_app(cfg, store)
-    server = uvicorn.Server(uvicorn.Config(
-        app, log_level="info" if args.verbose else "warning",
-        access_log=args.verbose))
+    app = None
     try:
+        app = create_app(cfg, store)
+        server = uvicorn.Server(uvicorn.Config(
+            app, log_level="info" if args.verbose else "warning",
+            access_log=args.verbose))
         server.run(sockets=[listener])
     except KeyboardInterrupt:
         pass
     finally:
-        scheduler = getattr(app.state, "scheduler", None)
+        scheduler = getattr(app.state, "scheduler", None) if app else None
         if scheduler and scheduler.running:
             scheduler.shutdown(wait=False)
         listener.close()
+        release_instance()
         store.audit("service_stopped", {"mode": cfg.mode,
                                          "effective_port": effective_port})
 
@@ -290,8 +353,8 @@ def _console_frame(port: int, color: bool) -> str:
     us = research.get("universe") or {}
     tiers = us.get("tiers") or {}
     graph = research.get("graph") or {}
-    active_job = next((j for j in research.get("jobs", [])
-                       if j.get("status") in ("queued", "running")), None)
+    active_jobs = [j for j in research.get("jobs", [])
+                   if j.get("status") in ("queued", "running")]
     lines += ["", B + "OFF-HOURS RESEARCH" + X,
               f"{rs.get('phase', 'unknown')}: {rs.get('detail', '—')}  "
               f"catalog {((us.get('catalog') or {}).get('count') or 0):,} · "
@@ -307,11 +370,14 @@ def _console_frame(port: int, color: bool) -> str:
     lines.append(f"company dossiers {evidence_status.get('counts') or {}} · "
                  f"AI month {_money(evidence_budget.get('spent_month_usd'))}/"
                  f"{_money(evidence_budget.get('monthly_budget_usd'))}")
-    if active_job:
-        p = active_job.get("progress") or {}
-        lines.append(f"operator job {active_job['kind']} {active_job['status']}"
-                     + (f" · {p.get('symbol')} {p.get('index')}/{p.get('total')}"
-                        if p.get("symbol") else ""))
+    for job in active_jobs:
+        p = job.get("progress") or {}
+        detail = (f"{p.get('phase', '')} {p.get('symbol', '')} "
+                  f"{p.get('index', '')}/{p.get('total', '')}").strip(" /")
+        wait = job.get("wait_reason") or ""
+        lines.append(f"{job.get('resource_class', 'research'):<12} "
+                     f"{job['kind']} {job.get('state') or job['status']} · "
+                     f"{detail or wait or 'queued'}")
 
     mandate = strategy_state.get("active") or {}
     mandate_payload = mandate.get("payload") or {}
@@ -475,6 +541,12 @@ def main(argv=None):
     s.add_argument("--save-analogs", action="store_true", default=True)
     s = sub.add_parser("research")
     s.add_argument("--status", action="store_true")
+    s.add_argument("--jobs", action="store_true",
+                   help="show durable operator jobs with progress and wait reasons")
+    s.add_argument("--enqueue", choices=("discover", "deep_research", "train_holdings"),
+                   help="queue an operator research action")
+    s.add_argument("--force", action="store_true",
+                   help="legacy flag; market-hours training is intentionally rejected")
     s.add_argument("--max-minutes", type=int, default=10)
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8420)
     s.add_argument("--port-range-end", type=int, default=8420,

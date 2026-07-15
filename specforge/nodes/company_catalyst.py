@@ -21,17 +21,26 @@ class Node(SignalNode):
         for symbol in ctx.universe:
             if symbol in ETFISH or symbol.startswith("^"):
                 continue
-            dossier = latest_dossier(ctx.store, symbol, ctx.as_of)
+            dossier = latest_dossier(ctx.store, symbol, ctx.as_of,
+                                      ctx.as_of if getattr(ctx, "historical", False) else None)
             if dossier:
                 try:
                     if datetime.now().astimezone() - datetime.fromisoformat(
                             dossier["created_at"]) > timedelta(hours=6):
-                        self.degraded_reason = "catalyst dossier is older than six hours"
-                        dossier = None       # fresh news may still supply the catalyst vote
+                        # Filing/event analysis remains valid until its source
+                        # hash changes. Only the fast-moving news aggregation
+                        # has a six-hour freshness contract.
+                        self.degraded_reason = "news refresh due; filing catalyst retained"
                 except (KeyError, ValueError):
-                    continue
+                    pass
             memo = (dossier or {}).get("catalyst_memo") or {}
             news = news_by_symbol.get(symbol) or {}
+            try:
+                if news and datetime.now().astimezone() - datetime.fromisoformat(
+                        news.get("as_of", "")) > timedelta(hours=6):
+                    news = {}
+            except (TypeError, ValueError):
+                news = {}
             memo_signed = 0.0
             if memo and memo.get("stance") != "neutral":
                 memo_signed = (1 if memo.get("stance") == "attractive" else -1) * float(
@@ -40,6 +49,8 @@ class Node(SignalNode):
             signed = (.65 * memo_signed + .35 * news_signed if memo and news else
                       memo_signed if memo else news_signed)
             if not signed:
+                self.symbol_states[symbol] = ("verified_neutral" if memo or news
+                                              else "unavailable")
                 continue
             confidence = min(1.0, abs(signed))
             if confidence <= 0:
@@ -63,4 +74,5 @@ class Node(SignalNode):
                 evidence=[f"{thesis[:180]}" + (f" [{citations}]" if citations else "")],
                 data_as_of=datetime.strptime(ctx.as_of, "%Y-%m-%d"),
                 node_id=self.id, node_version=self.version))
+            self.symbol_states[symbol] = "running"
         return events

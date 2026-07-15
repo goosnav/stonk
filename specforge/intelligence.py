@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import threading
+import time
 from datetime import datetime, timezone
 
 from .models import new_id
@@ -59,6 +60,9 @@ def jobs(store, limit: int = 30) -> list[dict]:
 
 
 def recover(store) -> int:
+    lease = store.kv_get("research_worker_lease:intelligence") or {}
+    if float(lease.get("expires_at", 0) or 0) > time.time():
+        return 0
     with store.db:
         count = store.db.execute("UPDATE intelligence_jobs SET status='queued',started_at=NULL "
                                  "WHERE status='running' AND attempts<2").rowcount
@@ -178,7 +182,22 @@ def refresh_news(cfg, store, progress=None, fetcher=None, ai=None) -> dict:
 def run_next(cfg, store) -> dict | None:
     if not _LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "intelligence worker busy"}
+    from .research import _acquire_lease, _release_lease, _renew_lease
+    owner = None
+    heartbeat_stop = threading.Event()
+    lease_lost = threading.Event()
+    heartbeat_thread = None
     try:
+        owner = _acquire_lease(store, 300, "intelligence")
+        if not owner:
+            return {"status": "skipped", "reason": "intelligence worker busy in another lane"}
+        def heartbeat_loop():
+            while not heartbeat_stop.wait(60):
+                if not _renew_lease(store, owner, "intelligence", 300):
+                    lease_lost.set(); return
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop, name="stonk-intelligence-heartbeat", daemon=True)
+        heartbeat_thread.start()
         row = store.db.execute("SELECT * FROM intelligence_jobs WHERE status='queued' "
                                "ORDER BY priority DESC,requested_at LIMIT 1").fetchone()
         if not row: return None
@@ -192,6 +211,8 @@ def run_next(cfg, store) -> dict | None:
         current = {}
         def progress(value):
             nonlocal current
+            if lease_lost.is_set():
+                raise InterruptedError("intelligence worker lease lost")
             current = dict(value)
             with store.db:
                 store.db.execute("UPDATE intelligence_jobs SET progress=? WHERE id=?",
@@ -203,6 +224,8 @@ def run_next(cfg, store) -> dict | None:
                 output = {"status": "completed", "mandate": result}
             else:
                 output = refresh_news(cfg, store, progress=progress)
+            if lease_lost.is_set():
+                raise InterruptedError("intelligence worker lease lost before result commit")
             terminal = "completed" if output.get("status") == "completed" else "partial"
             final_progress = {**current, "phase": terminal, "fraction": 1.0}
             if "available" in output:
@@ -216,6 +239,10 @@ def run_next(cfg, store) -> dict | None:
                                                         "status": terminal})
             return get_job(store, jid)
         except Exception as exc:
+            if lease_lost.is_set():
+                # Ownership has changed; the replacement worker is the only
+                # process allowed to publish terminal state.
+                return {"status": "skipped", "reason": "intelligence lease lost"}
             error = f"{type(exc).__name__}: {str(exc)[:300]}"
             with store.db:
                 store.db.execute("UPDATE intelligence_jobs SET status='failed',completed_at=?,"
@@ -224,4 +251,8 @@ def run_next(cfg, store) -> dict | None:
                                                       "error": error})
             return get_job(store, jid)
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread:
+            heartbeat_thread.join(timeout=2)
+        _release_lease(store, owner, "intelligence")
         _LOCK.release()

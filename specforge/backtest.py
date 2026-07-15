@@ -126,7 +126,7 @@ def _liquidate(bt: Store, bt_cfg, broker, last_day: str) -> None:
     from .data import MarketContext
     from .execution import Executor
     from .risk import Governor
-    ctx = MarketContext(bt, bt_cfg, as_of=last_day)
+    ctx = MarketContext(bt, bt_cfg, as_of=last_day, historical=True)
     broker.set_quotes(ctx.prices())
     gov = Governor(bt_cfg, bt, now_iso=f"{last_day}T20:00:00")
     ex = Executor(bt_cfg, bt, broker, gov)

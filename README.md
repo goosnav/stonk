@@ -28,8 +28,10 @@ Data → Signal nodes → Regime gate → Ensemble (+error bars) → Portfolio
   everything opened in one scan cycle is capped (default 10% of equity, hard $
   ceiling, scaled down by regime stress to zero).
 - **Self-improvement is statistics, not vibes**: closed trades update per-node
-  scorecards; weight multipliers move within [0.3×, 2×] with Bayesian shrinkage;
-  chronically negative nodes auto-disable; promotions need a human.
+  scorecards; weight multipliers move within visible status-specific floors
+  and a configured ceiling with Bayesian shrinkage;
+  chronically weak nodes are automatically deemphasized to a nonzero floor;
+  only the human toggle can disable an analysis, and promotions need a human.
 - **Every projection ships with error bars** bootstrapped from measured trades
   (backtest → paper → live), labeled with a confidence basis.
 - **Bounded instruments only**: long equities/ETFs and long calls/puts (max

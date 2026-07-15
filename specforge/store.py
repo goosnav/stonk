@@ -34,6 +34,11 @@ def configure_file_logging(mode: str, log_dir: str | Path | None = None) -> Path
         handler.setFormatter(logging.Formatter("%(message)s"))
         _AUDIT_LOG.addHandler(handler)
         _AUDIT_LOG.setLevel(logging.INFO)
+    try:
+        path.touch(exist_ok=True)
+        path.chmod(0o600)
+    except OSError:
+        pass
     return path
 
 SCHEMA = """
@@ -46,7 +51,8 @@ CREATE TABLE IF NOT EXISTS bars(
 CREATE TABLE IF NOT EXISTS signals(
   id TEXT PRIMARY KEY, cycle_id TEXT, ts TEXT, node_id TEXT, symbol TEXT,
   direction TEXT, score REAL, confidence REAL, horizon_days INTEGER,
-  expected_return REAL, expected_volatility REAL, downside REAL, evidence TEXT
+  expected_return REAL, expected_volatility REAL, downside REAL, evidence TEXT,
+  node_version TEXT
 );
 CREATE TABLE IF NOT EXISTS candidates(
   id TEXT PRIMARY KEY, cycle_id TEXT, ts TEXT, symbol TEXT, final_score REAL,
@@ -75,7 +81,8 @@ CREATE TABLE IF NOT EXISTS trades(                  -- closed round-trips (+ bac
   pnl REAL, ret REAL,                               -- ret = net simple return incl. modeled costs
   horizon_days INTEGER, score REAL, score_bucket TEXT, regime TEXT,
   nodes TEXT, source TEXT, exit_reason TEXT,
-  qualified INTEGER DEFAULT 1, evidence_version TEXT DEFAULT 'legacy'
+  qualified INTEGER DEFAULT 1, evidence_version TEXT DEFAULT 'legacy',
+  entry_candidate_id TEXT
 );
 CREATE TABLE IF NOT EXISTS equity_curve(
   d TEXT, ts TEXT, equity REAL, cash REAL, source TEXT,
@@ -243,6 +250,8 @@ class Store:
         if str(path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._connections: set[sqlite3.Connection] = set()
+        self._connections_lock = threading.Lock()
         self.db.executescript(SCHEMA)
         # migration for DBs created before positions.mode existed
         try:
@@ -262,7 +271,8 @@ class Store:
                 pass
         for column, declaration in (
                 ("qualified", "INTEGER DEFAULT 1"),
-                ("evidence_version", "TEXT DEFAULT 'legacy'")):
+                ("evidence_version", "TEXT DEFAULT 'legacy'"),
+                ("entry_candidate_id", "TEXT")):
             try:
                 self.db.execute(f"ALTER TABLE trades ADD COLUMN {column} {declaration}")
                 self.db.commit()
@@ -301,6 +311,102 @@ class Store:
                 self.db.commit()
             except sqlite3.OperationalError:
                 pass
+        # Durable research work predates the worker/eligibility contract.  Keep
+        # the original twelve columns for database compatibility and add the
+        # richer state additively so old rows and support bundles remain
+        # readable.  `status` is the coarse legacy API field; `state` is the
+        # truthful operator-facing state machine.
+        for column, declaration in (
+                ("state", "TEXT DEFAULT 'queued'"),
+                ("requested_by", "TEXT DEFAULT 'legacy'"),
+                ("run_policy", "TEXT DEFAULT 'closed_market'"),
+                ("resource_class", "TEXT DEFAULT 'research'"),
+                ("depends_on_id", "TEXT"),
+                ("eligible_at", "TEXT"),
+                ("wait_reason", "TEXT"),
+                ("worker_id", "TEXT"),
+                ("heartbeat_at", "TEXT"),
+                ("lease_expires_at", "TEXT"),
+                ("cancel_requested_at", "TEXT"),
+                ("next_retry_at", "TEXT"),
+                ("max_attempts", "INTEGER DEFAULT 2"),
+                ("updated_at", "TEXT"),
+                ("dedup_key", "TEXT")):
+            try:
+                self.db.execute(f"ALTER TABLE research_jobs ADD COLUMN {column} {declaration}")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self.db.execute("ALTER TABLE signals ADD COLUMN node_version TEXT")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass
+        # Translate legacy terminal rows without replaying them.  Queued work
+        # is re-evaluated by the current policy rather than trusted blindly.
+        self.db.execute(
+            "UPDATE research_jobs SET state=CASE status "
+            "WHEN 'completed' THEN 'succeeded' WHEN 'partial' THEN 'succeeded_with_warnings' "
+            "WHEN 'running' THEN 'running' WHEN 'failed' THEN 'failed' "
+            "WHEN 'cancelled' THEN 'cancelled' ELSE COALESCE(NULLIF(state,''),'queued') END "
+            "WHERE state IS NULL OR state='' OR requested_by='legacy'")
+        # Additive ALTER defaults cannot know the old job's purpose. Normalize
+        # pre-contract rows so they are visible to the independent resource
+        # lanes instead of remaining forever in the generic `research` class.
+        self.db.execute(
+            "UPDATE research_jobs SET "
+            "resource_class=CASE kind WHEN 'discover' THEN 'discovery' "
+            "WHEN 'deep_research' THEN 'intelligence' "
+            "WHEN 'train_global' THEN 'training' WHEN 'train_holdings' THEN 'training' "
+            "ELSE resource_class END, "
+            "run_policy=CASE kind WHEN 'discover' THEN 'market_safe' "
+            "WHEN 'deep_research' THEN 'market_safe' "
+            "WHEN 'train_global' THEN 'closed_market' "
+            "WHEN 'train_holdings' THEN 'closed_market' ELSE run_policy END, "
+            "updated_at=COALESCE(updated_at,requested_at) "
+            "WHERE requested_by='legacy' OR resource_class='research'")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_research_jobs_state "
+                        "ON research_jobs(state,resource_class,priority,requested_at)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_research_jobs_lease "
+                        "ON research_jobs(lease_expires_at,worker_id)")
+        # Exactly one active request per kind.  Older builds could race two
+        # scheduler threads through SELECT-then-INSERT; keep the earliest
+        # request and make the invariant enforceable by SQLite itself.
+        for duplicate in self.db.execute(
+                "SELECT kind,MIN(requested_at) keep_at FROM research_jobs "
+                "WHERE status IN ('queued','running') GROUP BY kind HAVING COUNT(*)>1"
+        ).fetchall():
+            keep = self.db.execute(
+                "SELECT id FROM research_jobs WHERE kind=? AND status IN ('queued','running') "
+                "ORDER BY requested_at,id LIMIT 1", (duplicate["kind"],)).fetchone()
+            self.db.execute(
+                "UPDATE research_jobs SET status='cancelled',state='cancelled',"
+                "completed_at=COALESCE(completed_at,datetime('now')),"
+                "error='deduplicated during queue migration' WHERE kind=? "
+                "AND status IN ('queued','running') AND id<>?",
+                (duplicate["kind"], keep["id"]))
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_research_jobs_active_kind "
+                        "ON research_jobs(kind) WHERE status IN ('queued','running')")
+        self.db.commit()
+        # Retire the old automatic kill path without guessing whether a human
+        # later confirmed the same toggle. Provenance did not exist in that
+        # schema, so preserve the visible setting and require explicit review;
+        # future learning never writes `enabled` at all.
+        auto_rows = self.db.execute(
+            "SELECT key FROM kv WHERE key LIKE 'node_auto_disabled_%'").fetchall()
+        if auto_rows:
+            review = [row["key"].removeprefix("node_auto_disabled_")
+                      for row in auto_rows]
+            self.db.execute(
+                "INSERT INTO kv(key,value) VALUES('legacy_node_disable_review',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps({"nodes": review, "requires_human_review": True}),))
+            self.db.execute(
+                "INSERT INTO audit(ts,cycle_id,event_type,payload) VALUES(?,?,?,?)",
+                (_now(), "", "legacy_automatic_node_disables_retired",
+                 json.dumps({"nodes": review, "settings_preserved": True})))
+            self.db.execute("DELETE FROM kv WHERE key LIKE 'node_auto_disabled_%'")
+        self.db.commit()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -311,8 +417,28 @@ class Store:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=15000")
+            if str(self.path) != ":memory:":
+                for protected in (self.path, Path(str(self.path) + "-wal"),
+                                  Path(str(self.path) + "-shm")):
+                    try:
+                        protected.chmod(0o600)
+                    except OSError:
+                        pass
             self._local.conn = conn
+            with self._connections_lock:
+                self._connections.add(conn)
         return conn
+
+    def close(self) -> None:
+        """Close every thread-local connection during a clean service exit."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
 
     # ---------- audit ----------
     def audit(self, event_type: str, payload: Any = None, cycle_id: str = "") -> None:
@@ -425,10 +551,13 @@ class Store:
         signal_ts = (sig.data_as_of.isoformat()
                      if getattr(sig, "data_as_of", None) else _now())
         self.db.execute(
-            "INSERT INTO signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO signals(id,cycle_id,ts,node_id,symbol,direction,score,confidence,"
+            "horizon_days,expected_return,expected_volatility,downside,evidence,node_version) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (new_id(), cycle_id, signal_ts, sig.node_id, sig.symbol, sig.direction,
              sig.score, sig.confidence, sig.horizon_days, sig.expected_return,
-             sig.expected_volatility, sig.downside_estimate, json.dumps(sig.evidence)))
+             sig.expected_volatility, sig.downside_estimate, json.dumps(sig.evidence),
+             getattr(sig, "node_version", None)))
         self.db.commit()
 
     def record_candidate(self, cand, cycle_id: str) -> None:
@@ -550,24 +679,39 @@ class Store:
         self.db.execute(
             "INSERT INTO trades(id,symbol,asset_type,entry_date,exit_date,entry_price,"
             "exit_price,qty,pnl,ret,horizon_days,score,score_bucket,regime,nodes,source,"
-            "exit_reason,qualified,evidence_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "exit_reason,qualified,evidence_version,entry_candidate_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t.get("id") or new_id(), t["symbol"], t.get("asset_type", "equity"),
              t["entry_date"], t["exit_date"], t["entry_price"], t["exit_price"],
              t["qty"], t["pnl"], t["ret"], t.get("horizon_days", 20),
              t.get("score", 0.0), t.get("score_bucket", ""), t.get("regime", ""),
              json.dumps(t.get("nodes", [])), source, t.get("exit_reason", ""),
-             qualified, t.get("evidence_version", "evidence.v2" if qualified else "legacy")))
+             qualified, t.get("evidence_version", "evidence.v2" if qualified else "legacy"),
+             t.get("entry_candidate_id")))
         self.db.commit()
 
     def analog_returns(self, score_bucket: str, regime: str,
-                       sources: tuple = ("paper", "live", "backtest_validated")) -> list[float]:
+                       sources: tuple = ("paper", "live", "backtest_validated"),
+                       *, evidence_version: str | None = None,
+                       horizon_days: int | None = None,
+                       asset_type: str | None = None) -> list[float]:
         """Horizon returns of historical trades in the same (score bucket, regime)
         cell — the raw material for bootstrap error bars (dev/DECISIONS.md D10)."""
         ph = ",".join("?" * len(sources))
+        where = ["qualified=1", "score_bucket=?", "regime=?",
+                 f"source IN ({ph})"]
+        args: list = [score_bucket, regime, *sources]
+        if evidence_version:
+            where.append("evidence_version=?"); args.append(evidence_version)
+        if asset_type:
+            where.append("asset_type=?"); args.append(asset_type)
+        if horizon_days is not None:
+            bucket = 10 if horizon_days <= 10 else 30 if horizon_days <= 30 else 99999
+            where.append("CASE WHEN horizon_days<=10 THEN 10 WHEN horizon_days<=30 "
+                         "THEN 30 ELSE 99999 END=?")
+            args.append(bucket)
         rows = self.db.execute(
-            f"SELECT ret FROM trades WHERE qualified=1 AND score_bucket=? AND regime=? "
-            f"AND source IN ({ph})",
-            (score_bucket, regime, *sources)).fetchall()
+            "SELECT ret FROM trades WHERE " + " AND ".join(where), args).fetchall()
         return [r["ret"] for r in rows]
 
     def trades(self, source: str | None = None, limit: int = 10000,

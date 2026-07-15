@@ -3,6 +3,7 @@
 # center and open the dashboard. Idempotent — if a server is already serving
 # on the port, it just opens the browser instead of fighting for it.
 set -uo pipefail
+umask 077
 
 REPO="/Users/jbs/Documents/code/stonk"
 PORT=8420
@@ -53,6 +54,11 @@ fi
 # shows logs and Ctrl-C / closing it stops the server.
 echo "starting live server at $URL  (close this window or Ctrl-C to stop)"
 mkdir -p logs
+if [ -f logs/runtime-live.log ] && [ "$(stat -f%z logs/runtime-live.log 2>/dev/null || echo 0)" -gt 10000000 ]; then
+  mv -f logs/runtime-live.log logs/runtime-live.log.1
+fi
+touch logs/runtime-live.log
+chmod 600 logs/runtime-live.log
 set +e
 .venv/bin/stonk --mode live serve --port "$PORT" --port-range-end "$PORT_END" \
   2>&1 | tee -a logs/runtime-live.log

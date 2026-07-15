@@ -136,13 +136,16 @@ class MarketContext:
     """As-of view over stored bars. All pipeline reads go through here."""
 
     def __init__(self, store: Store, cfg, as_of: str | None = None,
-                 offline: bool = False):
+                 offline: bool = False, historical: bool = False):
         self.store = store
         self.cfg = cfg
         self.as_of = as_of or date.today().isoformat()
         # offline=True (backtests): nodes must serve external data (earnings,
         # fundamentals) from kv caches only — never fetch mid-simulation
         self.offline = offline
+        # Historical replay additionally enforces source-availability time.
+        # Cache-only live discovery is offline but is not a replay.
+        self.historical = historical
         self._cache: dict[str, pd.DataFrame] = {}
 
     @property

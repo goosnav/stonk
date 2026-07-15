@@ -284,7 +284,11 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
                "scheduler_alive": scheduler_alive,
            },
            "research_worker": {
-               "state": "running" if operational_state == "researching" else "idle",
+               # Trading and research are intentionally independent lanes.  A
+               # market-safe operator job can be running while the trading
+               # loop remains the top-level operational state, so do not
+               # derive this label from operational_state.
+               "state": "running" if active_research_job else "idle",
                "detail": research.get("detail") or operational_detail,
                "phase": research.get("phase"),
                "active_job": active_research_job,

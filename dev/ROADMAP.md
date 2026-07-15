@@ -97,7 +97,7 @@ options (locked at this account size anyway).
 1. After ~30 live/paper round-trips, read `/api/nodes` and the nightly
    `promotion_proposals` (kv / audit). Apply promotions by editing node
    `status` in configs/default.yaml — a HUMAN approves, per D-rules.
-2. Prune what attribution flags (it auto-disables clear losers; you confirm).
+2. Review what attribution deemphasizes; only an operator toggle can eliminate it.
 3. Scaling decision (human): if live expectancy is positive over a fair
    sample, raise `time_step_budget_abs_cap` gradually (50 → 150 → 400…),
    NOT the percentage limits. The aggressive.yaml profile failed

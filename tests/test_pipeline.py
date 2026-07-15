@@ -29,7 +29,7 @@ def test_full_paper_cycle_and_audit_reconstruction(cfg, store):
     assert summary["budget_used"] <= summary["budget"] + 1e-6
 
 
-def test_broker_block_halts_remaining_entry_batch(cfg, store):
+def test_broker_block_halts_remaining_entry_batch(cfg, store, monkeypatch):
     from datetime import datetime
     from specforge.models import AccountState, OrderReview, SignalEvent
 
@@ -67,6 +67,11 @@ def test_broker_block_halts_remaining_entry_batch(cfg, store):
     cfg.data["ensemble"]["min_final_score"] = -1
     cfg.data["nodes"]["quality_value"]["enabled"] = False
     cfg.data["risk"]["stale_data_max_age_days"] = 999
+    # This test isolates broker batch behavior; classify the liquid synthetic
+    # fixtures as fund-like so the independent company-dossier gate is not the
+    # subject under test.
+    monkeypatch.setattr("specforge.ensemble.ETF_SYMBOLS",
+                        {"AAA", "BBB", "CCC", "SPY"})
     broker = BlockingBroker()
     summary = run_cycle(cfg, store, broker=broker, refresh_data=False,
                         registry={"momentum": Signals()})
@@ -180,7 +185,7 @@ def test_live_model_failure_keeps_production_evidence_pipeline_alive(cfg, store)
     class Signals:
         id, role, degraded_reason = "momentum", "alpha", ""
         def compute(self, ctx):
-            return [SignalEvent("AAA", "long", .9, .9, 21, .05, .1, -.1,
+            return [SignalEvent("SPY", "long", .9, .9, 21, .05, .1, -.1,
                                 ["test"], datetime.now(), "momentum")]
 
     cfg.data["mode"] = "live"
@@ -193,7 +198,7 @@ def test_live_model_failure_keeps_production_evidence_pipeline_alive(cfg, store)
     assert summary["model_state"]["block_reason"] == "BLOCKED: GRAPH"
     assert summary["model_state"]["effective_blend"] == 0.0
     assert summary["model_state"]["production_evidence"] is True
-    assert summary["entries"] == {"AAA": "rejected"}
+    assert summary["entries"] == {"SPY": "rejected"}
     assert store.db.execute(
         "SELECT payload FROM audit WHERE event_type='model_entries_blocked'"
     ).fetchone() is None

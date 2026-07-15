@@ -42,6 +42,9 @@ def test_dataset_is_chronological_and_train_normalized(cfg, store):
     ds = neural.build_dataset(cfg, store, symbols=["AAA", "BBB", "CCC"])
     assert "error" not in ds
     assert ds["train_end"] < ds["val_start"] < ds["test_start"]
+    unique = sorted(set(ds["dates"]))
+    assert unique.index(ds["val_start"]) - unique.index(ds["train_end"]) > 21
+    assert unique.index(ds["test_start"]) - unique.index(ds["val_end"]) > 21
     train = ds["X"][ds["masks"]["train"]]
     assert abs(float(train.mean())) < .05
 

@@ -413,6 +413,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     @app.get("/api/nodes")
     def nodes():
+        from .ensemble import s_node_multiplier
         c = fresh_cfg()
         src = "live" if c.mode == "live" else "paper"
         trades = store.trades(source=src)
@@ -429,9 +430,23 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         out = []
         for node_id, nc in (c.get("nodes", default={}) or {}).items():
             rets = by_node.get(node_id, [])
+            status = str(nc.get("status", "experimental"))
+            floor_key = ("experimental_floor" if status == "experimental"
+                         else "production_floor")
+            floor = float(c.get("ensemble", "weight_learning", floor_key,
+                                default=.25 if status == "experimental" else .50))
+            learned_multiplier = s_node_multiplier(node_id, c, store)
             out.append({
                 "id": node_id, **nc,
-                "weight_multiplier": store.get_weight_multiplier(node_id),
+                "stored_weight_multiplier": store.get_weight_multiplier(node_id),
+                "learned_weight_multiplier": learned_multiplier,
+                "weight_multiplier": (learned_multiplier
+                                      if nc.get("enabled") else 0.0),
+                "automated_floor": floor,
+                "human_disabled": not bool(nc.get("enabled")),
+                "learning_state": ("human_disabled" if not nc.get("enabled") else
+                                   "deemphasized" if learned_multiplier < .999 else
+                                   "full"),
                 "n_trades": len(rets),
                 "expectancy": round(sum(rets) / len(rets), 5) if rets else None,
                 "win_rate": round(sum(1 for r in rets if r > 0) / len(rets), 3) if rets else None,
@@ -987,7 +1002,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         signal activity — plus ensemble params, regime, and hypothesis link."""
         from . import regime as regime_mod
         from .attribution import node_scorecard
-        from .ensemble import s_node_weight
+        from .ensemble import s_node_multiplier, s_node_weight
         c = fresh_cfg()
         ctx = MarketContext(store, c)
         reg = regime_mod.classify(ctx, c)
@@ -1003,9 +1018,13 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 "role": nc.get("role", "alpha"), "status": nc.get("status"),
                 "ai": bool(nc.get("ai")) or node_id == "hypothesis",
                 "base_weight": nc.get("weight", 0.0),
-                "multiplier": round(store.get_weight_multiplier(node_id), 3),
-                "effective_weight": round(s_node_weight(node_id, c, store,
-                                                        reg.regime), 4),
+                "stored_multiplier": round(store.get_weight_multiplier(node_id), 3),
+                "multiplier": (round(s_node_multiplier(node_id, c, store,
+                                                        reg.regime), 3)
+                               if nc.get("enabled") else 0.0),
+                "effective_weight": (round(s_node_weight(node_id, c, store,
+                                                         reg.regime), 4)
+                                     if nc.get("enabled") else 0.0),
                 "signals_7d": sig_counts.get(node_id, 0),
                 "trades_n": sc.get("n", 0),
                 "expectancy": sc.get("expectancy"),
@@ -1108,16 +1127,18 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     @app.post("/api/research/jobs")
     def create_research_job(body: dict):
-        from .research import enqueue_job
+        from .research import PUBLIC_JOB_KINDS, enqueue_job
         try:
             kind = str(body.get("kind", ""))
+            if kind not in PUBLIC_JOB_KINDS:
+                raise HTTPException(400, f"unknown operator research job: {kind}")
             if kind == "deep_research":
                 from .ai import AIClient
                 if not AIClient(fresh_cfg(), store).available():
                     raise HTTPException(409, "Deep Research requires an enabled, available "
                                            "Codex/Claude/API route with remaining limits")
-            return enqueue_job(store, kind,
-                               body.get("payload") or {}, priority=10)
+            return enqueue_job(store, kind, body.get("payload") or {}, priority=10,
+                               requested_by="operator", force=bool(body.get("force")))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -1426,21 +1447,34 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     # Operator buttons should start promptly after the current atomic research
     # unit finishes. Polling SQLite is cheap; the shared research mutex keeps
     # this from overlapping autonomous backfill/training.
-    def operator_research_job():
-        from .health import _market_clock
-        if _market_clock()["open"]:
-            return                         # durable request waits for close
+    def operator_lane(resource: str):
+        """Run one resource lane.
+
+        Discovery and intelligence are independent market-safe workloads. A
+        slow model call must not strand a cached discovery scan in QUEUED, and
+        neither may occupy the training lane. Per-resource SQLite leases in
+        research.py preserve single execution across multiple app processes.
+        """
         try:
             from .research import run_operator_job
-            run_operator_job(current_config(store, mode), store)
+            state = store.kv_get("engine_state", {}) or {}
+            if state.get("phase") not in (None, "idle", "sleeping", "never_ran"):
+                return                    # trading always wins the start boundary
+            run_operator_job(current_config(store, mode), store, {resource})
         except Exception as e:             # noqa: BLE001
-            store.audit("scheduler_error", {"job": "operator_research",
+            store.audit("scheduler_error", {"job": f"operator_{resource}",
                                             "error": str(e)[:300]})
 
-    sched.add_job(operator_research_job, IntervalTrigger(seconds=5),
-                  next_run_time=datetime.now().astimezone() + timedelta(seconds=5),
-                  max_instances=1, coalesce=True, misfire_grace_time=30,
-                  id="operator_research")
+    for lane_index, resource in enumerate(("discovery", "intelligence", "training")):
+        sched.add_job(
+            operator_lane, trigger=IntervalTrigger(seconds=5), args=[resource],
+            next_run_time=datetime.now().astimezone() + timedelta(seconds=5 + lane_index),
+            # One instance may spend minutes inside a model call.  Permit a
+            # second cheap poll: the durable SQLite lease makes it return
+            # immediately, while avoiding APScheduler's repeated noisy
+            # "maximum instances" warnings during healthy long jobs.
+            max_instances=2, coalesce=True, misfire_grace_time=30,
+            id=f"operator_{resource}")
 
     # Intelligence is market-safe: it never contacts the broker and trading
     # reads only committed cached results. Strategy requests take priority;
@@ -1466,7 +1500,9 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
 
     sched.add_job(intelligence_job, IntervalTrigger(seconds=10),
                   next_run_time=datetime.now().astimezone() + timedelta(seconds=12),
-                  max_instances=1, coalesce=True, misfire_grace_time=60,
+                  # run_next owns the same cross-process intelligence lease;
+                  # a second scheduler poll is safe and stays short.
+                  max_instances=2, coalesce=True, misfire_grace_time=60,
                   id="intelligence")
 
     # D40: the weekend research loop — schedule slot existed since V1 but was
