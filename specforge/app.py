@@ -52,12 +52,30 @@ def current_config(store: Store, mode: str):
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     import os
+    import threading
 
     from .quotes import QuoteService
     app = FastAPI(title="Stonk Terminal", docs_url="/api/docs")
     mode = cfg.mode
     quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
     app.state.started_at = datetime.now().astimezone()
+    app.state.account_cache = {"at": None, "account": None, "persisted": False}
+    persisted_account = store.kv_get("account_snapshot_cache") or {}
+    try:
+        from .models import AccountState, Position
+        raw_account = persisted_account["account"]
+        app.state.account_cache = {
+            "at": datetime.fromisoformat(persisted_account["cached_at"]),
+            "persisted": True,
+            "account": AccountState(
+                equity=float(raw_account["equity"]), cash=float(raw_account["cash"]),
+                buying_power=float(raw_account["buying_power"]),
+                positions=[Position(**p) for p in raw_account.get("positions", [])],
+                as_of=raw_account["as_of"])}
+    except (KeyError, TypeError, ValueError):
+        pass
+    app.state.account_cache_lock = threading.Lock()
+    app.state.broker_connect_lock = threading.Lock()
 
     @app.middleware("http")
     async def same_origin_mutations(request: Request, call_next):
@@ -98,6 +116,31 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         if hasattr(broker, "set_quotes"):
             broker.set_quotes(ctx.prices())
         return c, broker, ctx
+
+    def cached_account(broker):
+        from .health import _market_clock
+        ttl = 10 if _market_clock()["open"] else 60
+        with app.state.account_cache_lock:
+            cached = app.state.account_cache
+            age = ((datetime.now().astimezone() - cached["at"]).total_seconds()
+                   if cached["at"] else float("inf"))
+            hit = cached["account"] is not None and age < ttl and \
+                not cached.get("persisted", False)
+            stale = False
+            if not hit:
+                try:
+                    account = broker.get_account()
+                    cached.update(account=account, at=datetime.now().astimezone(),
+                                  persisted=False)
+                    from .models import to_json_dict
+                    store.kv_set("account_snapshot_cache", {
+                        "cached_at": cached["at"].isoformat(timespec="seconds"),
+                        "account": to_json_dict(account)})
+                except Exception:
+                    if cached["account"] is None:
+                        raise
+                    stale = True
+            return cached["account"], cached["at"], hit, stale
 
     def _positions_marked(acct, daily_prices):
         """Positions with LIVE marks where the quote chain has them; falls
@@ -166,6 +209,16 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         c = fresh_cfg()
         probe = store.kv_get("broker_probe") or {"connected": False,
                                                  "state": "never_attempted"}
+        broker_health = store.kv_get("broker_health") or {}
+        if broker_health.get("adapter") == c.get("broker") and \
+                broker_health.get("connected"):
+            # A successful automatic read is stronger, newer evidence than an
+            # old explicit Connect error. Show the recovered state so the UI
+            # does not invite another unnecessary OAuth attempt.
+            probe = {"connected": True, "state": "connected",
+                     "as_of": broker_health.get("as_of"),
+                     "note": "session verified by automatic broker read"}
+            store.kv_set("broker_probe", probe)
         # a 'connecting' older than the OAuth window means the thread died
         # (server restart mid-login) — say so instead of spinning forever
         if probe.get("state") == "connecting":
@@ -184,7 +237,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def broker_connect():
         """Kick off the Robinhood OAuth probe in a background thread — the
         browser opens on this machine for login. Poll /api/broker/status."""
-        import threading
+        if not app.state.broker_connect_lock.acquire(blocking=False):
+            return {"ok": True, "state": "already_connecting",
+                    "note": "One Robinhood login is already in progress"}
 
         def _run():
             store.kv_set("broker_probe", {"connected": False, "state": "connecting",
@@ -192,17 +247,21 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                                           .isoformat(timespec="seconds")})
             try:
                 from .broker.robinhood_mcp import RobinhoodMCPBroker
-                b = RobinhoodMCPBroker(fresh_cfg(), store)
+                b = RobinhoodMCPBroker(fresh_cfg(), store, interactive_auth=True)
                 result = b.probe()
                 result["state"] = "connected"
                 store.kv_set("broker_probe", result)
                 store.audit("broker_probe_ok", result)
             except Exception as e:                  # noqa: BLE001
                 store.kv_set("broker_probe", {"connected": False, "state": "error",
-                                              "error": str(e)[:500]})
+                                              "error": str(e)[:500],
+                                              "finished_at": datetime.now().astimezone()
+                                              .isoformat(timespec="seconds")})
                 store.audit("broker_probe_failed", {"error": str(e)[:500]})
+            finally:
+                app.state.broker_connect_lock.release()
 
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_run, name="robinhood-oauth", daemon=True).start()
         return {"ok": True, "note": "OAuth window should open in your browser; "
                                     "poll /api/broker/status"}
 
@@ -297,7 +356,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def status():
         c, broker, ctx = broker_and_ctx()
         from . import regime as regime_mod
-        acct = broker.get_account()
+        acct, account_at, account_cached, account_stale = cached_account(broker)
         gov = Governor(c, store)
         reg = regime_mod.classify(ctx, c)
         prices = ctx.prices()
@@ -332,6 +391,10 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "mode": c.mode, "broker": c.get("broker"),
             "equity": round(acct.equity, 2), "cash": round(acct.cash, 2),
             "buying_power": round(acct.buying_power, 2),
+            "account_as_of": account_at.isoformat(timespec="seconds"),
+            "account_stale": account_stale,
+            "account_source": "stale_cache" if account_stale else
+                              ("cache" if account_cached else "broker"),
             "day_pnl": day_pnl, "net_pnl": net_pnl,
             "realized_pnl": round(realized, 2), "unrealized_pnl": unrealized,
             "drawdown_from_peak": round(1 - acct.equity / peak, 4) if peak else 0,
@@ -351,7 +414,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     @app.get("/api/nodes")
     def nodes():
         c = fresh_cfg()
-        trades = store.trades()
+        src = "live" if c.mode == "live" else "paper"
+        trades = store.trades(source=src)
         by_node: dict[str, list[float]] = {}
         for t in trades:
             for nd in json.loads(t["nodes"] or "[]"):
@@ -399,8 +463,21 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         return store.pending_approvals()
 
     @app.get("/api/trades")
-    def trades(source: str | None = None, limit: int = 100):
-        return store.trades(source=source, limit=limit)
+    def trades(source: str | None = None, limit: int = 100,
+               evidence_version: str | None = None):
+        if source not in (None, "live", "paper", "backtest", "backtest_validated"):
+            raise HTTPException(400, "invalid trade source")
+        return store.trades(source=source, limit=min(1000, max(1, limit)),
+                            evidence_version=evidence_version)
+
+    @app.get("/api/evidence/{symbol}")
+    def company_evidence(symbol: str):
+        from .evidence import ai_budget_status, latest_dossier
+        c = fresh_cfg()
+        dossier = latest_dossier(store, symbol)
+        return {"symbol": symbol.upper(), "dossier": dossier,
+                "available": bool(dossier and dossier.get("status") == "ready"),
+                "budget": ai_budget_status(c, store)}
 
     @app.get("/api/equity_curve")
     def equity_curve():
@@ -456,7 +533,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         friction_bps = (c.get("execution", "spread_cost_bps", default=3)
                         + c.get("execution", "slippage_bps", default=5)) * 2
         return {
-            "ai_enabled": bool(ai_cfg.get("enabled")),
+            "ai_enabled": AIClient(c, store).enabled(),
             "ai_available": AIClient(c, store).available(),
             "ai_model": ai_cfg.get("model"),
             "ai_models": ai_cfg.get("models", {}),
@@ -476,7 +553,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     def montecarlo(horizon_days: int = 20):
         from .montecarlo import from_positions, simulate
         c, broker, ctx = broker_and_ctx()
-        acct = broker.get_account()
+        acct, _, _, _ = cached_account(broker)
         out = simulate(from_positions(store, ctx, acct, horizon_days))
         return out.__dict__
 
@@ -524,14 +601,171 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         for k, v in body.items():
             if k == "models" and isinstance(v, dict):   # per-purpose routing (D36)
                 for purpose, model_id in v.items():
-                    if purpose not in ("headline_classification", "hypothesis"):
+                    if purpose not in ("headline_classification", "hypothesis",
+                                       "investment_memo"):
                         raise HTTPException(400, f"unknown ai purpose: {purpose}")
                     _set_override(["ai", "models", purpose], str(model_id))
+                    tier = "cheap" if purpose == "headline_classification" else "advanced"
+                    _set_override(["intelligence", "api_fallback", "models", tier],
+                                  str(model_id))
                 continue
             if k not in allowed:
                 raise HTTPException(400, f"ai key not editable via GUI: {k}")
             _set_override(["ai", k], v)
+            if k == "enabled":
+                # Backward-compatible control: the original /api/ai switch now
+                # controls the router too instead of appearing to save while
+                # Codex/Claude continue running.
+                _set_override(["intelligence", "enabled"], bool(v))
+            elif k == "model":
+                _set_override(["intelligence", "api_fallback", "models", "cheap"], str(v))
         return {"ok": True}
+
+    @app.get("/api/ai/routing")
+    def ai_routing():
+        from .ai import AIClient
+        c = fresh_cfg()
+        return {"config": c.get("intelligence", default={}),
+                "status": AIClient(c, store).status(probe_auth=False)}
+
+    @app.put("/api/ai/routing")
+    def set_ai_routing(body: dict):
+        allowed = {"enabled", "default_provider", "default_models", "local_fallback",
+                   "api_fallback", "purpose_tiers", "purpose_routes",
+                   "daily_local_limits", "request_timeout_seconds", "cache_ttl_hours"}
+        unknown = set(body) - allowed
+        if unknown:
+            raise HTTPException(400, f"unknown intelligence setting(s): {sorted(unknown)}")
+        providers = {"codex", "claude", "api", "openrouter", "openai",
+                     "anthropic", "custom"}
+        provider = body.get("default_provider")
+        if provider is not None and provider not in providers:
+            raise HTTPException(400, f"unsupported default provider {provider}")
+        fallback = body.get("local_fallback") or {}
+        if fallback.get("provider") and fallback["provider"] not in {"codex", "claude"}:
+            raise HTTPException(400, "local fallback must be codex or claude")
+        api = body.get("api_fallback") or {}
+        if api.get("provider") and api["provider"] not in {
+                "openrouter", "openai", "anthropic", "custom"}:
+            raise HTTPException(400, "unsupported API fallback provider")
+        for purpose, route in (body.get("purpose_routes") or {}).items():
+            if purpose not in {"headline_classification", "news_batch", "investment_memo",
+                                "hypothesis", "strategic_synthesis"}:
+                raise HTTPException(400, f"unknown intelligence purpose {purpose}")
+            blocks = [route.get("primary") or route]
+            if route.get("local_fallback"): blocks.append(route["local_fallback"])
+            if route.get("api_fallback"): blocks.append(route["api_fallback"])
+            for block in blocks:
+                if block.get("provider") and block["provider"] not in providers:
+                    raise HTTPException(400, f"unsupported provider in {purpose}")
+        limits = body.get("daily_local_limits") or {}
+        if any(not isinstance(v, int) or v < 0 or v > 1000 for v in limits.values()):
+            raise HTTPException(400, "daily local limits must be integers from 0 to 1000")
+        timeout = body.get("request_timeout_seconds")
+        if timeout is not None and (not isinstance(timeout, (int, float)) or not 5 <= timeout <= 1800):
+            raise HTTPException(400, "request timeout must be 5-1800 seconds")
+        for key, value in body.items():
+            try:
+                _set_override(["intelligence", key], value)
+            except ConfigError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        store.audit("intelligence_routing_updated", {
+            "keys": sorted(body), "default_provider": body.get("default_provider"),
+            "api_provider": api.get("provider")})
+        from .ai import AIClient
+        return {"ok": True, "status": AIClient(fresh_cfg(), store).status(False)}
+
+    @app.get("/api/ai/health")
+    def ai_health():
+        from .ai import AIClient
+        return AIClient(fresh_cfg(), store).status(probe_auth=False)
+
+    @app.post("/api/ai/doctor")
+    def ai_doctor():
+        from .ai import AIClient
+        return AIClient(fresh_cfg(), store).status(probe_auth=True)
+
+    @app.post("/api/ai/test")
+    def ai_test(body: dict):
+        from .ai import AIClient
+        from .config import Config
+        import copy
+        purpose = str(body.get("purpose", "headline_classification"))
+        if purpose not in {"headline_classification", "investment_memo", "hypothesis",
+                           "strategic_synthesis", "news_batch"}:
+            raise HTTPException(400, "unknown intelligence purpose")
+        # Use a purpose-compatible harmless schema test; never pass market data
+        # or contact the broker from a provider diagnostic.
+        test_purpose = "headline_classification"
+        c = fresh_cfg()
+        requested_provider = str(body.get("provider", "")).strip().lower()
+        if requested_provider:
+            if requested_provider not in {"codex", "claude", "openrouter", "openai",
+                                           "anthropic", "custom"}:
+                raise HTTPException(400, "unsupported provider")
+            # Provider-only diagnostics intentionally disable fallbacks so the
+            # operator learns whether this exact provider/model works.
+            data = copy.deepcopy(c.data)
+            intel = data.setdefault("intelligence", {})
+            intel["enabled"] = True
+            model = str(body.get("model", "")).strip() or (
+                (intel.get("default_models") or {}).get("cheap") or "gpt-5.4-mini")
+            intel["purpose_routes"] = {"headline_classification": {"primary": {
+                "provider": requested_provider,
+                "channel": "cli" if requested_provider in {"codex", "claude"} else "api",
+                "model": model}}}
+            intel["local_fallback"] = {"provider": "", "models": {}}
+            intel["api_fallback"] = {**(intel.get("api_fallback") or {}), "enabled": False}
+            c = Config(data)
+        result = AIClient(c, store).complete_json(
+            test_purpose, "provider_test",
+            "Return only valid JSON in the requested shape. This is a connectivity test.",
+            "Classify the neutral sentence 'Test completed.' with sentiment 0, "
+            "confidence 1, catalyst 'test', horizon_days 1, already_priced true, "
+            "and summary 'provider route operational'.", 120)
+        if result is None:
+            raise HTTPException(503, "all configured intelligence routes failed")
+        return {"ok": True, "requested_purpose": purpose,
+                "requested_provider": requested_provider or None, "result": result,
+                "last_call": store.kv_get("intelligence_last_call")}
+
+    @app.get("/api/intelligence/jobs")
+    def intelligence_jobs():
+        from .intelligence import jobs
+        return {"jobs": jobs(store), "state": store.kv_get("intelligence_last_call")}
+
+    @app.get("/api/strategy/directives")
+    def strategy_directives():
+        from .strategy import active, mandates, messages
+        return {"active": active(store), "messages": messages(store),
+                "mandates": mandates(store)}
+
+    @app.post("/api/strategy/directives/analyze")
+    def strategy_analyze(body: dict):
+        from .intelligence import enqueue
+        from .strategy import submit
+        try:
+            msg = submit(store, body.get("text", ""))
+            job = enqueue(store, "strategic_synthesis", {"message_id": msg["id"]}, priority=100)
+            return {"message": msg, "job": job}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/strategy/directives/{mandate_id}/activate")
+    def strategy_activate(mandate_id: str):
+        from .strategy import activate
+        try:
+            return activate(store, mandate_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/strategy/directives/{mandate_id}/deactivate")
+    def strategy_deactivate(mandate_id: str):
+        from .strategy import deactivate
+        try:
+            return deactivate(store, mandate_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/ai/provider")
     def get_ai_provider():
@@ -645,7 +879,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "AND json_extract(payload,'$.mode')=? ORDER BY id DESC LIMIT 1",
             (src,)).fetchone()
         last = dict(r) if r else None
-        out = {"cycle": None, "considered": [], "working": [], "exits": {}}
+        out = {"cycle": None, "considered": [], "working": [], "exits": {},
+               "rebalance": None}
         if last:
             summ = json.loads(last["payload"] or "{}")
             out["cycle"] = {"id": last["cycle_id"], "ts": last["ts"],
@@ -653,6 +888,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                             "budget": summ.get("budget"),
                             "budget_used": summ.get("budget_used")}
             out["exits"] = summ.get("exits", {})
+            rr = next((x for x in store.audit_rows(cycle_id=last["cycle_id"], limit=500)
+                       if x["event_type"] == "rebalance_plan"), None)
+            out["rebalance"] = json.loads(rr["payload"] or "{}") if rr else None
             verdicts = {}
             for r in store.audit_rows(cycle_id=last["cycle_id"], limit=500):
                 if r["event_type"] == "risk_decision":
@@ -671,6 +909,13 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                     "notional": pl.get("target_notional"),
                     "expected_return": pl.get("expected_return"),
                     "ci": [pl.get("ci_low"), pl.get("ci_high")],
+                    "evidence_version": pl.get("evidence_version"),
+                    "evidence_coverage": pl.get("evidence_coverage"),
+                    "evidence": pl.get("evidence_details", []),
+                    "production_score": pl.get("production_score", c["final_score"]),
+                    "strategy_contribution": pl.get("strategy_contribution", 0),
+                    "learned_contribution": pl.get("learned_contribution", 0),
+                    "strategy_mandate_id": pl.get("strategy_mandate_id"),
                     "verdict": v.get("verdict"),
                     "reasons": v.get("reasons", []),
                     "result": entries.get(c["symbol"])})
@@ -707,12 +952,30 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         for o in store.orders_today(mode="live" if mode == "live" else "paper"):
             by_status[o["status"]] = by_status.get(o["status"], 0) + 1
         st = store.active_hypothesis("short_term")
+        dossiers = []
+        seen = set()
+        for row in store.db.execute(
+                "SELECT symbol,created_at,quality,status,fundamental_memo,catalyst_memo "
+                "FROM company_evidence ORDER BY created_at DESC LIMIT 50"):
+            if row["symbol"] in seen:
+                continue
+            seen.add(row["symbol"])
+            item = dict(row)
+            for key in ("fundamental_memo", "catalyst_memo"):
+                try:
+                    item[key] = json.loads(item[key] or "null")
+                except json.JSONDecodeError:
+                    item[key] = None
+            dossiers.append(item)
+            if len(dossiers) == 5:
+                break
         return {
             "date": day, "scans": scans, "candidates": candidates,
             "orders": by_status,
             "top_vetoes": sorted(veto_reasons.items(), key=lambda x: -x[1])[:4],
             "news": store.kv_get("news_synopsis"),
             "fundamentals": store.kv_get("fundamentals_synopsis"),
+            "company_evidence": dossiers,
             "hypothesis": ((st["thesis"] or "").strip().splitlines()[0][:160]
                            if st else None),
         }
@@ -733,7 +996,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "WHERE ts >= datetime('now', '-7 days') GROUP BY node_id")}
         nodes = []
         for node_id, nc in (c.get("nodes", default={}) or {}).items():
-            sc = node_scorecard(store, node_id)
+            sc = node_scorecard(store, node_id,
+                                sources=("live" if c.mode == "live" else "paper",))
             nodes.append({
                 "id": node_id, "enabled": bool(nc.get("enabled")),
                 "role": nc.get("role", "alpha"), "status": nc.get("status"),
@@ -749,8 +1013,9 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                 "per_trade_ir": sc.get("per_trade_ir"),
             })
         st = store.active_hypothesis("short_term")
-        from .graph import champion as graph_champion
+        from .graph import activation_state, champion as graph_champion
         graph = graph_champion(store)
+        activation = activation_state(c, store)
         return {
             "regime": reg.regime,
             "deployment_multiplier": reg.deployment_multiplier,
@@ -771,13 +1036,14 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             "research": store.kv_get("research_report"),
             "analog_graph": {"id": graph["id"], "status": graph["status"],
                              "metrics": graph.get("metrics", {}),
-                             "live_blend": c.get("analog_graph", "live_blend", default=0)},
+                             "live_blend": activation["effective_blend"],
+                             "activation": activation},
         }
 
     @app.get("/api/model/graph")
     def model_graph(symbol: str = "SPY", horizon: int = 21):
         """Actual deployed topology plus symbol-specific live activations."""
-        from .graph import champion as graph_champion
+        from .graph import activation_state, champion as graph_champion
         from .neural import describe as describe_neural
         c = fresh_cfg(); graph = graph_champion(store)
         if horizon not in (5, 21):
@@ -791,13 +1057,43 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                             "cycle_id": snapshots.get("cycle_id")}
         else:                                  # compatibility with D41 snapshots
             snapshot = snapshots.get(symbol)
+        # Never pair activations from an older topology with the deployed DAG.
+        # Legacy snapshots lack an explicit schema, so detect removed node IDs
+        # as well. A directed empty state is more truthful than a plausible lie.
+        topology_ids = {n["id"] for n in graph["topology"]["nodes"]}
+        snapshot_ids = set(((snapshot or {}).get("activations") or {}).keys())
+        snapshot_schema = snapshots.get("topology_schema")
+        if snapshot and ((snapshot_schema and snapshot_schema != graph["topology"].get("schema"))
+                         or snapshot_ids - topology_ids):
+            snapshot = None
         configured = float(c.get("analog_graph", "live_blend", default=0) or 0)
-        effective = configured if graph["status"] == "champion" else 0.0
-        return {"schema": "stonk.graph.v1", "version": graph["id"],
+        activation = activation_state(c, store)
+        effective = activation["effective_blend"]
+        enabled = {n for n, nc in (c.get("nodes", default={}) or {}).items()
+                   if nc.get("enabled")}
+        snapshot_states = (snapshot or {}).get("node_states", {})
+        node_state = {}
+        for n in graph["topology"]["nodes"]:
+            fallback = ("shadow" if n["role"] in ("interaction", "output") and
+                        graph["status"] != "champion" else
+                        "neutral" if n["id"] in enabled or
+                        n["id"] in ("macro_regime", "quality_value") else "unavailable")
+            node_state[n["id"]] = snapshot_states.get(n["id"], fallback)
+        return {"schema": graph["topology"].get("schema", "stonk.graph.v1"),
+                "version": graph["id"],
                 "status": graph["status"], "metrics": graph.get("metrics", {}),
                 "live_blend": configured,
                 "configured_live_blend": configured,
                 "effective_live_blend": effective,
+                "ramp_stage": activation["stage"],
+                "current_live_blend": effective,
+                "entry_block_reason": None,
+                "learned_block_reason": activation["block_reason"],
+                "production_evidence_version": "evidence.v2",
+                "production_evidence_active": True,
+                "activation_completeness": ((snapshot or {}).get(
+                    "activation_complete") if snapshot else False),
+                "activation_state": activation, "node_state": node_state,
                 "topology_provenance": "learned" if graph["status"] == "champion"
                                        else "initial_prior",
                 "symbol": symbol, "horizon": horizon,
@@ -808,7 +1104,7 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     @app.get("/api/research")
     def research_status():
         from .research import status
-        return status(store)
+        return status(store, fresh_cfg())
 
     @app.post("/api/research/jobs")
     def create_research_job(body: dict):
@@ -818,8 +1114,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
             if kind == "deep_research":
                 from .ai import AIClient
                 if not AIClient(fresh_cfg(), store).available():
-                    raise HTTPException(409, "Deep Research requires AI enabled, a configured "
-                                           "API key, and remaining daily/monthly budget")
+                    raise HTTPException(409, "Deep Research requires an enabled, available "
+                                           "Codex/Claude/API route with remaining limits")
             return enqueue_job(store, kind,
                                body.get("payload") or {}, priority=10)
         except ValueError as exc:
@@ -882,13 +1178,30 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         from .research import list_jobs
         research_state = store.kv_get("research_state") or {"phase": "never_ran"}
         research_jobs = list_jobs(store, 10)
+        from .intelligence import jobs as list_intelligence_jobs
+        intelligence_jobs = list_intelligence_jobs(store, 10)
+        active_intelligence = next((j for j in intelligence_jobs
+                                    if j.get("status") == "running"), None)
+        intelligence_state = ({"phase": active_intelligence["kind"],
+                               "detail": (active_intelligence.get("progress") or {}).get(
+                                   "phase", "working"),
+                               "progress": active_intelligence.get("progress") or {},
+                               "at": active_intelligence.get("started_at")}
+                              if active_intelligence else
+                              {"phase": "idle", "detail": "waiting for cached-news refresh "
+                               "or Strategy AI direction", "progress": {},
+                               "at": (store.kv_get("intelligence_last_call") or {}).get("at")})
         return {"state": state,
                 "processes": {
                     "trading": {"state": state, "serial": True},
                     "research": {"state": research_state,
                                  "jobs": research_jobs,
                                  "serial": True,
-                                 "detail": "one research task at a time; trading remains responsive"}},
+                                 "detail": "one research task at a time; trading remains responsive"},
+                    "intelligence": {"state": intelligence_state,
+                                     "jobs": intelligence_jobs,
+                                     "serial": True,
+                                     "detail": "one sandboxed provider call at a time; trading reads cache"}},
                 "market": _market_clock(),
                 "interval_minutes": c.get("schedule", "scan_interval_minutes"),
                 "scan_times": c.get("schedule", "scans", default=[]),
@@ -915,35 +1228,11 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
         @app.on_event("shutdown")
         def stop_scheduler():
+            app.state.stopping = True
             scheduler = getattr(app.state, "scheduler", None)
             if scheduler and scheduler.running:
                 scheduler.shutdown(wait=False)
     return app
-
-
-def _commit_reports(store: Store, root: Path | None = None) -> None:
-    """Nightly git snapshot of dev/reports (ROADMAP Sprint D). Best-effort:
-    skips silently when there is nothing new or git is unavailable."""
-    import subprocess
-    root = root or Path(__file__).resolve().parent.parent
-    if not (root / ".git").is_dir():
-        return
-    try:
-        subprocess.run(["git", "add", "dev/reports"], cwd=root,
-                       timeout=15, capture_output=True, check=True)
-        dirty = subprocess.run(["git", "diff", "--cached", "--quiet",
-                                "--", "dev/reports"], cwd=root,
-                               timeout=15, capture_output=True)
-        if dirty.returncode == 0:
-            return                              # nothing new under dev/reports
-        subprocess.run(["git", "commit", "-m",
-                        "chore: nightly dev/reports snapshot",
-                        "--", "dev/reports"], cwd=root,
-                       timeout=15, capture_output=True, check=True)
-        store.audit("reports_committed", {})
-    except Exception as e:                      # noqa: BLE001
-        store.audit("scheduler_error", {"job": "commit_reports",
-                                        "error": str(e)})
 
 
 def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
@@ -1012,7 +1301,6 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 _notify("Stonk Terminal", f"{len(proposals)} node promotion proposal(s) "
                                      f"await your review")
             _backup_db(store)
-            _commit_reports(store)
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "post_close", "error": str(e)})
             print(f"[scheduler] post-close FAILED: {e}")
@@ -1030,9 +1318,23 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             old.unlink()
         store.audit("db_backup", {"path": str(dest)})
 
+    def broker_session_job():
+        """Premarket non-interactive auth/read probe; never opens a browser."""
+        from .health import _broker_health
+        c = current_config(store, mode)
+        state = _broker_health(c, store, force=True)
+        store.audit("broker_session_check", {
+            "connected": bool(state.get("connected")),
+            "detail": str(state.get("detail") or "")[:200]})
+        if not state.get("connected"):
+            _notify("Stonk Terminal: Robinhood login required",
+                    "Broker session check failed before open; use Connect Robinhood once")
+
     cfg = current_config(store, mode)
     from .research import recover_jobs
     recover_jobs(store)
+    from .intelligence import recover as recover_intelligence_jobs
+    recover_intelligence_jobs(store)
     tz = cfg.get("schedule", "timezone", default="America/New_York")
     sched = BackgroundScheduler(timezone=tz)
     # misfire_grace_time: a scan fired up to 30 min late (laptop wake) still
@@ -1047,6 +1349,9 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     sched.add_job(post_close_job, CronTrigger(day_of_week="mon-fri", hour=int(h),
                                               minute=int(m), timezone=tz),
                   misfire_grace_time=1800, id="post_close")
+    sched.add_job(broker_session_job,
+                  CronTrigger(day_of_week="mon-fri", hour=9, minute=10, timezone=tz),
+                  misfire_grace_time=900, id="broker_session_check")
 
     from apscheduler.triggers.interval import IntervalTrigger
 
@@ -1075,17 +1380,40 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             next_run_time=datetime.now().astimezone() + timedelta(seconds=3),
             misfire_grace_time=120, id="scan_interval")
 
-    # Closed-market research plane: one bounded, idempotent task per tick.
-    # It trains challengers, never mutates live champions in place.
+    # Closed-market research runs nearly continuously but yields before the
+    # open. Torch/data work must not compete with the time-critical trading
+    # cycle; operator jobs remain durable and wait for this same worker.
     def research_job():
+        import time as _t
         from .health import _market_clock
         c = current_config(store, mode)
         if _market_clock()["open"]:
             return
+        import pandas as _pd
+        import exchange_calendars as _xcals
+        seconds_to_open = (_xcals.get_calendar("XNYS").next_open(
+            _pd.Timestamp.now(tz="UTC")) - _pd.Timestamp.now(tz="UTC")).total_seconds()
+        budget = min(840, max(0, int(seconds_to_open - 15 * 60)))
+        if budget < 30:
+            return
+        deadline = _t.monotonic() + budget
         try:
             from .research import run_next, run_operator_job
-            if run_operator_job(c, store) is None:
-                run_next(c, store)
+            while True:
+                if getattr(app.state, "stopping", False):
+                    break
+                if _market_clock()["open"]:
+                    break
+                remaining = int(deadline - _t.monotonic())
+                if remaining < 30:
+                    break
+                out = run_operator_job(c, store) or run_next(
+                    c, store, max_seconds=remaining)
+                if (out or {}).get("task") == "caught_up" or \
+                        (out or {}).get("status") == "skipped":
+                    break
+                if getattr(app.state, "stopping", False):
+                    break
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "research",
                                             "error": str(e)[:300]})
@@ -1101,7 +1429,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     def operator_research_job():
         from .health import _market_clock
         if _market_clock()["open"]:
-            return                         # market-hours requests wait for close
+            return                         # durable request waits for close
         try:
             from .research import run_operator_job
             run_operator_job(current_config(store, mode), store)
@@ -1113,6 +1441,33 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                   next_run_time=datetime.now().astimezone() + timedelta(seconds=5),
                   max_instances=1, coalesce=True, misfire_grace_time=30,
                   id="operator_research")
+
+    # Intelligence is market-safe: it never contacts the broker and trading
+    # reads only committed cached results. Strategy requests take priority;
+    # news refreshes are deduplicated and only classify newly ingested items.
+    def intelligence_job():
+        try:
+            from .intelligence import enqueue, jobs, run_next
+            rows = jobs(store, limit=5)
+            active = any(j.get("status") in ("queued", "running") for j in rows)
+            state = store.kv_get("news_intelligence", {}) or {}
+            stale = True
+            try:
+                stale = datetime.now().astimezone() - datetime.fromisoformat(
+                    state.get("as_of", "")) >= timedelta(minutes=30)
+            except (ValueError, TypeError):
+                pass
+            if not active and stale:
+                enqueue(store, "news_refresh", priority=1)
+            run_next(current_config(store, mode), store)
+        except Exception as exc:              # intelligence never wedges scheduler
+            store.audit("scheduler_error", {"job": "intelligence",
+                                            "error": str(exc)[:300]})
+
+    sched.add_job(intelligence_job, IntervalTrigger(seconds=10),
+                  next_run_time=datetime.now().astimezone() + timedelta(seconds=12),
+                  max_instances=1, coalesce=True, misfire_grace_time=60,
+                  id="intelligence")
 
     # D40: the weekend research loop — schedule slot existed since V1 but was
     # never wired. A 2y walk-forward backtest of the CURRENT config every

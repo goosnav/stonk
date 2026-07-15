@@ -79,7 +79,7 @@ def cmd_status(args, cfg, store):
 
 def cmd_backtest(args, cfg, store):
     from .backtest import run_backtest
-    report = run_backtest(cfg, years=args.years, tag=args.tag,
+    report = run_backtest(cfg, years=args.years, tag=args.tag, scale=args.scale,
                           copy_analogs_to=store if args.save_analogs else None)
     print(json.dumps(report, indent=2, default=str))
 
@@ -98,11 +98,13 @@ def cmd_serve(args, cfg, store):
 
     import uvicorn
     from .app import create_app
+    store.scrub_audit_history()
     # Pre-bind once and pass the socket into Uvicorn: choosing a fallback and
     # releasing it before server startup creates a check-then-bind race.
     listener = None
     for port in range(args.port, args.port_range_end + 1):
         candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             candidate.bind(("127.0.0.1", port))
             candidate.listen(128)
@@ -209,6 +211,16 @@ def _console_frame(port: int, color: bool) -> str:
         research = _console_api(port, "/api/research")
     except Exception:
         research = {}
+    try:
+        live_model = _console_api(port, "/api/model/graph?symbol=SPY&horizon=21")
+    except Exception:
+        live_model = {}
+    try:
+        strategy_state = _console_api(port, "/api/strategy/directives")
+        intelligence_state = _console_api(port, "/api/intelligence/jobs")
+        routing_state = _console_api(port, "/api/ai/health")
+    except Exception:
+        strategy_state, intelligence_state, routing_state = {}, {}, {}
 
     G, R, A, D, B, X = (("\033[32m", "\033[31m", "\033[33m", "\033[2m",
                           "\033[1m", "\033[0m") if color else ("",) * 6)
@@ -265,8 +277,14 @@ def _console_frame(port: int, color: bool) -> str:
                      f"budget {_money(cycle.get('budget_used'))}/{_money(cycle.get('budget'))}")
     for c in considered[:5]:
         verdict = c.get("result") or c.get("verdict") or "not_selected"
+        evidence = " ".join(
+            f"{item.get('node')}:{float(item.get('signed_alpha', 0)):+.2f}"
+            for item in (c.get("evidence") or [])
+            if item.get("state") == "running" and
+            not str(item.get("node", "")).startswith("family:"))
         lines.append(f"{c['symbol']:<6} score {c['score']:.3f}  {verdict:<18} "
-                     f"{(c.get('thesis') or '')[:75]}")
+                     f"coverage {float(c.get('evidence_coverage') or 0):.0%}  "
+                     f"{evidence[:95]}")
 
     rs = research.get("state") or {}
     us = research.get("universe") or {}
@@ -279,12 +297,40 @@ def _console_frame(port: int, color: bool) -> str:
               f"catalog {((us.get('catalog') or {}).get('count') or 0):,} · "
               f"research {(tiers.get('research') or 0):,} · active {(tiers.get('active') or 0):,}",
               f"analog graph {graph.get('id', 'default')} {graph.get('status', 'shadow')} · "
-              f"TCN {((research.get('neural') or {}).get('status') or 'shadow')}"]
+              f"TCN {((research.get('neural') or {}).get('status') or 'shadow')} · "
+              f"PRODUCTION EVIDENCE {live_model.get('production_evidence_version', 'evidence.v2')} · "
+              f"LEARNED stage {live_model.get('ramp_stage', 0)} "
+              f"{float(live_model.get('effective_live_blend', 0)):.0%} "
+              f"{live_model.get('learned_block_reason') or 'validated'}"]
+    evidence_status = research.get("company_evidence") or {}
+    evidence_budget = evidence_status.get("budget") or {}
+    lines.append(f"company dossiers {evidence_status.get('counts') or {}} · "
+                 f"AI month {_money(evidence_budget.get('spent_month_usd'))}/"
+                 f"{_money(evidence_budget.get('monthly_budget_usd'))}")
     if active_job:
         p = active_job.get("progress") or {}
         lines.append(f"operator job {active_job['kind']} {active_job['status']}"
                      + (f" · {p.get('symbol')} {p.get('index')}/{p.get('total')}"
                         if p.get("symbol") else ""))
+
+    mandate = strategy_state.get("active") or {}
+    mandate_payload = mandate.get("payload") or {}
+    intel_job = next((j for j in intelligence_state.get("jobs", [])
+                      if j.get("status") in ("queued", "running")), None)
+    last_intel = routing_state.get("last_call") or intelligence_state.get("state") or {}
+    lines += ["", B + "STRATEGY / INTELLIGENCE" + X,
+              (f"active mandate {mandate.get('id', '')[:8]} · "
+               f"{mandate_payload.get('summary') or mandate_payload.get('thesis', '')[:100]}"
+               if mandate else "no active Strategy AI mandate; raw operator text has no effect"),
+              f"route {routing_state.get('default_provider', '—')} · last "
+              f"{last_intel.get('provider', '—')}/{last_intel.get('model', '—')} "
+              f"{last_intel.get('purpose', '')} "
+              f"{'OK' if last_intel.get('ok') else 'idle/unavailable'}"]
+    if intel_job:
+        progress = intel_job.get("progress") or {}
+        lines.append(f"intelligence {intel_job.get('kind')} {intel_job.get('status')} · "
+                     f"{progress.get('phase', 'queued')} "
+                     f"{progress.get('completed', 0)}/{progress.get('total', '—')}")
 
     switches = s.get("kill_switches") or {}
     lines += ["", B + "RISK / RECOVERY" + X]
@@ -363,6 +409,47 @@ def cmd_hypothesis(args, cfg, store):
     print(json.dumps(maintain(cfg, store), indent=2, default=str))
 
 
+def cmd_ai(args, cfg, store):
+    from .ai import AIClient
+    client = AIClient(cfg, store)
+    if args.action == "doctor":
+        out = client.status(probe_auth=True)
+    elif args.action == "test":
+        result = client.complete_json(
+            "headline_classification", "cli_provider_test",
+            "Return only the requested JSON. This is a harmless connectivity test.",
+            "Return sentiment 0, confidence 1, catalyst 'test', horizon_days 1, "
+            "already_priced true, summary 'provider route operational'.", 120)
+        out = {"ok": result is not None, "result": result,
+               "last_call": store.kv_get("intelligence_last_call")}
+    else:
+        out = client.status(probe_auth=False)
+    print(json.dumps(out, indent=2, default=str))
+    return 0 if out.get("available", out.get("ok", False)) else 1
+
+
+def cmd_strategy(args, cfg, store):
+    from . import strategy
+    if args.action == "analyze":
+        msg = strategy.submit(store, args.text)
+        out = strategy.analyze(cfg, store, msg["id"])
+    elif args.action == "activate":
+        out = strategy.activate(store, args.id or args.text)
+    elif args.action == "deactivate":
+        out = strategy.deactivate(store, args.id or args.text)
+    else:
+        out = {"active": strategy.active(store), "messages": strategy.messages(store),
+               "mandates": strategy.mandates(store)}
+    print(json.dumps(out, indent=2, default=str))
+
+
+def cmd_intelligence(args, cfg, store):
+    from .intelligence import jobs
+    print(json.dumps({"jobs": jobs(store),
+                      "last_call": store.kv_get("intelligence_last_call"),
+                      "news": store.kv_get("news_intelligence")}, indent=2, default=str))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="stonk")
     p.add_argument("--mode", default=None, help="config overlay: paper|live")
@@ -384,6 +471,7 @@ def main(argv=None):
     s = sub.add_parser("backtest")
     s.add_argument("--years", type=int, default=10)
     s.add_argument("--tag", default="default")
+    s.add_argument("--scale", choices=("live", "research"), default="research")
     s.add_argument("--save-analogs", action="store_true", default=True)
     s = sub.add_parser("research")
     s.add_argument("--status", action="store_true")
@@ -397,6 +485,16 @@ def main(argv=None):
     s = sub.add_parser("reject"); s.add_argument("intent_id")
     s = sub.add_parser("reset-kill"); s.add_argument("name")
     sub.add_parser("hypothesis")
+    s = sub.add_parser("ai")
+    s.add_argument("action", choices=("status", "doctor", "test"), default="status",
+                   nargs="?")
+    s.add_argument("--json", action="store_true", help="stable JSON output (default)")
+    s = sub.add_parser("strategy")
+    s.add_argument("action", choices=("status", "analyze", "activate", "deactivate"))
+    s.add_argument("text", nargs="?", default="")
+    s.add_argument("--id", default="")
+    s = sub.add_parser("intelligence")
+    s.add_argument("--status", action="store_true", default=True)
     sub.add_parser("bridge-dump")
     s = sub.add_parser("bridge-report")
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")

@@ -192,8 +192,10 @@ def maintain(cfg, store: Store, ai=None, ctx=None) -> dict:
     hypothesis, review the north star on cadence. Everything routes through
     steering; nothing here touches orders. Returns a small summary."""
     out = {"swept": len(sweep(cfg, store))}
+    intelligence_enabled = cfg.get("intelligence", "enabled", default=
+                                   cfg.get("ai", "enabled", default=False))
     if not (cfg.get("hypothesis", "enabled", default=False)
-            and cfg.get("ai", "enabled", default=False)):
+            and intelligence_enabled):
         out["skipped"] = "hypothesis or ai disabled"
         return out
     if ctx is None:

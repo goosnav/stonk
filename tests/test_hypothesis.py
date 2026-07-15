@@ -72,7 +72,7 @@ def test_node_emits_stances_and_degrades_silently(cfg, store):
     by = {e.symbol: e for e in events}
     assert set(by) == {"AAA", "BBB"}                     # ZZZZ has no bars
     assert by["AAA"].score == 0.8 and by["AAA"].direction == "long"
-    assert by["BBB"].score == -0.5 and by["BBB"].direction == "avoid"
+    assert by["BBB"].score == 0.5 and by["BBB"].direction == "avoid"
 
     cfg.data["hypothesis"]["enabled"] = False            # master switch off
     assert node.compute(ctx) == []

@@ -76,7 +76,8 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
 def portfolio_projection(store: Store, source: str) -> dict:
     """Strategy-level projected APR ± bars from closed trades (GUI headline).
     Basis counts by source are reported so the user sees what the number rests on."""
-    trades = store.trades()
+    source = "live" if source == "live" else "paper"
+    trades = store.trades(source=source)
     if not trades:
         return {"apr": None, "note": "no closed trades yet — run a backtest"}
     rets = [t["ret"] for t in trades]

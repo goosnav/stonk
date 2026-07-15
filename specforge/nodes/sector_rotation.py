@@ -60,6 +60,19 @@ class Node(SignalNode):
         events = []
         for sym in ctx.universe:
             sector = SECTOR_OF.get(sym) or (sym if sym in rel else None)
+            if sector is None:
+                stock = ctx.closes(sym, lookback=140).pct_change().dropna().tail(126)
+                correlations = {}
+                for etf in rel:
+                    sector_returns = ctx.closes(etf, lookback=140).pct_change().dropna().tail(126)
+                    aligned = stock.to_frame("stock").join(
+                        sector_returns.rename("sector"), how="inner")
+                    if len(aligned) >= 60:
+                        corr = aligned["stock"].corr(aligned["sector"])
+                        if corr == corr:
+                            correlations[etf] = corr
+                if correlations:
+                    sector = max(correlations, key=correlations.get)
             if sector is None or sector not in rel:
                 continue
             strength = math.tanh(rel[sector] / 0.06)
@@ -71,7 +84,7 @@ class Node(SignalNode):
                 continue
             vol = (ctx.atr_pct(sym) or 0.02) * math.sqrt(self.horizon_days)
             events.append(SignalEvent(
-                symbol=sym, direction=direction, score=round(score, 4),
+                symbol=sym, direction=direction, score=round(abs(score), 4),
                 confidence=0.6, horizon_days=self.horizon_days,
                 expected_return=round(score * vol * 0.4, 5),
                 expected_volatility=round(vol, 5),

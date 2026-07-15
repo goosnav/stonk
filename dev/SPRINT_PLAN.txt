@@ -11,6 +11,10 @@ In scope
 - Browser retry/progress/error behavior.
 - Loopback startup, bounded port fallback, health endpoints, and shutdown.
 - Release evidence and remaining M1a gap accounting.
+- Immutable TCN compatibility and objective 10/25/50 activation gates.
+- Historical graph sample recovery and embargoed graph tournaments.
+- Target-weight partial trims with confirmed-cash buy sequencing.
+- Account snapshot single-flight caching and durable audit redaction.
 
 Non-goals
 - M1b frozen runtime or public installer.
@@ -26,6 +30,12 @@ Verification
 Rollback
 Stop the server, revert this reviewable change set, and relaunch on port 8420.
 SQLite job and report records are additive and remain readable.
+
+Model rollout truth
+The versioned production evidence ensemble may trade while learned components
+remain shadowed. Until both a schema-4 global TCN and an embargo-validated graph
+pass Stage 1, learned influence is exactly zero. Training activity is research,
+not proof; objective gates decide the 10%→25%→50% overlay.
 
 Exit gate
 All items in dev/RELEASE_CHECKLIST.txt must have evidence, then the milestone

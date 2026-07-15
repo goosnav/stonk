@@ -38,12 +38,13 @@ class Node(SignalNode):
                 continue
             horizon = int(s.get("horizon_days", self.horizon_days))
             vol = (ctx.atr_pct(sym) or 0.02) * math.sqrt(horizon)
-            score = conviction if s["direction"] == "long" else -conviction
+            score = conviction
             events.append(SignalEvent(
                 symbol=sym, direction=s["direction"],
                 score=round(score, 4), confidence=round(conviction, 3),
                 horizon_days=horizon,
-                expected_return=round(score * vol * 0.5, 5),
+                expected_return=round((score if s["direction"] == "long" else -score)
+                                      * vol * 0.5, 5),
                 expected_volatility=round(vol, 5),
                 downside_estimate=round(-2 * vol, 5),
                 evidence=[f"hypothesis {h['id'][:8]}: {s.get('rationale', '')[:120]}"],

@@ -154,8 +154,7 @@ class Node(SignalNode):
                              "summary": view["thesis"]})
             if view["direction"] == "neutral" or view["conviction"] < MIN_CONVICTION:
                 continue
-            score = (view["conviction"] if view["direction"] == "long"
-                     else -view["conviction"])
+            score = view["conviction"]
             horizon = view["horizon_days"]
             vol = (ctx.atr_pct(sym) or 0.02) * (horizon ** 0.5)
             flags = ("; ".join(view["red_flags"])) if view["red_flags"] else ""
@@ -163,7 +162,8 @@ class Node(SignalNode):
                 symbol=sym, direction=view["direction"],
                 score=round(score, 4), confidence=round(view["conviction"], 3),
                 horizon_days=horizon,
-                expected_return=round(score * vol * 0.4, 5),
+                expected_return=round((score if view["direction"] == "long" else -score)
+                                      * vol * 0.4, 5),
                 expected_volatility=round(vol, 5),
                 downside_estimate=round(-2 * vol, 5),
                 evidence=[f"{view['valuation']}: {view['thesis']}"

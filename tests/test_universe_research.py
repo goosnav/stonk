@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import numpy as np
@@ -8,7 +9,9 @@ from fastapi.testclient import TestClient
 from specforge.montecarlo import block_bootstrap
 from specforge.research import (cancel_job, deep_research, discover_opportunities,
                                 enqueue_job, latest_sec_filing, list_jobs,
-                                resolve_forecasts, run_operator_job)
+                                resolve_forecasts, run_operator_job,
+                                _acquire_lease, _release_lease, recover_jobs)
+from specforge.store import Store
 from specforge.universe import parse_directory, refresh_membership, symbols
 
 
@@ -88,11 +91,55 @@ def test_research_model_and_universe_apis_expose_real_state(cfg, store):
     assert universe["tier"] == "active" and universe["limit"] == 10
 
 
+def test_model_api_rejects_snapshot_from_removed_topology(cfg, store):
+    from specforge.app import create_app
+    store.kv_set("graph_last_activations", {"symbols": {"AAA": {
+        "activations": {"removed_legacy_node": {"value": -.4}},
+        "node_states": {"removed_legacy_node": "running"}}}})
+    graph = TestClient(create_app(cfg, store, with_scheduler=False)).get(
+        "/api/model/graph?symbol=AAA&horizon=21").json()
+    assert graph["snapshot"] is None
+    assert graph["activation_completeness"] is False
+
+
 def test_research_jobs_are_durable_deduplicated_and_cancellable(store):
     first = enqueue_job(store, "discover")
     assert enqueue_job(store, "discover")["id"] == first["id"]
     assert list_jobs(store)[0]["status"] == "queued"
     assert cancel_job(store, first["id"])["status"] == "cancelled"
+
+
+def test_terminal_research_job_persists_complete_progress(cfg, store, monkeypatch):
+    job = enqueue_job(store, "discover")
+    monkeypatch.setattr("specforge.research.discover_opportunities",
+                        lambda _cfg, _store: {"status": "completed", "shortlist": []})
+    assert run_operator_job(cfg, store)["status"] == "completed"
+    visible = next(row for row in list_jobs(store) if row["id"] == job["id"])
+    assert visible["progress"]["fraction"] == 1.0
+    persisted = json.loads(store.db.execute(
+        "SELECT progress FROM research_jobs WHERE id=?", (job["id"],)).fetchone()[0])
+    assert persisted["fraction"] == 1.0
+
+
+def test_research_lease_prevents_cross_process_overlap(store):
+    other = Store(store.path)
+    owner = _acquire_lease(store, 60)
+    assert owner and _acquire_lease(other, 60) is None
+    _release_lease(store, owner)
+    second = _acquire_lease(other, 60)
+    assert second
+    _release_lease(other, second)
+
+
+def test_restart_requeues_job_and_clears_dead_worker_lease(store):
+    job = enqueue_job(store, "discover")
+    store.db.execute("UPDATE research_jobs SET status='running',attempts=1 WHERE id=?",
+                     (job["id"],))
+    store.kv_set("research_worker_lease", {
+        "owner": "99999999:1", "expires_at": __import__("time").time() + 1800})
+    assert recover_jobs(store) == 1
+    assert store.kv_get("research_worker_lease") is None
+    assert list_jobs(store)[0]["status"] == "queued"
 
 
 def test_research_job_api_contract(cfg, store):
@@ -156,3 +203,48 @@ def test_latest_sec_filing_extracts_narrative_and_source_hash():
     filing = latest_sec_filing("123", Client)
     assert filing["form"] == "10-Q" and "Revenue grew" in filing["text"]
     assert len(filing["sha256"]) == 64 and filing["url"].endswith("/q.htm")
+
+
+def test_company_facts_ingestion_is_point_in_time_and_durable(store):
+    from specforge.universe import ingest_next_filing_facts
+    today = date.today().isoformat()
+    with store.db:
+        store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                         ("FACT", "Facts Co", "NASDAQ", "common", 0, 0, 1,
+                          today, today, "test", "123", "x"))
+        store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                         (today, "FACT", "research", 1, "test", "{}"))
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"facts": {"us-gaap": {"EarningsPerShareDiluted": {
+                "units": {"USD/shares": [{"filed": "2025-02-01",
+                    "end": "2024-12-31", "val": 4.2, "form": "10-K",
+                    "accn": "a"}]}}}}}
+    class Client:
+        @staticmethod
+        def get(*args, **kwargs): return Response()
+
+    result = ingest_next_filing_facts(store, Client)
+    assert result["status"] == "completed" and result["inserted"] == 1
+    fact = store.db.execute("SELECT * FROM filing_facts WHERE cik='123'").fetchone()
+    assert fact["filed"] == "2025-02-01" and fact["period_end"] == "2024-12-31"
+    assert store.kv_get("filing_facts_attempted_FACT")["status"] == "completed"
+
+
+def test_holding_training_isolates_one_symbol_failure(cfg, store, monkeypatch):
+    from specforge import neural
+    from specforge.research import train_holdings
+    monkeypatch.setattr(store, "open_positions", lambda mode=None: [
+        {"symbol": "AAA"}, {"symbol": "BBB"}])
+
+    def train(_cfg, _store, symbol=None, **_kwargs):
+        if symbol == "AAA":
+            raise ValueError("Encountered all NA values")
+        return {"status": "challenger", "symbol": symbol}
+
+    monkeypatch.setattr(neural, "train_challenger", train)
+    result = train_holdings(cfg, store)
+    assert result["status"] == "partial" and result["failures"] == ["AAA"]
+    assert result["results"]["BBB"]["status"] == "challenger"

@@ -232,6 +232,8 @@ def generate(cfg, store: Store, ai, ctx, tier: str = "short_term") -> dict | Non
     from . import regime as regime_mod
     reg = regime_mod.classify(ctx, cfg)
     north = store.active_hypothesis("north_star")
+    from .strategy import active as active_strategy
+    strategy = active_strategy(store)
     prev = store.active_hypothesis(tier) if tier == "short_term" else None
     max_wl = cfg.get("hypothesis", "max_watchlist", default=8)
 
@@ -249,6 +251,8 @@ def generate(cfg, store: Store, ai, ctx, tier: str = "short_term") -> dict | Non
         f"Current regime: {reg.regime} (evidence: {reg.evidence}).",
         f"North star (persistent thesis to stay aligned with):\n{north['thesis']}"
         if north and tier == "short_term" else "",
+        ("Active operator-informed Strategy AI mandate (advisory context):\n" +
+         json.dumps(strategy["payload"], default=str)[:8000]) if strategy else "",
         f"Previous short-term hypothesis (being replaced):\n{prev['thesis']}\n"
         f"Its invalidation was: {prev['invalidation']}" if prev else "",
         perf,

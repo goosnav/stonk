@@ -20,22 +20,43 @@ import pandas as pd
 
 FEATURES = ["r1", "range", "gap", "volume_z", "vol21", "rsi14",
             "atr14", "breakout60", "sma50_d", "sma200_d", "spy_r1", "spy_r21",
-            "relative_r21", "vix", "valuation", "valuation_missing",
-            "event_proximity", "event_missing"]
+            "sector_relative_r21", "vix", "valuation", "valuation_missing",
+            "event_proximity", "event_missing", "vix9d", "vix3m", "vix6m",
+            "vvix", "vix_curve_9d_3m", "vix_curve_1m_3m",
+            "implied_realized_spread", "hyg_r21", "tlt_r21",
+            "vol_context_missing", "revenue_growth", "revenue_growth_missing",
+            "operating_margin", "operating_margin_missing", "fcf_margin",
+            "fcf_margin_missing", "debt_assets", "debt_assets_missing",
+            "dilution", "dilution_missing", "accruals", "accruals_missing",
+            "liquidity", "liquidity_missing", "news_sentiment", "news_missing"]
 QUANTILES = (0.1, 0.5, 0.9)
+MODEL_SCHEMA = 5
+FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
+ARCHITECTURE_HASH = hashlib.sha256(
+    b"tcn-v5:conv32:k3:d1,2,4:gelu:dropout.1:context16:separate-qheads:probability:rank-loss:calibrated"
+).hexdigest()[:16]
+
+TRIAL_SPECS = (
+    {"lr": 1e-3, "weight_decay": 1e-4, "rank_weight": .03},
+    {"lr": 5e-4, "weight_decay": 1e-4, "rank_weight": .05},
+    {"lr": 3e-4, "weight_decay": 3e-4, "rank_weight": .08},
+    {"lr": 1e-3, "weight_decay": 1e-3, "rank_weight": .05},
+    {"lr": 2e-4, "weight_decay": 1e-4, "rank_weight": .10},
+    {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08},
+)
 
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _path(cfg, symbol: str | None = None, challenger: bool = False) -> Path:
+def _path(cfg, symbol: str | None = None, challenger: bool = False,
+          run_id: str | None = None) -> Path:
     if symbol:
         root = Path(cfg.get("neural", "holdings_dir", default="data/models/holdings"))
-        suffix = ".challenger.pt" if challenger else ".pt"
-        return root / f"{symbol}{suffix}"
+        return root / (f"{symbol}.{run_id}.pt" if challenger and run_id else f"{symbol}.pt")
     p = Path(cfg.get("neural", "checkpoint", default="data/models/global_tcn.pt"))
-    return p.with_suffix(".challenger.pt") if challenger else p
+    return p.with_name(f"{p.stem}.{run_id}.pt") if challenger and run_id else p
 
 
 def _save(path: Path, payload: dict) -> None:
@@ -58,18 +79,138 @@ def _valuation_series(store, symbol: str, index, prices) -> tuple[pd.Series, pd.
     if not inst or not inst["cik"]:
         return pd.Series(0.0, index=index), pd.Series(1.0, index=index)
     rows = store.db.execute(
-        "SELECT filed,value FROM filing_facts WHERE cik=? AND tag='EarningsPerShareDiluted' "
+        "SELECT filed,period_end,value FROM filing_facts WHERE cik=? "
+        "AND tag='EarningsPerShareDiluted' "
         "AND form IN ('10-K','10-K/A') ORDER BY filed", (str(inst["cik"]),)).fetchall()
     if not rows:
         return pd.Series(0.0, index=index), pd.Series(1.0, index=index)
-    known = pd.Series({r["filed"]: float(r["value"]) for r in rows})
-    eps = known.reindex(index).ffill()
+    # A 10-K repeats comparative prior years under the same filing date. Keep
+    # the latest period that was actually reported on each availability date.
+    by_filed = {}
+    for r in rows:
+        current = by_filed.get(r["filed"])
+        if current is None or r["period_end"] > current[0]:
+            by_filed[r["filed"]] = (r["period_end"], float(r["value"]))
+    known = pd.Series({filed: value for filed, (_, value) in by_filed.items()})
+    eps = known.reindex(known.index.union(index)).sort_index().ffill().reindex(index)
     pe = (prices / eps.replace(0, np.nan)).clip(-100, 100) / 25.0
     return pe.fillna(0.0), pe.isna().astype(float)
 
 
+def _event_series(store, symbol: str, index) -> tuple[pd.Series, pd.Series]:
+    """Post-filing event proximity using only then-public filing dates."""
+    inst = store.db.execute("SELECT cik FROM instruments WHERE symbol=?", (symbol,)).fetchone()
+    if not inst or not inst["cik"]:
+        return pd.Series(0.0, index=index), pd.Series(1.0, index=index)
+    rows = store.db.execute(
+        "SELECT DISTINCT filed FROM filing_facts WHERE cik=? AND form IN "
+        "('10-K','10-K/A','10-Q','10-Q/A') ORDER BY filed", (str(inst["cik"]),)).fetchall()
+    if not rows:
+        return pd.Series(0.0, index=index), pd.Series(1.0, index=index)
+    dates = np.asarray([np.datetime64(r["filed"]) for r in rows])
+    observed = np.asarray(index, dtype="datetime64[D]")
+    positions = np.searchsorted(dates, observed, side="right") - 1
+    missing = positions < 0
+    safe = np.maximum(positions, 0)
+    days = (observed - dates[safe]).astype("timedelta64[D]").astype(float)
+    # np.where evaluates both branches. Clip pre-filing negative offsets before
+    # exponentiation so missing history cannot create overflow warnings during
+    # broad shadow inference; the mask still makes those rows explicitly zero.
+    decay = np.exp(-np.clip(days, 0.0, 30.0) / 10.0)
+    proximity = np.where(missing | (days > 30), 0.0, decay)
+    return (pd.Series(proximity, index=index),
+            pd.Series(missing.astype(float), index=index))
+
+
+def _fundamental_series(store, symbol: str, index) -> dict[str, pd.Series]:
+    """Then-known SEC facts transformed only on their filing availability date."""
+    inst = store.db.execute("SELECT cik FROM instruments WHERE symbol=?", (symbol,)).fetchone()
+    names = ("revenue_growth", "operating_margin", "fcf_margin", "debt_assets",
+             "dilution", "accruals", "liquidity")
+    empty = {n: pd.Series(0.0, index=index) for n in names}
+    empty.update({n + "_missing": pd.Series(1.0, index=index) for n in names})
+    if not inst or not inst["cik"]:
+        return empty
+    tags = ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
+            "OperatingIncomeLoss", "NetCashProvidedByUsedInOperatingActivities",
+            "PaymentsToAcquirePropertyPlantAndEquipment", "LongTermDebtCurrent",
+            "LongTermDebtNoncurrent", "LongTermDebt", "Assets", "NetIncomeLoss",
+            "AssetsCurrent", "LiabilitiesCurrent", "CommonStocksIncludingAdditionalPaidInCapital",
+            "CommonStockSharesOutstanding")
+    marks = ",".join("?" for _ in tags)
+    rows = store.db.execute(
+        f"SELECT filed,period_end,tag,value FROM filing_facts WHERE cik=? AND tag IN ({marks}) "
+        "ORDER BY filed,period_end", (str(inst["cik"]), *tags)).fetchall()
+    if not rows:
+        return empty
+    grouped: dict[str, dict[str, tuple[str, float]]] = {}
+    for row in rows:
+        current = grouped.setdefault(row["filed"], {}).get(row["tag"])
+        if current is None or row["period_end"] >= current[0]:
+            grouped[row["filed"]][row["tag"]] = (row["period_end"], float(row["value"]))
+    state, prior = {}, {}; snapshots = {}
+    for filed, facts in sorted(grouped.items()):
+        for tag, (_, value) in facts.items(): state[tag] = value
+        revenue = state.get("RevenueFromContractWithCustomerExcludingAssessedTax",
+                            state.get("Revenues"))
+        # Paid-in capital is a dollar balance, not a share count.  Treat a
+        # missing share fact as missing instead of manufacturing dilution from
+        # dimensionally incompatible SEC data.
+        shares = state.get("CommonStockSharesOutstanding")
+        assets = state.get("Assets")
+        cfo = state.get("NetCashProvidedByUsedInOperatingActivities")
+        capex = state.get("PaymentsToAcquirePropertyPlantAndEquipment")
+        debt = sum(v for v in (state.get("LongTermDebtCurrent"),
+                               state.get("LongTermDebtNoncurrent")) if v is not None)
+        if not debt: debt = state.get("LongTermDebt")
+        values = {
+            "revenue_growth": ((revenue / prior["revenue"] - 1) if revenue is not None and
+                               prior.get("revenue") not in (None, 0) else None),
+            "operating_margin": (state.get("OperatingIncomeLoss") / revenue
+                                 if revenue not in (None, 0) and
+                                 state.get("OperatingIncomeLoss") is not None else None),
+            "fcf_margin": ((cfo - (capex or 0)) / revenue if cfo is not None and
+                           revenue not in (None, 0) else None),
+            "debt_assets": (debt / assets if debt is not None and assets not in (None, 0) else None),
+            "dilution": ((shares / prior["shares"] - 1) if shares is not None and
+                         prior.get("shares") not in (None, 0) else None),
+            "accruals": ((state.get("NetIncomeLoss") - cfo) / assets
+                         if state.get("NetIncomeLoss") is not None and cfo is not None and
+                         assets not in (None, 0) else None),
+            "liquidity": (state.get("AssetsCurrent") / state.get("LiabilitiesCurrent") - 1
+                          if state.get("AssetsCurrent") is not None and
+                          state.get("LiabilitiesCurrent") not in (None, 0) else None),
+        }
+        snapshots[filed] = {k: (max(-3.0, min(3.0, v)) if v is not None else None)
+                            for k, v in values.items()}
+        if revenue is not None: prior["revenue"] = revenue
+        if shares is not None: prior["shares"] = shares
+    out = {}
+    for name in names:
+        series = pd.Series({d: value[name] for d, value in snapshots.items()}, dtype=float)
+        aligned = series.reindex(series.index.union(index)).sort_index().ffill().reindex(index)
+        out[name] = aligned.fillna(0.0)
+        out[name + "_missing"] = aligned.isna().astype(float)
+    return out
+
+
+def _news_series(store, symbol: str, index) -> tuple[pd.Series, pd.Series]:
+    rows = store.db.execute(
+        "SELECT substr(published_at,1,10) d,AVG(stance*confidence*reliability) score "
+        "FROM news_intelligence WHERE symbol=? AND classified_at IS NOT NULL GROUP BY 1",
+        (symbol,)).fetchall()
+    if not rows:
+        return pd.Series(0.0, index=index), pd.Series(1.0, index=index)
+    series = pd.Series({r["d"]: float(r["score"] or 0) for r in rows})
+    aligned = series.reindex(series.index.union(index)).sort_index().rolling(3, min_periods=1).mean()
+    aligned = aligned.reindex(index)
+    return aligned.fillna(0.0), aligned.isna().astype(float)
+
+
 def _features(b: pd.DataFrame, spy: pd.DataFrame, vix: pd.DataFrame,
-              store=None, symbol: str = "") -> pd.DataFrame:
+              store=None, symbol: str = "",
+              sectors: dict[str, pd.DataFrame] | None = None,
+              context: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
     c = b["close"].astype(float)
     r = c.pct_change()
     f = pd.DataFrame(index=b.index)
@@ -93,23 +234,74 @@ def _features(b: pd.DataFrame, spy: pd.DataFrame, vix: pd.DataFrame,
     sp = spy["close"].reindex(f.index).ffill().astype(float)
     f["spy_r1"] = sp.pct_change()
     f["spy_r21"] = sp.pct_change(21)
-    f["relative_r21"] = c.pct_change(21) - sp.pct_change(21)
-    if len(vix):
-        f["vix"] = vix["close"].reindex(f.index).ffill() / 20.0 - 1
+    sector_returns = {}
+    for sector_symbol, sector_bars in (sectors or {}).items():
+        if len(sector_bars):
+            sector_close = sector_bars["close"].reindex(f.index).ffill().astype(float)
+            sector_returns[sector_symbol] = sector_close.pct_change()
+    if sector_returns:
+        sr = pd.DataFrame(sector_returns, index=f.index)
+        # Each date chooses the sector ETF whose prior 60 sessions best match
+        # this stock. Rolling correlations and 21d returns use no future rows.
+        correlations = sr.apply(lambda series: r.rolling(60).corr(series))
+        valid = correlations.notna().any(axis=1)
+        chosen = pd.Series(index=f.index, dtype=object)
+        if valid.any():
+            chosen.loc[valid] = correlations.loc[valid].idxmax(axis=1)
+        sector_r21 = sr.add(1).rolling(21).apply(np.prod, raw=True) - 1
+        proxy = pd.Series(index=f.index, dtype=float)
+        for sector_symbol in sector_r21.columns:
+            mask = chosen == sector_symbol
+            proxy.loc[mask] = sector_r21.loc[mask, sector_symbol]
+        f["sector_relative_r21"] = c.pct_change(21) - proxy
     else:
+        f["sector_relative_r21"] = c.pct_change(21) - sp.pct_change(21)
+    if len(vix):
+        vix_series = vix["close"].reindex(f.index).ffill()
+        f["vix"] = vix_series / 20.0 - 1
+    else:
+        vix_series = pd.Series(np.nan, index=f.index)
         f["vix"] = 0.0
+    context = context or {}
+    def aligned(name):
+        frame = context.get(name)
+        return (frame["close"].reindex(f.index).ffill().astype(float)
+                if frame is not None and len(frame) else pd.Series(np.nan, index=f.index))
+    vix9d, vix3m, vix6m, vvix = (aligned("vix9d"), aligned("vix3m"),
+                                 aligned("vix6m"), aligned("vvix"))
+    f["vix9d"] = (vix9d / 20.0 - 1).fillna(0.0)
+    f["vix3m"] = (vix3m / 20.0 - 1).fillna(0.0)
+    f["vix6m"] = (vix6m / 20.0 - 1).fillna(0.0)
+    f["vvix"] = (vvix / 100.0 - 1).fillna(0.0)
+    f["vix_curve_9d_3m"] = (vix9d / vix3m - 1).fillna(0.0)
+    f["vix_curve_1m_3m"] = (vix_series / vix3m - 1).fillna(0.0)
+    realized = sp.pct_change().rolling(21).std() * math.sqrt(252) * 100
+    f["implied_realized_spread"] = ((vix_series - realized) / 20.0).fillna(0.0)
+    hyg, tlt = aligned("hyg"), aligned("tlt")
+    f["hyg_r21"] = hyg.pct_change(21).fillna(0.0)
+    f["tlt_r21"] = tlt.pct_change(21).fillna(0.0)
+    f["vol_context_missing"] = (vix9d.isna() | vix3m.isna() | vix6m.isna() |
+                                vvix.isna()).astype(float)
     if store is not None and symbol:
         f["valuation"], f["valuation_missing"] = _valuation_series(
             store, symbol, f.index, c)
     else:
         f["valuation"], f["valuation_missing"] = 0.0, 1.0
-    # Earnings-calendar history is not yet reliably point-in-time. Keep the
-    # channel explicit and missing instead of leaking today's calendar back.
-    f["event_proximity"], f["event_missing"] = 0.0, 1.0
+    if store is not None and symbol:
+        f["event_proximity"], f["event_missing"] = _event_series(store, symbol, f.index)
+        for name, values in _fundamental_series(store, symbol, f.index).items():
+            f[name] = values
+        f["news_sentiment"], f["news_missing"] = _news_series(store, symbol, f.index)
+    else:
+        f["event_proximity"], f["event_missing"] = 0.0, 1.0
+        for name in ("revenue_growth", "operating_margin", "fcf_margin", "debt_assets",
+                     "dilution", "accruals", "liquidity"):
+            f[name], f[name + "_missing"] = 0.0, 1.0
+        f["news_sentiment"], f["news_missing"] = 0.0, 1.0
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def build_dataset(cfg, store, symbols: list[str] | None = None) -> dict:
+def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -> dict:
     window = int(cfg.get("neural", "input_sessions", default=60))
     horizons = tuple(cfg.get("neural", "horizons", default=[5, 21]))
     since = cfg.get("neural", "train_since", default="2011-01-01")
@@ -118,24 +310,49 @@ def build_dataset(cfg, store, symbols: list[str] | None = None) -> dict:
     bench = cfg.get("universe", "benchmark", default="SPY")
     spy, vix = _bars(store, bench, since), _bars(
         store, cfg.get("universe", "vix_symbol", default="^VIX"), since)
+    vol_symbols = cfg.get("universe", "volatility_symbols", default={}) or {}
+    context = {name: _bars(store, ticker, since) for name, ticker in vol_symbols.items()
+               if name != "vix"}
+    context.update({"hyg": _bars(store, "HYG", since), "tlt": _bars(store, "TLT", since)})
+    sector_symbols = cfg.get("universe", "sector_etfs", default=[
+        "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB", "XLRE", "XLC"])
+    sectors = {s: _bars(store, s, since) for s in sector_symbols}
     if len(spy) < window + max(horizons) + 100:
         return {"error": "not enough benchmark history"}
     X, Y, dates, owners = [], [], [], []
-    for sym in symbols:
+    per_symbol_cap = min(int(cfg.get("neural", "max_windows_per_symbol", default=500)),
+                         max(20, int(cfg.get("neural", "max_training_windows",
+                                            default=250_000)) // max(1, len(symbols))))
+    for symbol_index, sym in enumerate(symbols, 1):
+        if progress:
+            progress({"phase": "dataset", "symbol": sym, "index": symbol_index,
+                      "total": len(symbols),
+                      "fraction": .2 * symbol_index / max(1, len(symbols))})
         b = _bars(store, sym, since)
         if len(b) < window + max(horizons) + 100:
             continue
-        f = _features(b, spy, vix, store, sym)
+        f = _features(b, spy, vix, store, sym, sectors, context)
         c = b["close"].astype(float)
         sp = spy["close"].reindex(c.index).ffill().astype(float)
         targets = pd.DataFrame({h: (c.shift(-h) / c - 1) -
                                     (sp.shift(-h) / sp - 1) for h in horizons})
         vals = f[FEATURES].to_numpy(np.float32)
-        for i in range(window - 1, len(f) - max(horizons)):
-            x = vals[i - window + 1:i + 1]
-            y = targets.iloc[i].to_numpy(np.float32)
-            if np.isfinite(x).all() and np.isfinite(y).all():
-                X.append(x); Y.append(y); dates.append(f.index[i]); owners.append(sym)
+        yvals = targets.to_numpy(np.float32)
+        row_valid = np.isfinite(vals).all(axis=1).astype(np.int16)
+        # A window is usable only when all 60 rows and both future targets are
+        # finite. Select evenly across history instead of materializing every
+        # overlapping window (which grows to many GB at 1,500 symbols).
+        complete = np.convolve(row_valid, np.ones(window, dtype=np.int16),
+                               mode="valid") == window
+        indices = np.flatnonzero(complete) + window - 1
+        indices = indices[(indices < len(f) - max(horizons)) &
+                          np.isfinite(yvals[indices]).all(axis=1)]
+        if len(indices) > per_symbol_cap:
+            indices = indices[np.linspace(0, len(indices) - 1,
+                                          per_symbol_cap, dtype=int)]
+        for i in indices:
+            X.append(vals[i - window + 1:i + 1])
+            Y.append(yvals[i]); dates.append(f.index[i]); owners.append(sym)
     if len(X) < 100:
         return {"error": f"not enough training windows ({len(X)})"}
     X, Y = np.stack(X), np.stack(Y)
@@ -155,10 +372,12 @@ def build_dataset(cfg, store, symbols: list[str] | None = None) -> dict:
              "test": d >= test_start}
     mean = X[masks["train"]].mean((0, 1), keepdims=True)
     std = X[masks["train"]].std((0, 1), keepdims=True) + 1e-6
+    target_scale = np.maximum(Y[masks["train"]].std(axis=0), .005).astype(np.float32)
     X = (X - mean) / std
     return {"X": X.astype(np.float32), "Y": Y, "dates": d,
             "owners": np.asarray(owners), "masks": masks,
             "mean": mean, "std": std, "horizons": horizons,
+            "target_scale": target_scale,
             "data_as_of": unique[-1], "train_end": train_end,
             "val_start": val_start, "test_start": test_start}
 
@@ -186,24 +405,28 @@ def _make_model(n_features: int, n_horizons: int):
             self.blocks = nn.Sequential(CausalBlock(n_features, 32, 1),
                                         CausalBlock(32, 32, 2),
                                         CausalBlock(32, 32, 4))
-            self.context_width = min(8, n_features)
-            self.head = nn.Linear(32 + self.context_width, n_horizons * 3)
-            self.probability_head = nn.Linear(32 + self.context_width, n_horizons)
+            self.context = nn.Sequential(nn.Linear(n_features, 16), nn.GELU(),
+                                         nn.Dropout(.1))
+            self.quantile_heads = nn.ModuleList(nn.Linear(48, 3)
+                                                for _ in range(n_horizons))
+            self.probability_heads = nn.ModuleList(nn.Linear(48, 1)
+                                                   for _ in range(n_horizons))
 
         def encoded(self, x):
             temporal = self.blocks(x.transpose(1, 2))[..., -1]
-            return torch.cat((temporal, x[:, -1, -self.context_width:]), dim=1)
+            return torch.cat((temporal, self.context(x[:, -1, :])), dim=1)
 
         def forward(self, x):
             z = self.encoded(x)
-            raw = self.head(z).view(-1, n_horizons, 3)
+            raw = torch.stack([head(z) for head in self.quantile_heads], dim=1)
             q50 = raw[..., 1]
             q10 = q50 - torch.nn.functional.softplus(raw[..., 0])
             q90 = q50 + torch.nn.functional.softplus(raw[..., 2])
             return torch.stack((q10, q50, q90), dim=-1)
 
         def probability(self, x):
-            return torch.sigmoid(self.probability_head(self.encoded(x)))
+            z = self.encoded(x)
+            return torch.sigmoid(torch.cat([head(z) for head in self.probability_heads], dim=1))
     return TCN()
 
 
@@ -214,11 +437,122 @@ def _pinball(pred, target):
     return torch.maximum(q * err, (q - 1) * err).mean()
 
 
+def _rank_loss(pred, target, dates) -> object:
+    """Small same-session pairwise loss, aligned with live cross-sectional rank."""
+    import torch
+    losses = []
+    for day in np.unique(dates):
+        loc = np.flatnonzero(dates == day)
+        if len(loc) < 2:
+            continue
+        # Adjacent deterministic pairs cap quadratic cost while retaining sign.
+        a = torch.as_tensor(loc[:-1], device=pred.device)
+        b = torch.as_tensor(loc[1:], device=pred.device)
+        truth = torch.sign(target[a] - target[b])
+        mask = truth != 0
+        if mask.any():
+            losses.append(torch.nn.functional.softplus(
+                -truth[mask] * (pred[a][mask] - pred[b][mask])).mean())
+    return torch.stack(losses).mean() if losses else pred.sum() * 0
+
+
+def _training_device(cfg, torch) -> str:
+    requested = str(cfg.get("neural", "device", default="auto")).lower()
+    if requested in ("cpu", "mps", "cuda"):
+        if requested == "cuda" and not torch.cuda.is_available(): return "cpu"
+        if requested == "mps" and not torch.backends.mps.is_available(): return "cpu"
+        return requested
+    if torch.cuda.is_available(): return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): return "mps"
+    return "cpu"
+
+
+def _predict_batches(model, X, indices, scale, device: str, batch_size: int = 2048):
+    import torch
+    predictions, probabilities = [], []
+    model.eval()
+    with torch.no_grad():
+        for chunk in torch.as_tensor(indices).split(batch_size):
+            xb = X[chunk].to(device)
+            predictions.append(model(xb).cpu().numpy())
+            probabilities.append(model.probability(xb).cpu().numpy())
+    pred = np.concatenate(predictions) * np.asarray(scale).reshape(1, -1, 1)
+    return pred, np.concatenate(probabilities)
+
+
+def _calibration(pred, probability, truth) -> dict:
+    out = {"quantile_offsets": [], "probability_logit_offsets": []}
+    for i in range(truth.shape[1]):
+        out["quantile_offsets"].append([
+            float(np.quantile(truth[:, i] - pred[:, i, 0], .10)),
+            0.0,
+            float(np.quantile(truth[:, i] - pred[:, i, 2], .90))])
+        observed = np.clip((truth[:, i] > 0).mean(), 1e-4, 1 - 1e-4)
+        expected = np.clip(probability[:, i].mean(), 1e-4, 1 - 1e-4)
+        out["probability_logit_offsets"].append(float(
+            np.log(observed / (1 - observed)) - np.log(expected / (1 - expected))))
+    return out
+
+
+def _apply_calibration(pred, probability, calibration):
+    pred = np.asarray(pred).copy(); probability = np.asarray(probability).copy()
+    for i, offsets in enumerate((calibration or {}).get("quantile_offsets", [])):
+        pred[:, i, :] += np.asarray(offsets)
+        pred[:, i, 0] = np.minimum(pred[:, i, 0], pred[:, i, 1])
+        pred[:, i, 2] = np.maximum(pred[:, i, 2], pred[:, i, 1])
+    for i, offset in enumerate((calibration or {}).get("probability_logit_offsets", [])):
+        p = np.clip(probability[:, i], 1e-5, 1 - 1e-5)
+        probability[:, i] = 1 / (1 + np.exp(-(np.log(p / (1 - p)) + offset)))
+    return pred, probability
+
+
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1]) if len(a) > 5 and np.std(a) and np.std(b) else 0.0
 
 
-def _metrics(pred: np.ndarray, y: np.ndarray, horizons) -> dict:
+def _rank_ic(pred: np.ndarray, truth: np.ndarray, dates) -> float:
+    if dates is None:
+        return _corr(pred, truth)
+    values = []
+    dates = np.asarray(dates)
+    for day in np.unique(dates):
+        mask = dates == day
+        if mask.sum() < 8:
+            continue
+        pr = pd.Series(pred[mask]).rank(method="average").to_numpy()
+        tr = pd.Series(truth[mask]).rank(method="average").to_numpy()
+        values.append(_corr(pr, tr))
+    return float(np.mean(values)) if values else 0.0
+
+
+def _top_decile_alpha(pred: np.ndarray, truth: np.ndarray, dates=None,
+                      cost: float = .0016) -> float:
+    """After-cost mean return of each session's highest-ranked decile.
+
+    Pooling symbols across dates rewards market timing instead of the
+    cross-sectional stock selection this model is used for.  Forward shadow
+    and tournament metrics therefore use the same per-session definition.
+    """
+    pred, truth = np.asarray(pred), np.asarray(truth)
+    if dates is None:
+        if not len(pred):
+            return 0.0
+        selected = truth[pred >= np.quantile(pred, .9)]
+        return float(selected.mean() - cost) if len(selected) else 0.0
+    values = []
+    dates = np.asarray(dates)
+    for day in np.unique(dates):
+        mask = dates == day
+        if mask.sum() < 8:
+            continue
+        day_pred, day_truth = pred[mask], truth[mask]
+        chosen = day_truth[day_pred >= np.quantile(day_pred, .9)]
+        if len(chosen):
+            values.append(float(chosen.mean() - cost))
+    return float(np.mean(values)) if values else 0.0
+
+
+def _metrics(pred: np.ndarray, y: np.ndarray, horizons, dates=None) -> dict:
     out = {}
     losses = []
     for i, h in enumerate(horizons):
@@ -228,23 +562,81 @@ def _metrics(pred: np.ndarray, y: np.ndarray, horizons) -> dict:
             (np.asarray(QUANTILES) - 1) * (y[:, i, None] - pred[:, i, :]))))
         losses.append(loss)
         out[str(h)] = {"pinball": round(loss, 6),
-                       "correlation": round(_corr(q50, y[:, i]), 4),
+                       "correlation": round(_rank_ic(q50, y[:, i], dates), 4),
+                       "top_decile_alpha_after_cost": round(
+                           _top_decile_alpha(q50, y[:, i], dates), 5),
                        "directional_accuracy": round(float((np.sign(q50) == np.sign(y[:, i])).mean()), 3),
                        "coverage": round(float(((y[:, i] >= q10) & (y[:, i] <= q90)).mean()), 3)}
     out["pinball"] = round(float(np.mean(losses)), 6)
+    out["correlation_kind"] = "daily_rank_ic" if dates is not None else "time_series"
     return out
 
 
-def _walk_forward_metrics(cfg, ds: dict) -> dict:
+def _selection_score(metrics: dict) -> float:
+    """Validation-only tournament utility aligned with the live ranker."""
+    hs = [metrics.get(str(h), {}) for h in (5, 21)]
+    if any("correlation" not in h for h in hs):
+        return float("-inf")
+    rank_ic = sum(float(h.get("correlation", 0)) for h in hs) / 2
+    alpha = sum(float(h.get("top_decile_alpha_after_cost", 0)) for h in hs) / 2
+    calibration = sum(abs(float(h.get("coverage", 0)) - .80) for h in hs) / 2
+    pinball = sum(float(h.get("pinball", 1)) for h in hs) / 2
+    return rank_ic + 4 * alpha - .25 * calibration - pinball
+
+
+def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
+    """Honest local-compute baselines evaluated on the identical untouched rows."""
+    y = ds["Y"][eval_idx]
+    horizons = ds["horizons"]
+    dates = ds["dates"][eval_idx]
+    raw = ds["X"] * ds["std"] + ds["mean"]
+    train = ds["masks"]["train"]
+
+    def bands(median, residual_source):
+        pred = np.zeros((len(median), len(horizons), 3), dtype=np.float32)
+        for i in range(len(horizons)):
+            residual = residual_source[:, i]
+            lo, hi = np.quantile(residual, [.10, .90])
+            pred[:, i, 0], pred[:, i, 1], pred[:, i, 2] = \
+                median[:, i] + lo, median[:, i], median[:, i] + hi
+        return pred
+
+    zero_median = np.zeros_like(y)
+    zero = bands(zero_median, ds["Y"][train])
+    last_r1 = raw[:, -1, FEATURES.index("r1")]
+    momentum_all = np.column_stack(
+        [last_r1 * math.sqrt(max(1, h)) for h in horizons]).astype(np.float32)
+    momentum = bands(momentum_all[eval_idx], ds["Y"][train] - momentum_all[train])
+
+    # Closed-form ridge on the latest context row. It is deliberately simple
+    # and deterministic; a TCN that cannot beat it has not earned complexity.
+    x = raw[:, -1, :].astype(np.float64)
+    mean, std = x[train].mean(0), x[train].std(0) + 1e-6
+    xn = (x - mean) / std
+    design = np.column_stack((np.ones(train.sum()), xn[train]))
+    reg = np.eye(design.shape[1]) * 1e-2; reg[0, 0] = 0
+    coef = np.linalg.solve(design.T @ design + reg, design.T @ ds["Y"][train])
+    ridge_all = np.column_stack((np.ones(len(xn)), xn)) @ coef
+    ridge = bands(ridge_all[eval_idx], ds["Y"][train] - ridge_all[train])
+    return {"zero": _metrics(zero, y, horizons, dates),
+            "momentum": _metrics(momentum, y, horizons, dates),
+            "ridge": _metrics(ridge, y, horizons, dates)}
+
+
+def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
+                          max_seconds: float | None = None) -> tuple[dict, list[tuple]]:
     """Five expanding, embargoed TCN folds before the final sealed block."""
     import torch
     dates, unique = ds["dates"], sorted(set(ds["dates"]))
+    trial_spec = trial_spec or TRIAL_SPECS[0]
+    device = _training_device(cfg, torch)
     folds = int(cfg.get("neural", "walk_forward_folds", default=5))
     embargo = max(ds["horizons"])
     initial, sealed = int(len(unique) * .45), int(len(unique) * .85)
     width = max(1, (sealed - initial - embargo) // folds)
     raw = ds["X"] * ds["std"] + ds["mean"]
-    results = []
+    results, oos = [], []
+    started = time.time()
     for fold in range(folds):
         train_pos = initial + fold * width
         test_start_pos = train_pos + embargo
@@ -256,30 +648,58 @@ def _walk_forward_metrics(cfg, ds: dict) -> dict:
         mean = raw[train_mask].mean((0, 1), keepdims=True)
         std = raw[train_mask].std((0, 1), keepdims=True) + 1e-6
         X = torch.from_numpy(((raw - mean) / std).astype(np.float32))
-        Y = torch.from_numpy(ds["Y"])
+        scale_np = np.maximum(ds["Y"][train_mask].std(axis=0), .005).astype(np.float32)
+        scale = torch.from_numpy(scale_np)
+        Yraw = torch.from_numpy(ds["Y"])
+        Y = Yraw / scale
         tr = torch.from_numpy(np.flatnonzero(train_mask))
         te = np.flatnonzero(test_mask)
-        model = _make_model(len(FEATURES), len(ds["horizons"]))
-        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        for _ in range(min(15, int(cfg.get("neural", "max_epochs", default=50)))):
+        model = _make_model(len(FEATURES), len(ds["horizons"])).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
+                                weight_decay=trial_spec["weight_decay"])
+        remaining_folds = max(1, folds - fold)
+        fold_deadline = (time.time() + max(1.0, (max_seconds - (time.time() - started)) /
+                         remaining_folds)) if max_seconds else None
+        epochs = min(int(cfg.get("neural", "walk_forward_epochs", default=6)),
+                     int(cfg.get("neural", "max_epochs", default=50)))
+        for _ in range(epochs):
             model.train()
             for idx in tr[torch.randperm(len(tr))].split(512):
+                xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
                 opt.zero_grad()
-                loss = _pinball(model(X[idx]), Y[idx]) + .1 * \
+                prediction = model(xb)
+                loss = _pinball(prediction, yb) + .1 * \
                     torch.nn.functional.binary_cross_entropy(
-                        model.probability(X[idx]), (Y[idx] > 0).float())
+                        model.probability(xb), (yr > 0).float())
+                rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], dates[idx.numpy()])
+                           for h in range(len(ds["horizons"]))) / len(ds["horizons"])
+                loss = loss + float(trial_spec["rank_weight"]) * rank
                 loss.backward(); opt.step()
-        model.eval()
-        with torch.no_grad(): pred = model(X[te]).numpy()
-        m = _metrics(pred, ds["Y"][te], ds["horizons"])
+                if fold_deadline and time.time() >= fold_deadline:
+                    break
+            if fold_deadline and time.time() >= fold_deadline:
+                break
+        pred, probability = _predict_batches(model, X, te, scale_np, device)
+        m = _metrics(pred, ds["Y"][te], ds["horizons"], dates[te])
+        fold_payload = {}
+        for i, h in enumerate(ds["horizons"]):
+            q50, truth = pred[:, i, 1], ds["Y"][te, i]
+            fold_payload[f"net_alpha_{h}d"] = round(
+                _top_decile_alpha(q50, truth, dates[te]), 5)
         results.append({"fold": fold + 1, "train_end": unique[train_pos],
                         "test_start": unique[test_start_pos], "n": len(te),
                         **{f"ic_{h}d": m[str(h)]["correlation"]
-                           for h in ds["horizons"]}})
+                           for h in ds["horizons"]}, **fold_payload})
+        for row_index, sample_index in enumerate(te):
+            for horizon_index, horizon in enumerate(ds["horizons"]):
+                oos.append((str(dates[sample_index]), str(ds["owners"][sample_index]),
+                            int(horizon), *map(float, pred[row_index, horizon_index]),
+                            float(probability[row_index, horizon_index]),
+                            float(ds["Y"][sample_index, horizon_index])))
     return {"walk_forward_folds": len(results), "folds": results,
             **{f"median_fold_ic_{h}d": round(float(np.median(
                 [f[f'ic_{h}d'] for f in results])), 4) if results else 0.0
-               for h in ds["horizons"]}}
+               for h in ds["horizons"]}}, oos
 
 
 def train_challenger(cfg, store, symbols: list[str] | None = None,
@@ -290,6 +710,17 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     except ImportError:
         return {"error": "torch not installed — install .[neural]"}
     torch.set_num_threads(int(cfg.get("research", "max_cpu_threads", default=4)))
+    market_snapshot = store.latest_bar_date(
+        cfg.get("universe", "benchmark", default="SPY")) or "no-market-snapshot"
+    tournament_key = f"{market_snapshot}_{MODEL_SCHEMA}_{FEATURE_HASH}_{ARCHITECTURE_HASH}"
+    if not symbol and symbols:
+        tournament = store.kv_get("neural_active_tournament")
+        if tournament and tournament.get("key") == tournament_key:
+            symbols = tournament["symbols"]
+        else:
+            tournament = {"key": tournament_key, "symbols": sorted(set(symbols)),
+                          "started_at": _now()}
+            store.kv_set("neural_active_tournament", tournament)
     if symbol:
         observed = store.db.execute("SELECT COUNT(*) n FROM bars WHERE symbol=?",
                                     (symbol,)).fetchone()["n"]
@@ -297,56 +728,94 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         if observed < required:
             return {"status": "waiting", "kind": "holding_tcn", "symbol": symbol,
                     "reason": f"need {required} settled observations; have {observed}"}
-    ds = build_dataset(cfg, store, symbols=[symbol] if symbol else symbols)
+    ds = build_dataset(cfg, store, symbols=[symbol] if symbol else symbols,
+                       progress=progress)
     if "error" in ds:
         return ds
     snapshot = ds["data_as_of"]
-    trial_key = f"neural_trials_{symbol or 'global'}_{snapshot}"
+    fact_state = store.db.execute(
+        "SELECT COUNT(*) n,COALESCE(MAX(rowid),0) newest FROM filing_facts").fetchone()
+    data_fingerprint = hashlib.sha256(json.dumps({
+        "owners": sorted(set(ds["owners"])), "data_as_of": snapshot,
+        "facts": [fact_state["n"], fact_state["newest"]],
+        "features": FEATURE_HASH}, sort_keys=True).encode()).hexdigest()[:16]
+    # The settled market snapshot is the trial boundary.  Filing ingestion or
+    # universe maintenance must not reset the six-trial cap and repeatedly
+    # expose the same sealed test (the previous fingerprint-based key did).
+    trial_key = (f"neural_trials_{symbol or 'global'}_{market_snapshot}_"
+                 f"{MODEL_SCHEMA}_{FEATURE_HASH}_{ARCHITECTURE_HASH}")
     trials = int(store.kv_get(trial_key, 0) or 0)
     cap = int(cfg.get("neural", "max_trials_per_snapshot", default=6))
     if trials >= cap:
         return {"status": "caught_up", "reason": f"{trials}/{cap} trials used",
                 "data_as_of": snapshot}
-    store.kv_set(trial_key, trials + 1)
     torch.manual_seed(trials)
+    trial_spec = dict(TRIAL_SPECS[trials % len(TRIAL_SPECS)])
+    device = _training_device(cfg, torch)
     model = _make_model(len(FEATURES), len(ds["horizons"]))
     # Holding nets are complete trainable clones of the global champion.
     parent_row = parent = None
     if symbol:
-        try:
-            parent_row = store.db.execute(
-                "SELECT checkpoint,id,status FROM model_runs WHERE kind='global_tcn' "
+        candidate_parent = store.db.execute(
+                "SELECT * FROM model_runs WHERE kind='global_tcn' "
                 "AND status IN ('champion','challenger') "
                 "ORDER BY CASE status WHEN 'champion' THEN 0 ELSE 1 END,created_at DESC LIMIT 1"
             ).fetchone()
-            parent = torch.load(Path(parent_row["checkpoint"]), map_location="cpu",
-                                weights_only=False)
-            model.load_state_dict(parent["model"])
-        except Exception:
-            pass
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    X = torch.from_numpy(ds["X"]); Y = torch.from_numpy(ds["Y"])
+        if candidate_parent:
+            parent, parent_model, reason = _load_checked(
+                Path(candidate_parent["checkpoint"]), candidate_parent["checkpoint_sha256"])
+            if parent is not None:
+                parent_row = candidate_parent
+                model.load_state_dict(parent_model.state_dict())
+        if parent_row is None:
+            # Holding networks are fine-tunes, never random standalone models.
+            # Return the reserved trial because no training occurred.
+            return {"status": "waiting", "kind": "holding_tcn", "symbol": symbol,
+                    "reason": "need a compatible global TCN champion or challenger"}
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
+                            weight_decay=trial_spec["weight_decay"])
+    X = torch.from_numpy(ds["X"])
+    Yraw = torch.from_numpy(ds["Y"])
+    target_scale = torch.from_numpy(ds["target_scale"])
+    Y = Yraw / target_scale
     tr = torch.from_numpy(np.flatnonzero(ds["masks"]["train"]))
     va = torch.from_numpy(np.flatnonzero(ds["masks"]["val"]))
     te = np.flatnonzero(ds["masks"]["test"])
     best, best_loss, stale = None, float("inf"), 0
     started = time.time()
     max_epochs = int(cfg.get("neural", "max_epochs", default=50))
+    final_trial = cap >= 5 and trials == cap - 1
+    # Preserve enough of the bounded final trial for the five chronological
+    # folds; the ordinary validation challengers can use the whole budget.
+    training_seconds = max_seconds * .4 if max_seconds and final_trial else max_seconds
     for epoch in range(max_epochs):
         model.train()
         for idx in tr[torch.randperm(len(tr))].split(512):
+            xb, yb = X[idx].to(device), Y[idx].to(device)
+            yr = Yraw[idx].to(device)
             opt.zero_grad()
-            loss = _pinball(model(X[idx]), Y[idx]) + .1 * \
+            prediction = model(xb)
+            loss = _pinball(prediction, yb) + .1 * \
                 torch.nn.functional.binary_cross_entropy(
-                    model.probability(X[idx]), (Y[idx] > 0).float())
+                    model.probability(xb), (yr > 0).float())
+            rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], ds["dates"][idx.numpy()])
+                       for h in range(len(ds["horizons"]))) / len(ds["horizons"])
+            loss = loss + float(trial_spec["rank_weight"]) * rank
             loss.backward(); opt.step()
-            if max_seconds and time.time() - started >= max_seconds:
+            if training_seconds and time.time() - started >= training_seconds:
                 break
         model.eval()
+        total_loss = total_rows = 0
         with torch.no_grad():
-            val_loss = float(_pinball(model(X[va]), Y[va]) + .1 *
-                             torch.nn.functional.binary_cross_entropy(
-                                 model.probability(X[va]), (Y[va] > 0).float()))
+            for idx in va.split(2048):
+                xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
+                objective = _pinball(model(xb), yb) + .1 * \
+                    torch.nn.functional.binary_cross_entropy(
+                        model.probability(xb), (yr > 0).float())
+                total_loss += float(objective) * len(idx)
+                total_rows += len(idx)
+        val_loss = total_loss / max(1, total_rows)
         if val_loss < best_loss - 1e-6:
             best_loss, stale = val_loss, 0
             best = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -355,21 +824,95 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         if progress:
             progress({"epoch": epoch + 1, "max_epochs": max_epochs,
                       "best_loss": round(best_loss, 6), "patience": stale,
-                      "fraction": (epoch + 1) / max_epochs})
+                      "fraction": .2 + .8 * (epoch + 1) / max_epochs})
         if stale >= int(cfg.get("neural", "patience", default=5)) or \
-                (max_seconds and time.time() - started >= max_seconds):
+                (training_seconds and time.time() - started >= training_seconds):
             break
     model.load_state_dict(best or model.state_dict()); model.eval()
-    with torch.no_grad():
-        pred = model(X[te]).numpy(); probability = model.probability(X[te]).numpy()
-    metrics = _metrics(pred, ds["Y"][te], ds["horizons"])
+    tournament_winner_id = None
+    if final_trial and not symbol:
+        # Validation chooses the tournament winner. Only this cloned winner is
+        # allowed to inspect the sealed test and walk-forward report folds.
+        current_val_pred, _ = _predict_batches(
+            model, X, va.numpy(), ds["target_scale"], device)
+        current_val_metrics = _metrics(
+            current_val_pred, ds["Y"][va.numpy()], ds["horizons"], ds["dates"][va.numpy()])
+        winner_score = _selection_score(current_val_metrics)
+        winner_loss = best_loss
+        for row in store.db.execute(
+                "SELECT * FROM model_runs WHERE kind='global_tcn' AND status='challenger' "
+                "AND schema_version=? AND feature_hash=? AND architecture_hash=?",
+                (MODEL_SCHEMA, FEATURE_HASH, ARCHITECTURE_HASH)).fetchall():
+            prior_metrics = json.loads(row["metrics"] or "{}")
+            if prior_metrics.get("tournament_key") != tournament_key or \
+                    prior_metrics.get("evaluation_split") != "validation":
+                continue
+            score = prior_metrics.get("validation_selection_score")
+            if score is None or float(score) <= winner_score:
+                continue
+            _, prior_model, _ = _load_checked(Path(row["checkpoint"]),
+                                               row["checkpoint_sha256"])
+            if prior_model is not None:
+                model = prior_model.to(device)
+                winner_score, tournament_winner_id = float(score), row["id"]
+                winner_loss = float(prior_metrics.get("validation_objective", winner_loss))
+        best_loss = winner_loss
+    eval_idx = te if final_trial else va.numpy()
+    # Fit the transform on validation only; the sealed block and live calls
+    # receive the same frozen calibration without seeing their outcomes.
+    validation_pred, validation_probability = _predict_batches(
+        model, X, va.numpy(), ds["target_scale"], device)
+    calibration = _calibration(validation_pred, validation_probability,
+                               ds["Y"][va.numpy()])
+    pred, probability = _predict_batches(
+        model, X, eval_idx, ds["target_scale"], device)
+    pred, probability = _apply_calibration(pred, probability, calibration)
+    metric_dates = None if symbol else ds["dates"][eval_idx]
+    metrics = _metrics(pred, ds["Y"][eval_idx], ds["horizons"], metric_dates)
+    metrics.update(evaluation_split="sealed_test" if final_trial else "validation",
+                   validation_objective=round(best_loss, 6),
+                   validation_selection_score=round(
+                       winner_score if final_trial and not symbol else _selection_score(metrics), 6),
+                   tournament_key=tournament_key,
+                   data_fingerprint=data_fingerprint,
+                   device=device, trial_spec=trial_spec,
+                   calibration_source="validation")
+    if not symbol:
+        metrics["baselines"] = _baseline_metrics(ds, eval_idx)
+        metrics["beats_baselines"] = all(
+            metrics["pinball"] < baseline.get("pinball", float("inf")) and
+            _selection_score(metrics) > _selection_score(baseline)
+            for baseline in metrics["baselines"].values())
+    if final_trial:
+        metrics["tournament_winner_source"] = tournament_winner_id or "final_trial"
+    feature_std = (ds["X"][ds["masks"]["train"]] * ds["std"] + ds["mean"]).std(
+        axis=(0, 1))
+    active_features = [name for name, value in zip(FEATURES, feature_std) if value > 1e-8]
+    metrics["feature_diagnostics"] = {
+        "active": active_features,
+        "inactive": [name for name in FEATURES if name not in active_features]}
     for i, h in enumerate(ds["horizons"]):
         metrics[str(h)]["probability_brier"] = round(float(np.mean(
-            (probability[:, i] - (ds["Y"][te, i] > 0)) ** 2)), 5)
+            (probability[:, i] - (ds["Y"][eval_idx, i] > 0)) ** 2)), 5)
     # Only the final permitted trial pays for the five-fold tournament. Earlier
     # challengers remain cheap; none can promote without these real folds.
-    if cap >= 5 and trials == cap - 1:
-        metrics.update(_walk_forward_metrics(cfg, ds))
+    oos_predictions = []
+    if final_trial:
+        remaining = None if max_seconds is None else max(5.0, max_seconds - (time.time() - started))
+        walk_metrics, oos_predictions = _walk_forward_metrics(
+            cfg, ds, trial_spec=trial_spec, max_seconds=remaining)
+        metrics.update(walk_metrics)
+        # The validation-selected final model has never seen the sealed block.
+        # Its per-symbol sealed predictions are therefore legitimate OOS graph
+        # inputs.  Without them the graph replay starts after the TCN series
+        # ends and the neural specialist has exactly zero sample coverage.
+        for row_index, sample_index in enumerate(eval_idx):
+            for horizon_index, horizon in enumerate(ds["horizons"]):
+                oos_predictions.append((
+                    str(ds["dates"][sample_index]), str(ds["owners"][sample_index]),
+                    int(horizon), *map(float, pred[row_index, horizon_index]),
+                    float(probability[row_index, horizon_index]),
+                    float(ds["Y"][sample_index, horizon_index])))
     if symbol and parent_row and parent:
         try:
             baseline_model = _make_model(len(parent["features"]), len(parent["horizons"]))
@@ -377,22 +920,52 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
             raw = ds["X"] * ds["std"] + ds["mean"]
             bx = (raw - parent["mean"]) / parent["std"]
             with torch.no_grad(): baseline_pred = baseline_model(
-                torch.from_numpy(bx[te].astype(np.float32))).numpy()
+                torch.from_numpy(bx[eval_idx].astype(np.float32))).numpy() * \
+                np.asarray(parent["target_scale"]).reshape(1, -1, 1)
+            with torch.no_grad(): baseline_probability = baseline_model.probability(
+                torch.from_numpy(bx[eval_idx].astype(np.float32))).numpy()
+            baseline_pred, _ = _apply_calibration(
+                baseline_pred, baseline_probability, parent.get("calibration"))
             metrics["global_baseline"] = _metrics(
-                baseline_pred, ds["Y"][te], ds["horizons"])
+                baseline_pred, ds["Y"][eval_idx], ds["horizons"])
         except Exception:
             metrics["global_baseline"] = {"error": "incompatible parent checkpoint"}
-    payload = {"model": model.state_dict(), "mean": ds["mean"], "std": ds["std"],
+    rid = hashlib.sha256(
+        f"{tournament_key}|{symbol}|{snapshot}|{trials}|{MODEL_SCHEMA}|"
+        f"{FEATURE_HASH}|{data_fingerprint}".encode()
+    ).hexdigest()[:12]
+    payload = {"schema_version": MODEL_SCHEMA, "architecture_hash": ARCHITECTURE_HASH,
+               "feature_hash": FEATURE_HASH,
+               "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+               "mean": ds["mean"], "std": ds["std"],
+               "target_scale": ds["target_scale"],
+               "calibration": calibration, "trial_spec": trial_spec,
                "features": FEATURES, "horizons": ds["horizons"],
+               "active_features": active_features,
                "metrics": metrics, "trained_at": _now(), "data_as_of": snapshot,
+               "data_fingerprint": data_fingerprint,
+               "parent_id": parent_row["id"] if parent_row else tournament_winner_id,
                "symbol": symbol, "window": int(cfg.get("neural", "input_sessions", default=60))}
-    path = _path(cfg, symbol, challenger=True); _save(path, payload)
-    rid = hashlib.sha256(f"{symbol}|{snapshot}|{trials}|{metrics}".encode()).hexdigest()[:12]
+    path = _path(cfg, symbol, challenger=True, run_id=rid); _save(path, payload)
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    store.kv_set(trial_key, trials + 1)
     kind = "holding_tcn" if symbol else "global_tcn"
-    store.db.execute("INSERT OR REPLACE INTO model_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (
-        rid, kind, symbol, _now(), snapshot, "challenger", None, json.dumps(metrics),
-        str(path), hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]))
+    store.db.execute(
+        "INSERT OR REPLACE INTO model_runs(id,kind,symbol,created_at,data_as_of,status,"
+        "parent_id,metrics,checkpoint,feature_hash,schema_version,architecture_hash,"
+        "checkpoint_sha256,incompatibility_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        rid, kind, symbol, _now(), snapshot, "challenger",
+        parent_row["id"] if parent_row else tournament_winner_id, json.dumps(metrics), str(path),
+        FEATURE_HASH, MODEL_SCHEMA, ARCHITECTURE_HASH, sha, None))
     store.db.commit()
+    if oos_predictions:
+        with store.db:
+            store.db.executemany(
+                "INSERT OR REPLACE INTO model_forecasts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [(rid, as_of, owner, horizon, q10, q50, q90, probability,
+                  "historical_oos", realized, FEATURE_HASH)
+                 for as_of, owner, horizon, q10, q50, q90, probability, realized
+                 in oos_predictions])
     status = {"id": rid, "kind": kind, "symbol": symbol, "status": "challenger",
               "data_as_of": snapshot, "metrics": metrics, "trial": trials + 1,
               "at": _now()}
@@ -410,8 +983,10 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
 
 def describe(cfg, store, symbol: str | None = None) -> dict:
     """Operator-facing truth; no checkpoint load and no invented metrics."""
+    refresh_compatibility(store)
     global_run = store.db.execute(
         "SELECT * FROM model_runs WHERE kind='global_tcn' "
+        "AND status IN ('champion','challenger') "
         "ORDER BY CASE status WHEN 'champion' THEN 0 ELSE 1 END,created_at DESC LIMIT 1"
     ).fetchone()
     holdings = []
@@ -437,7 +1012,10 @@ def describe(cfg, store, symbol: str | None = None) -> dict:
                 "neural", "input_sessions", default=60)), "blocks": [
                 {"channels": 32, "kernel": 3, "dilation": d, "activation": "GELU"}
                 for d in (1, 2, 4)], "dropout": .1,
-                "heads": ["5d q10/q50/q90", "21d q10/q50/q90"]},
+                "context_fusion": f"all {len(FEATURES)} current features → Linear(16) + GELU",
+                "target_scaling": "train-only per-horizon volatility",
+                "heads": ["5d q10/q50/q90", "21d q10/q50/q90",
+                          "5d/21d probability positive"]},
             "features": FEATURES, "global": ({**dict(global_run),
                 "metrics": json.loads(global_run["metrics"] or "{}")} if global_run else None),
             "selected_forecast": forecast, "holdings": holdings}
@@ -461,20 +1039,18 @@ def holding_gate_passed(metrics: dict) -> bool:
 
 
 def promote(cfg, store, run_id: str) -> None:
-    import torch
     row = store.db.execute("SELECT * FROM model_runs WHERE id=?", (run_id,)).fetchone()
     if not row:
         raise ValueError("unknown model run")
+    payload, _, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
+    if payload is None:
+        raise ValueError(f"incompatible checkpoint: {reason}")
     symbol = row["symbol"]
-    source, dest = Path(row["checkpoint"]), _path(cfg, symbol)
-    payload = torch.load(source, map_location="cpu", weights_only=False)
-    _save(dest, payload)
     with store.db:
         store.db.execute("UPDATE model_runs SET status='retired' WHERE kind=? AND "
                          "COALESCE(symbol,'')=COALESCE(?,'') AND status='champion'",
                          (row["kind"], symbol))
-        store.db.execute("UPDATE model_runs SET status='champion', checkpoint=? WHERE id=?",
-                         (str(dest), run_id))
+        store.db.execute("UPDATE model_runs SET status='champion' WHERE id=?", (run_id,))
     store.audit("neural_champion_promoted", {"id": run_id, "symbol": symbol})
 
 
@@ -484,7 +1060,15 @@ def _latest_window(cfg, store, ctx, symbol: str, payload: dict) -> np.ndarray | 
     b = _bars(store, symbol, since)
     spy = _bars(store, cfg.get("universe", "benchmark", default="SPY"), since)
     vix = _bars(store, cfg.get("universe", "vix_symbol", default="^VIX"), since)
-    f = _features(b, spy, vix, store, symbol)[FEATURES].dropna()
+    vol_symbols = cfg.get("universe", "volatility_symbols", default={}) or {}
+    context = {name: _bars(store, ticker, since) for name, ticker in vol_symbols.items()
+               if name != "vix"}
+    context.update({"hyg": _bars(store, "HYG", since), "tlt": _bars(store, "TLT", since)})
+    sectors = {s: _bars(store, s, since) for s in cfg.get(
+        "universe", "sector_etfs", default=[
+            "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU",
+            "XLB", "XLRE", "XLC"])}
+    f = _features(b, spy, vix, store, symbol, sectors, context)[FEATURES].dropna()
     if len(f) < window:
         return None
     x = f.iloc[-window:].to_numpy(np.float32)
@@ -492,17 +1076,47 @@ def _latest_window(cfg, store, ctx, symbol: str, payload: dict) -> np.ndarray | 
             payload["std"].reshape(1, -1)).astype(np.float32)
 
 
-def _load(path: Path):
+def _load_checked(path: Path, expected_sha: str | None = None):
     import torch
     if not path.exists():
-        return None, None
+        return None, None, "checkpoint missing"
     try:
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if expected_sha and actual_sha != expected_sha:
+            return None, None, "checkpoint hash mismatch"
         payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("schema_version") != MODEL_SCHEMA:
+            return None, None, f"schema {payload.get('schema_version', 1)} != {MODEL_SCHEMA}"
+        if payload.get("feature_hash") != FEATURE_HASH or payload.get("features") != FEATURES:
+            return None, None, "feature schema mismatch"
+        if payload.get("architecture_hash") != ARCHITECTURE_HASH:
+            return None, None, "architecture mismatch"
+        if "target_scale" not in payload or len(payload["target_scale"]) != len(payload["horizons"]):
+            return None, None, "target scaling metadata missing"
         model = _make_model(len(payload["features"]), len(payload["horizons"]))
         model.load_state_dict(payload["model"]); model.eval()
-        return payload, model
-    except Exception:
-        return None, None
+        return payload, model, None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def _load(path: Path):
+    payload, model, _ = _load_checked(path)
+    return payload, model
+
+
+def refresh_compatibility(store) -> dict:
+    """Persist checkpoint truth; legacy artifacts stay auditable but unusable."""
+    out = {"compatible": 0, "incompatible": 0}
+    for row in store.db.execute("SELECT * FROM model_runs WHERE status!='retired'").fetchall():
+        _, _, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
+        incompatible = reason is not None
+        status = "incompatible" if incompatible else row["status"]
+        store.db.execute("UPDATE model_runs SET status=?,incompatibility_reason=? WHERE id=?",
+                         (status, reason, row["id"]))
+        out["incompatible" if incompatible else "compatible"] += 1
+    store.db.commit()
+    return out
 
 
 def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
@@ -514,9 +1128,9 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
                            "AND status='champion' ORDER BY created_at DESC LIMIT 1").fetchone()
     if not row:
         return {}, {"silent": "no validated global TCN champion"}
-    payload, model = _load(_path(cfg))
+    payload, model, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
     if payload is None:
-        return {}, {"silent": "global champion checkpoint missing"}
+        return {}, {"silent": f"global champion unavailable: {reason}"}
     age = (datetime.now().astimezone() - datetime.fromisoformat(payload["trained_at"])).days
     if age > int(cfg.get("neural", "max_checkpoint_age_days", default=7)):
         return {}, {"silent": f"global champion stale ({age}d)"}
@@ -527,17 +1141,29 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
             continue
         with torch.no_grad():
             tensor = torch.from_numpy(x[None, ...])
-            pred = model(tensor).numpy()[0]
+            pred = model(tensor).numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
             probability = model.probability(tensor).numpy()[0]
+        pred, probability = _apply_calibration(
+            pred[None, ...], probability[None, ...], payload.get("calibration"))
+        pred, probability = pred[0], probability[0]
         # A validated holding champion blends within this node only.
-        hp, hm = _load(_path(cfg, sym))
+        holding_row = store.db.execute(
+            "SELECT * FROM model_runs WHERE kind='holding_tcn' AND symbol=? "
+            "AND status='champion' ORDER BY created_at DESC LIMIT 1", (sym,)).fetchone()
+        hp, hm = (None, None)
+        if holding_row:
+            hp, hm, _ = _load_checked(Path(holding_row["checkpoint"]),
+                                      holding_row["checkpoint_sha256"])
         if hp is not None:
             hx = _latest_window(cfg, store, ctx, sym, hp)
             if hx is not None:
                 with torch.no_grad():
                     ht = torch.from_numpy(hx[None, ...])
-                    local = hm(ht).numpy()[0]
+                    local = hm(ht).numpy()[0] * np.asarray(hp["target_scale"]).reshape(-1, 1)
                     local_probability = hm.probability(ht).numpy()[0]
+                local, local_probability = _apply_calibration(
+                    local[None, ...], local_probability[None, ...], hp.get("calibration"))
+                local, local_probability = local[0], local_probability[0]
                 w = float(cfg.get("neural", "holding_blend", default=0.25))
                 pred = (1 - w) * pred + w * local
                 probability = (1 - w) * probability + w * local_probability
@@ -558,9 +1184,10 @@ def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
     row = store.db.execute("SELECT * FROM model_runs WHERE id=?", (run_id,)).fetchone()
     if not row:
         return {}, {"silent": "unknown model run"}
-    payload, model = _load(Path(row["checkpoint"]))
+    payload, model, reason = _load_checked(
+        Path(row["checkpoint"]), row["checkpoint_sha256"])
     if payload is None:
-        return {}, {"silent": "challenger checkpoint missing"}
+        return {}, {"silent": f"challenger checkpoint unavailable: {reason}"}
     out = {}
     for sym in ctx.universe:
         x = _latest_window(cfg, store, ctx, sym, payload)
@@ -568,8 +1195,11 @@ def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
             continue
         with torch.no_grad():
             tensor = torch.from_numpy(x[None, ...])
-            pred = model(tensor).numpy()[0]
+            pred = model(tensor).numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
             probability = model.probability(tensor).numpy()[0]
+        pred, probability = _apply_calibration(
+            pred[None, ...], probability[None, ...], payload.get("calibration"))
+        pred, probability = pred[0], probability[0]
         out[sym] = {str(h): {"q10": float(pred[i, 0]), "q50": float(pred[i, 1]),
                              "q90": float(pred[i, 2]),
                              "probability_positive": float(probability[i])}
@@ -579,27 +1209,47 @@ def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
 
 def shadow_metrics(store, model_id: str) -> dict:
     rows = store.db.execute("SELECT * FROM model_forecasts WHERE model_id=? "
-                            "AND resolved_at IS NOT NULL", (model_id,)).fetchall()
+                            "AND resolved_at IS NOT NULL "
+                            "AND resolved_at!='historical_oos'", (model_id,)).fetchall()
     out = {"sessions": len({r["as_of"] for r in rows}), "total": len(rows), "horizons": {}}
     for h in (5, 21):
         hs = [r for r in rows if r["horizon"] == h]
         pred = np.asarray([r["q50"] for r in hs]); actual = np.asarray([r["realized_excess"] for r in hs])
         if not hs:
             out["horizons"][str(h)] = {"n": 0}; continue
-        cutoff = np.quantile(pred, .9)
-        top = actual[pred >= cutoff]
+        dates = np.asarray([r["as_of"] for r in hs])
         coverage = np.mean([(r["q10"] <= r["realized_excess"] <= r["q90"]) for r in hs])
-        out["horizons"][str(h)] = {"n": len(hs), "ic": round(_corr(pred, actual), 4),
-                                     "top_decile_alpha": round(float(top.mean()), 5),
+        out["horizons"][str(h)] = {"n": len(hs),
+                                     "ic": round(_rank_ic(pred, actual, dates), 4),
+                                     "top_decile_alpha": round(
+                                         _top_decile_alpha(pred, actual, dates), 5),
                                      "coverage": round(float(coverage), 3)}
     return out
 
 
+def _offline_gate(metrics: dict) -> bool:
+    """Stage-one gate shared by promotion and champion integrity checks."""
+    folds = metrics.get("folds") or []
+    fold_gate = len(folds) >= 5 and all(
+        sum(f.get(f"ic_{h}d", 0) > 0 for f in folds) >= 4 and
+        min(f.get(f"ic_{h}d", -1) for f in folds) > -.01 and
+        metrics.get(f"median_fold_ic_{h}d", 0) >= (.015 if h == 5 else .02) and
+        sum(f.get(f"net_alpha_{h}d", -1) > 0 for f in folds) >= 4
+        for h in (5, 21))
+    return bool(metrics.get("beats_baselines")) and fold_gate and all(
+        float(metrics.get(str(h), {}).get("correlation", 0)) > 0 and
+        float(metrics.get(str(h), {}).get("top_decile_alpha_after_cost", 0)) > 0 and
+        .75 <= float(metrics.get(str(h), {}).get("coverage", 0)) <= .85
+        for h in (5, 21))
+
+
 def maybe_promote(cfg, store) -> dict:
     """Objective-gated global promotion/rollback; never relaxes the governor."""
+    refresh_compatibility(store)
     champion_row = store.db.execute("SELECT * FROM model_runs WHERE kind='global_tcn' "
                                     "AND status='champion' ORDER BY created_at DESC LIMIT 1").fetchone()
     if champion_row:
+        champion_metrics = json.loads(champion_row["metrics"] or "{}")
         sm = shadow_metrics(store, champion_row["id"])
         hs = sm["horizons"]
         stale = (datetime.now().date() - datetime.fromisoformat(champion_row["created_at"]).date()).days > \
@@ -607,28 +1257,36 @@ def maybe_promote(cfg, store) -> dict:
         decay = any(hs.get(str(h), {}).get("n", 0) >= 1000 and
                     (hs[str(h)].get("ic", 0) <= 0 or hs[str(h)].get("top_decile_alpha", 0) <= 0)
                     for h in (5, 21))
-        if stale or decay:
+        integrity_failed = not _offline_gate(champion_metrics)
+        if stale or decay or integrity_failed:
+            retired_id = champion_row["id"]
             with store.db:
                 store.db.execute("UPDATE model_runs SET status='retired' WHERE id=?",
-                                 (champion_row["id"],))
-            store.audit("neural_champion_rolled_back", {"id": champion_row["id"],
-                                                         "stale": stale, "metrics": sm})
-            return {"action": "rollback", "id": champion_row["id"], "metrics": sm}
+                                 (retired_id,))
+            store.audit("neural_champion_rolled_back", {"id": retired_id,
+                                                         "stale": stale,
+                                                         "offline_gate_failed": integrity_failed,
+                                                         "metrics": sm})
+            return {"action": "rollback", "id": retired_id,
+                    "offline_gate_failed": integrity_failed, "metrics": sm}
     row = store.db.execute("SELECT * FROM model_runs WHERE kind='global_tcn' "
                            "AND status='challenger' ORDER BY created_at DESC LIMIT 1").fetchone()
     if not row:
         return {"action": "none"}
     test = json.loads(row["metrics"] or "{}")
     sm = shadow_metrics(store, row["id"]); hs = sm["horizons"]
-    # Five embargoed folds are intentionally mandatory. The initial single-
-    # split challenger therefore remains shadow until research attaches them.
     folds = test.get("folds") or []
     fold_gate = len(folds) >= 5 and all(
         sum(f.get(f"ic_{h}d", 0) > 0 for f in folds) >= 4 and
         min(f.get(f"ic_{h}d", -1) for f in folds) > -.01 and
         test.get(f"median_fold_ic_{h}d", 0) >= (.015 if h == 5 else .02)
         for h in (5, 21))
-    passed = fold_gate and sm["sessions"] >= 30 and all(
+    offline_passed = _offline_gate(test)
+    if offline_passed and not champion_row:
+        promote(cfg, store, row["id"])
+        store.kv_set("tcn_offline_gate", {"passed": True, "id": row["id"], "at": _now()})
+        return {"action": "promote_stage1", "id": row["id"], "metrics": test}
+    passed = offline_passed and sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0 and
         .75 <= hs[str(h)].get("coverage", 0) <= .85 for h in (5, 21))

@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS trades(                  -- closed round-trips (+ bac
   entry_date TEXT, exit_date TEXT, entry_price REAL, exit_price REAL, qty REAL,
   pnl REAL, ret REAL,                               -- ret = net simple return incl. modeled costs
   horizon_days INTEGER, score REAL, score_bucket TEXT, regime TEXT,
-  nodes TEXT, source TEXT, exit_reason TEXT
+  nodes TEXT, source TEXT, exit_reason TEXT,
+  qualified INTEGER DEFAULT 1, evidence_version TEXT DEFAULT 'legacy'
 );
 CREATE TABLE IF NOT EXISTS equity_curve(
   d TEXT, ts TEXT, equity REAL, cash REAL, source TEXT,
@@ -97,7 +98,10 @@ CREATE TABLE IF NOT EXISTS kv(
 CREATE TABLE IF NOT EXISTS ai_ledger(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, model TEXT,
   purpose TEXT, node_id TEXT, in_tokens INTEGER, out_tokens INTEGER,
-  cost_usd REAL, cache_hit INTEGER, ok INTEGER
+  cost_usd REAL, cache_hit INTEGER, ok INTEGER,
+  provider TEXT DEFAULT 'legacy', channel TEXT DEFAULT 'api',
+  tier TEXT DEFAULT 'cheap', latency_ms INTEGER DEFAULT 0,
+  fallback_reason TEXT DEFAULT '', error TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS approvals(               -- human approval queue
   intent_id TEXT PRIMARY KEY, created_at TEXT, expires_at TEXT,
@@ -146,7 +150,9 @@ CREATE TABLE IF NOT EXISTS graph_versions(          -- immutable champion/challe
 );
 CREATE TABLE IF NOT EXISTS model_runs(              -- global + holding TCNs
   id TEXT PRIMARY KEY, kind TEXT, symbol TEXT, created_at TEXT, data_as_of TEXT,
-  status TEXT, parent_id TEXT, metrics TEXT, checkpoint TEXT, feature_hash TEXT
+  status TEXT, parent_id TEXT, metrics TEXT, checkpoint TEXT, feature_hash TEXT,
+  schema_version INTEGER DEFAULT 1, architecture_hash TEXT,
+  checkpoint_sha256 TEXT, incompatibility_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS model_forecasts(         -- shadow/live learning labels
   model_id TEXT, as_of TEXT, symbol TEXT, horizon INTEGER,
@@ -163,6 +169,32 @@ CREATE TABLE IF NOT EXISTS research_reports(         -- structured company deep 
   id TEXT PRIMARY KEY, symbol TEXT, as_of TEXT, created_at TEXT,
   sources TEXT, report TEXT, status TEXT
 );
+CREATE TABLE IF NOT EXISTS company_evidence(          -- production company dossiers
+  id TEXT PRIMARY KEY, symbol TEXT, as_of TEXT, created_at TEXT,
+  source_hash TEXT, sources TEXT, facts TEXT,
+  fundamental_memo TEXT, catalyst_memo TEXT,
+  quality REAL, status TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS strategy_messages(         -- immutable operator input
+  id TEXT PRIMARY KEY, created_at TEXT, text TEXT, status TEXT,
+  mandate_id TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS strategy_mandates(         -- AI interpretation, not raw command
+  id TEXT PRIMARY KEY, message_id TEXT, status TEXT,
+  created_at TEXT, activated_at TEXT, deactivated_at TEXT, expires_at TEXT,
+  payload TEXT, provider TEXT, model TEXT
+);
+CREATE TABLE IF NOT EXISTS intelligence_jobs(         -- market-safe background intelligence
+  id TEXT PRIMARY KEY, kind TEXT, status TEXT, priority INTEGER,
+  requested_at TEXT, started_at TEXT, completed_at TEXT,
+  payload TEXT, progress TEXT, result TEXT, error TEXT, attempts INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS news_intelligence(         -- deduplicated article classifications
+  id TEXT PRIMARY KEY, symbol TEXT, published_at TEXT, ingested_at TEXT,
+  title TEXT, summary TEXT, url TEXT, source TEXT, content_hash TEXT,
+  stance REAL, confidence REAL, catalyst TEXT, novelty REAL, reliability REAL,
+  contradiction TEXT, price_reaction REAL, classified_at TEXT
+);
 CREATE TABLE IF NOT EXISTS equity_intraday(         -- throttled live marks (V4)
   ts TEXT, equity REAL, cash REAL, source TEXT,
   pnl REAL                                          -- realized+unrealized (D36):
@@ -176,11 +208,27 @@ CREATE INDEX IF NOT EXISTS idx_forecasts_unresolved ON model_forecasts(resolved_
 CREATE INDEX IF NOT EXISTS idx_filing_fact_asof ON filing_facts(cik, tag, filed);
 CREATE INDEX IF NOT EXISTS idx_research_jobs_status ON research_jobs(status, priority, requested_at);
 CREATE INDEX IF NOT EXISTS idx_research_reports_symbol ON research_reports(symbol, created_at);
+CREATE INDEX IF NOT EXISTS idx_company_evidence_symbol ON company_evidence(symbol, created_at);
+CREATE INDEX IF NOT EXISTS idx_strategy_mandates_status ON strategy_mandates(status, activated_at);
+CREATE INDEX IF NOT EXISTS idx_intelligence_jobs_status ON intelligence_jobs(status,priority,requested_at);
+CREATE INDEX IF NOT EXISTS idx_news_intelligence_symbol ON news_intelligence(symbol,published_at);
 """
 
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _sanitize(value):
+    """Redact credentials and account identifiers before durable logging."""
+    secret_keys = ("account_number", "authorization", "token", "secret",
+                   "password", "api_key", "access_token", "refresh_token")
+    if isinstance(value, dict):
+        return {k: ("[redacted]" if any(x in k.lower() for x in secret_keys)
+                    else _sanitize(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize(v) for v in value]
+    return value
 
 
 class Store:
@@ -202,6 +250,29 @@ class Store:
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
+        for column, declaration in (
+                ("schema_version", "INTEGER DEFAULT 1"),
+                ("architecture_hash", "TEXT"),
+                ("checkpoint_sha256", "TEXT"),
+                ("incompatibility_reason", "TEXT")):
+            try:
+                self.db.execute(f"ALTER TABLE model_runs ADD COLUMN {column} {declaration}")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass
+        for column, declaration in (
+                ("qualified", "INTEGER DEFAULT 1"),
+                ("evidence_version", "TEXT DEFAULT 'legacy'")):
+            try:
+                self.db.execute(f"ALTER TABLE trades ADD COLUMN {column} {declaration}")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass
+        # Historical backtest rows predate point-in-time evidence provenance.
+        # Keep them visible, but never allow them to calibrate live forecasts.
+        self.db.execute("UPDATE trades SET qualified=0 WHERE source='backtest' "
+                        "AND COALESCE(evidence_version,'legacy')='legacy'")
+        self.db.commit()
         # same migration for orders (D26): the only pre-migration rows that must
         # be 'live' are those that reached a live broker — those carry a
         # broker_order_id (paper fills never do), so backfill from that. Getting
@@ -218,6 +289,18 @@ class Store:
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
+        for column, declaration in (
+                ("provider", "TEXT DEFAULT 'legacy'"),
+                ("channel", "TEXT DEFAULT 'api'"),
+                ("tier", "TEXT DEFAULT 'cheap'"),
+                ("latency_ms", "INTEGER DEFAULT 0"),
+                ("fallback_reason", "TEXT DEFAULT ''"),
+                ("error", "TEXT DEFAULT ''")):
+            try:
+                self.db.execute(f"ALTER TABLE ai_ledger ADD COLUMN {column} {declaration}")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -234,6 +317,7 @@ class Store:
     # ---------- audit ----------
     def audit(self, event_type: str, payload: Any = None, cycle_id: str = "") -> None:
         ts = _now()
+        payload = _sanitize(payload)
         body = json.dumps(payload, default=str)
         self.db.execute(
             "INSERT INTO audit(ts, cycle_id, event_type, payload) VALUES(?,?,?,?)",
@@ -250,6 +334,48 @@ class Store:
             q += " WHERE cycle_id=?"; args.append(cycle_id)
         q += " ORDER BY id DESC LIMIT ?"; args.append(limit)
         return [dict(r) for r in self.db.execute(q, args)]
+
+    def scrub_audit_history(self) -> dict:
+        """One-time backup-first redaction of legacy durable audit payloads."""
+        if self.kv_get("audit_redaction_v1"):
+            return {"status": "already_done"}
+        if str(self.path) == ":memory:":
+            return {"status": "memory"}
+        import shutil
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup = self.path.parent / "backups" / f"{self.path.stem}.pre-redaction-{stamp}.db"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(backup) as target:
+            self.db.backup(target)
+        backup.chmod(0o600)
+        changed = 0
+        with self.db:
+            for row in self.db.execute("SELECT id,payload FROM audit").fetchall():
+                try:
+                    clean = json.dumps(_sanitize(json.loads(row["payload"] or "{}")), default=str)
+                except json.JSONDecodeError:
+                    clean = json.dumps("[redacted malformed audit payload]")
+                if clean != row["payload"]:
+                    self.db.execute("UPDATE audit SET payload=? WHERE id=?", (clean, row["id"]))
+                    changed += 1
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        for path in log_dir.glob("audit-*.jsonl"):
+            legacy_backup = path.with_suffix(path.suffix + f".pre-redaction-{stamp}")
+            shutil.copy2(path, legacy_backup)
+            legacy_backup.chmod(0o600)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with path.open(errors="replace") as src, tmp.open("w") as dst:
+                for line in src:
+                    try:
+                        record = json.loads(line)
+                        record["payload"] = _sanitize(record.get("payload"))
+                        dst.write(json.dumps(record, default=str) + "\n")
+                    except json.JSONDecodeError:
+                        dst.write(json.dumps({"event": "redacted_malformed_line"}) + "\n")
+            tmp.replace(path)
+        self.kv_set("audit_redaction_v1", {"at": _now(), "rows": changed,
+                                           "backup": str(backup)})
+        return {"status": "completed", "rows": changed, "backup": str(backup)}
 
     # ---------- kv ----------
     def kv_get(self, key: str, default=None):
@@ -293,9 +419,14 @@ class Store:
     # ---------- signals / candidates ----------
     def record_signal(self, sig, cycle_id: str) -> None:
         from .models import new_id
+        # `data_as_of` is the market date used by the equation. Using wall
+        # clock here made historical replay signals look as if they all
+        # happened on the day the backtest process ran.
+        signal_ts = (sig.data_as_of.isoformat()
+                     if getattr(sig, "data_as_of", None) else _now())
         self.db.execute(
             "INSERT INTO signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (new_id(), cycle_id, _now(), sig.node_id, sig.symbol, sig.direction,
+            (new_id(), cycle_id, signal_ts, sig.node_id, sig.symbol, sig.direction,
              sig.score, sig.confidence, sig.horizon_days, sig.expected_return,
              sig.expected_volatility, sig.downside_estimate, json.dumps(sig.evidence)))
         self.db.commit()
@@ -377,6 +508,21 @@ class Store:
         return [dict(r) for r in self.db.execute(q, args)]
 
     def save_position(self, pid: str, p: dict) -> None:
+        existing = self.db.execute(
+            "SELECT * FROM positions WHERE status='open' AND mode=? AND symbol=? "
+            "AND COALESCE(option_symbol,'')=COALESCE(?,'') LIMIT 1",
+            (p.get("mode", "paper"), p["symbol"], p.get("option_symbol"))).fetchone()
+        if existing:
+            old_qty, add_qty = float(existing["qty"]), float(p["qty"])
+            total = old_qty + add_qty
+            avg = ((old_qty * float(existing["avg_cost"]) + add_qty * float(p["avg_cost"])) /
+                   total) if total else float(p["avg_cost"])
+            self.db.execute("UPDATE positions SET qty=?,avg_cost=?,stop_price=?,candidate_id=?,"
+                            "nodes=?,horizon_days=? WHERE id=?",
+                            (total, avg, p["stop_price"], p.get("candidate_id", ""),
+                             json.dumps(p.get("nodes", [])), p["horizon_days"], existing["id"]))
+            self.db.commit()
+            return
         self.db.execute(
             "INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, p["symbol"], p["asset_type"], p["qty"], p["avg_cost"], p["opened_at"],
@@ -389,33 +535,49 @@ class Store:
         self.db.execute("UPDATE positions SET status='closed' WHERE id=?", (pid,))
         self.db.commit()
 
+    def reduce_position(self, pid: str, sold_qty: float) -> None:
+        self.db.execute("UPDATE positions SET qty=MAX(0,qty-?) WHERE id=?",
+                        (sold_qty, pid))
+        self.db.execute("UPDATE positions SET status='closed' WHERE id=? AND qty<=0.0000005",
+                        (pid,))
+        self.db.commit()
+
     # ---------- trades (round-trips + backtest analogs) ----------
     def record_trade(self, t: dict) -> None:
         from .models import new_id
+        source = t.get("source", "paper")
+        qualified = int(t.get("qualified", source != "backtest"))
         self.db.execute(
-            "INSERT INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades(id,symbol,asset_type,entry_date,exit_date,entry_price,"
+            "exit_price,qty,pnl,ret,horizon_days,score,score_bucket,regime,nodes,source,"
+            "exit_reason,qualified,evidence_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t.get("id") or new_id(), t["symbol"], t.get("asset_type", "equity"),
              t["entry_date"], t["exit_date"], t["entry_price"], t["exit_price"],
              t["qty"], t["pnl"], t["ret"], t.get("horizon_days", 20),
              t.get("score", 0.0), t.get("score_bucket", ""), t.get("regime", ""),
-             json.dumps(t.get("nodes", [])), t.get("source", "paper"),
-             t.get("exit_reason", "")))
+             json.dumps(t.get("nodes", [])), source, t.get("exit_reason", ""),
+             qualified, t.get("evidence_version", "evidence.v2" if qualified else "legacy")))
         self.db.commit()
 
     def analog_returns(self, score_bucket: str, regime: str,
-                       sources: tuple = ("backtest", "paper", "live")) -> list[float]:
+                       sources: tuple = ("paper", "live", "backtest_validated")) -> list[float]:
         """Horizon returns of historical trades in the same (score bucket, regime)
         cell — the raw material for bootstrap error bars (dev/DECISIONS.md D10)."""
         ph = ",".join("?" * len(sources))
         rows = self.db.execute(
-            f"SELECT ret FROM trades WHERE score_bucket=? AND regime=? AND source IN ({ph})",
+            f"SELECT ret FROM trades WHERE qualified=1 AND score_bucket=? AND regime=? "
+            f"AND source IN ({ph})",
             (score_bucket, regime, *sources)).fetchall()
         return [r["ret"] for r in rows]
 
-    def trades(self, source: str | None = None, limit: int = 10000) -> list[dict]:
+    def trades(self, source: str | None = None, limit: int = 10000,
+               evidence_version: str | None = None) -> list[dict]:
         q, args = "SELECT * FROM trades", []
         if source:
             q += " WHERE source=?"; args.append(source)
+        if evidence_version:
+            q += " AND" if source else " WHERE"
+            q += " evidence_version=?"; args.append(evidence_version)
         q += " ORDER BY exit_date DESC LIMIT ?"; args.append(limit)
         return [dict(r) for r in self.db.execute(q, args)]
 
@@ -600,11 +762,23 @@ class Store:
             q += " AND purpose=?"; args.append(purpose)
         return self.db.execute(q, args).fetchone()["s"]
 
+    def ai_local_calls_today(self, tier: str | None = None) -> int:
+        q = ("SELECT COUNT(*) n FROM ai_ledger WHERE day=date('now','localtime') "
+             "AND channel='cli' AND cache_hit=0")
+        args: list = []
+        if tier:
+            q += " AND tier=?"; args.append(tier)
+        return int(self.db.execute(q, args).fetchone()["n"])
+
     def ai_log(self, model: str, purpose: str, node_id: str, in_tok: int, out_tok: int,
-               cost: float, cache_hit: bool, ok: bool) -> None:
+               cost: float, cache_hit: bool, ok: bool, provider: str = "legacy",
+               channel: str = "api", tier: str = "cheap", latency_ms: int = 0,
+               fallback_reason: str = "", error: str = "") -> None:
         self.db.execute(
             "INSERT INTO ai_ledger(ts,day,model,purpose,node_id,in_tokens,out_tokens,"
-            "cost_usd,cache_hit,ok) VALUES(?,date('now','localtime'),?,?,?,?,?,?,?,?)",
+            "cost_usd,cache_hit,ok,provider,channel,tier,latency_ms,fallback_reason,error) "
+            "VALUES(?,date('now','localtime'),?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), model, purpose, node_id, in_tok, out_tok, cost,
-             int(cache_hit), int(ok)))
+             int(cache_hit), int(ok), provider, channel, tier, latency_ms,
+             fallback_reason[:300], error[:500]))
         self.db.commit()

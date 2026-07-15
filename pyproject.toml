@@ -12,11 +12,13 @@ dependencies = [
     "apscheduler",
     "pyyaml",
     "yfinance",
+    "lxml",
     "mcp",
+    "exchange-calendars>=4.11,<5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "pytest-cov", "playwright"]
 # D40 neural node; everything degrades to silence without it
 neural = ["torch"]
 

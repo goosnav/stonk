@@ -55,7 +55,7 @@
   .progress { width:180px; height:5px; display:inline-block; background:#20242a;
               border:1px solid var(--line); vertical-align:1px; margin:0 6px; }
   .progress > i { display:block; height:100%; background:var(--cyan); }
-  .process-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:9px; }
+  .process-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:6px; margin-top:9px; }
   .process-lane { border:1px solid var(--line); padding:7px 9px; min-height:62px; }
   .process-lane.running { border-color:var(--cyan); }
   .feed-stale { opacity:.72; }
@@ -108,6 +108,9 @@
     background:#0a0a0a; color:var(--text); border:1px solid var(--line);
     padding:2px 6px; width:90px; font:inherit; font-size:11.5px; }
   input[type=text] { width:230px; }
+  textarea { width:100%; min-height:110px; box-sizing:border-box; resize:vertical;
+    background:#0a0a0a; color:var(--text); border:1px solid var(--line);
+    padding:8px; font:inherit; font-size:12px; }
   input:focus-visible, select:focus-visible { outline:2px solid var(--amber); }
   canvas { width:100%; height:120px; }
   .proj .apr { font-size:24px; font-weight:700; }
@@ -133,7 +136,7 @@
   <div id="actionrail" aria-label="Operator actions">
     <button id="tradecycle" class="primary" onclick="scanNow()" title="Run the ordinary governed trade cycle. Available only while the market is open.">Run trade cycle</button>
     <button data-job-kind="discover" onclick="queueResearch('discover',this)" title="Rank the broad research universe using deterministic cached-data signals. Never places orders.">Discover opportunities</button>
-    <button id="deepresearch" data-job-kind="deep_research" onclick="queueResearch('deep_research',this)" title="Use the configured, budget-limited AI to deeply evaluate the top five discoveries.">Deep-research top 5</button>
+    <button id="deepresearch" data-job-kind="deep_research" onclick="queueResearch('deep_research',this)" title="Use the configured, budget-limited AI to evaluate the top five discoveries and refresh current holdings.">Deep-research top 5 + holdings</button>
     <button data-job-kind="train_holdings" onclick="queueResearch('train_holdings',this)" title="Queue one bounded full-network challenger for each current holding. Never mutates a champion.">Train holdings</button>
     <span id="actionstate">no operator jobs</span>
   </div>
@@ -141,6 +144,7 @@
 <div id="alerts"></div>
 <div id="tabs">
   <div data-p="overview" class="on">Overview</div>
+  <div data-p="strategy">Strategy</div>
   <div data-p="engine">Engine</div>
   <div data-p="trading">Trading</div>
   <div data-p="switchboard">Switchboard</div>
@@ -256,8 +260,33 @@
   </section>
   <section>
     <h2>Recent closed trades</h2>
-    <p class="explain">Round-trips with exit reasons — the raw material of the learning loop.</p>
-    <table id="trades"><thead><tr><th>sym</th><th>exit</th><th>ret</th><th>reason</th><th>nodes</th></tr></thead><tbody></tbody></table>
+    <p class="explain">Live, paper, and backtest outcomes are separate evidence sources. Legacy backtests remain visible but never calibrate live forecasts.</p>
+    <label>source <select id="trade_source" onchange="refreshTrades()"><option value="live">LIVE</option><option value="paper">PAPER</option><option value="backtest">BACKTEST</option></select></label>
+    <table id="trades"><thead><tr><th>src</th><th>sym</th><th>exit</th><th>ret</th><th>reason</th><th>nodes</th></tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<!-- ============ STRATEGY ============ -->
+<div class="page" data-page="strategy" style="display:none">
+  <section class="wide">
+    <h2>Operator direction → Strategy AI</h2>
+    <p class="explain">Your message is advisory context, never an order. GPT evaluates it against the portfolio, evidence, regime, volatility, and measured performance. Only a reviewed and activated AI mandate can influence discovery and scores.</p>
+    <textarea id="strategy_input" placeholder="Example: Look for profitable infrastructure and power companies positioned to benefit from data-center expansion, but avoid businesses whose valuations require unrealistic growth."></textarea>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:7px">
+      <button class="primary" id="strategy_analyze" onclick="analyzeStrategy()">Analyze direction</button>
+      <span id="strategy_job" class="dim">idle</span>
+    </div>
+  </section>
+  <section class="wide">
+    <h2>Active strategic mandate</h2>
+    <div id="strategy_active" class="dim">no active mandate</div>
+  </section>
+  <section class="wide">
+    <h2>Proposed strategy — preview before activation</h2>
+    <div id="strategy_proposed" class="dim">submit direction to create a proposal</div>
+  </section>
+  <section class="wide">
+    <h2>Direction history</h2>
+    <div id="strategy_history" class="dim">none</div>
   </section>
 </div>
 <!-- ============ SWITCHBOARD ============ -->
@@ -283,7 +312,7 @@
   </section>
   <section>
     <h2>AI provider &amp; key</h2>
-    <p class="explain">The key is stored in <code>.env</code> (gitignored, never committed) and applied to the running server immediately — the next scan uses it. It is never sent back to this page; only a masked hint is shown. All providers use the OpenAI-compatible chat API.</p>
+    <p class="explain">The key is stored in <code>.env</code> (gitignored, never committed) and applies to the next intelligence job. It is never sent back to this page; only a masked hint is shown. Anthropic uses its native Messages API; custom providers use the OpenAI-compatible chat API.</p>
     <table class="kv"><tbody>
       <tr><td>provider</td><td>
         <select id="ai_provider" onchange="onProviderChange()">
@@ -305,7 +334,7 @@
       <tr><td>AI enabled</td><td><input type="checkbox" id="ai_enabled"></td></tr>
       <tr><td>default model</td><td><input type="text" id="ai_model"></td></tr>
       <tr><td>news / bulk model (cheap, high volume)</td><td><input type="text" id="ai_model_news" placeholder="deepseek/deepseek-chat-v3-0324"></td></tr>
-      <tr><td>strategy model (flagship reasoner; try x-ai/grok-4 for the X angle)</td><td><input type="text" id="ai_model_hypo" placeholder="anthropic/claude-sonnet-4.5"></td></tr>
+      <tr><td>deep research / strategy model</td><td><input type="text" id="ai_model_hypo" placeholder="anthropic/claude-sonnet-4.5"></td></tr>
       <tr><td>daily budget $</td><td><input type="number" step="0.25" id="ai_budget"></td></tr>
       <tr><td>monthly ceiling $ (all AI)</td><td><input type="number" step="1" id="ai_month_budget"></td></tr>
       <tr><td>spend today / this month</td><td id="ai_today">—</td></tr>
@@ -313,6 +342,28 @@
       <tr><td>trading friction (round trip)</td><td id="friction">—</td></tr>
     </tbody></table>
     <button onclick="saveAI()">Save AI settings</button>
+  </section>
+  <section class="wide">
+    <h2>Intelligence routing — one-shot CLI first</h2>
+    <p class="explain">Prompts go to the selected local client through stdin in an empty read-only workspace. Provider/model changes apply to the next job. API is the final fallback and remains budget-limited.</p>
+    <table class="kv"><tbody>
+      <tr><td>intelligence enabled</td><td><input type="checkbox" id="intel_enabled"></td></tr>
+      <tr><td>default provider</td><td><select id="intel_provider"><option value="codex">Codex CLI</option><option value="claude">Claude CLI</option><option value="api">API</option></select></td></tr>
+      <tr><td>default cheap model</td><td><input type="text" id="intel_cheap"></td></tr>
+      <tr><td>default advanced model</td><td><input type="text" id="intel_advanced"></td></tr>
+      <tr><td>local fallback</td><td><select id="intel_fallback"><option value="claude">Claude CLI</option><option value="codex">Codex CLI</option></select></td></tr>
+      <tr><td>fallback cheap / advanced</td><td><input type="text" id="intel_fb_cheap" style="width:150px"> <input type="text" id="intel_fb_advanced" style="width:150px"></td></tr>
+      <tr><td>API fallback</td><td><input type="checkbox" id="intel_api_enabled"> <select id="intel_api_provider"><option>openrouter</option><option>openai</option><option>anthropic</option><option>custom</option></select></td></tr>
+      <tr><td>API cheap / advanced models</td><td><input type="text" id="intel_api_cheap" style="width:220px"> <input type="text" id="intel_api_advanced" style="width:220px"></td></tr>
+      <tr><td>daily local calls cheap / advanced</td><td><input type="number" id="intel_limit_cheap" style="width:70px"> <input type="number" id="intel_limit_advanced" style="width:70px"></td></tr>
+      <tr><td>timeout seconds / cache hours</td><td><input type="number" id="intel_timeout" style="width:70px"> <input type="number" id="intel_cache" style="width:70px"></td></tr>
+      <tr><td>purpose overrides JSON</td><td><textarea id="intel_routes" style="min-height:70px" placeholder='{"strategic_synthesis":{"provider":"codex","model":"gpt-5.6"}}'></textarea></td></tr>
+      <tr><td>route health</td><td id="intel_health">—</td></tr>
+    </tbody></table>
+    <button onclick="saveRouting()">Save routing</button>
+    <button onclick="doctorRouting()">Check clients &amp; auth</button>
+    <button onclick="testProvider()">Test selected provider</button>
+    <button onclick="testRouting()">Test complete route</button>
   </section>
 </div>
 <!-- ============ MODEL ============ -->
@@ -368,6 +419,7 @@ const $ = id => document.getElementById(id);
 const fmt$ = v => v==null ? '—' : (v<0?'-':'')+'$'+Math.abs(Number(v)).toLocaleString(undefined,{maximumFractionDigits:2});
 const pct = (v,d=1) => v==null ? '—' : (v*100).toFixed(d)+'%';
 const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
+const esc = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';
   setTimeout(()=>t.style.display='none',4500);}
 async function api(p,o={}){
@@ -385,6 +437,7 @@ async function api(p,o={}){
   err.network=true; throw err;
 }
 async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
+async function put(p,b){return api(p,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
 async function researchPost(kind){
   try{return await post('/api/research/jobs',{kind});}
   catch(first){await new Promise(r=>setTimeout(r,700));return post('/api/research/jobs',{kind});}
@@ -408,10 +461,13 @@ const NODE_DESC = {
   insider:'insider cluster BUYS (selling is noise, buying is signal)',
   options_vol:'converts the top conviction into a bounded-premium long call (unlocks ~$5k)',
   fundamentals:'AI valuation read of company-published financials, cached 3d/symbol',
+  business_fundamentals:'Citation-checked AI read of SEC filings and point-in-time business fundamentals',
+  company_catalyst:'Citation-checked company filing, earnings and news catalyst analysis',
   hypothesis:'deterministic reader of the active AI market hypothesis',
   gap:'opening gap up 1.5-6% in an uptrend rides continuation (live quotes; silent in backtests)',
   vol_contraction:'VCP-lite: vol squeeze near 60d high in an uptrend → breakout entry',
   neural:'Causal multivariate TCN predicting 5d/21d excess-return quantiles; challengers train off-hours and remain silent until every gate passes',
+  strategy_context:'Operator-informed Strategy AI mandate; bounded context, never a raw user command',
 };
 
 function line(canvas, series){
@@ -488,6 +544,13 @@ async function refreshToday(){
         <b>${i.symbol}</b> <span class="${V[i.valuation]||''}">${i.valuation}</span>
         <span class="dim">[${i.direction} ${i.conviction}]</span> ${i.summary}</div>`).join('')+`</div>`;
   }
+  if(t.company_evidence&&t.company_evidence.length){
+    ai+=`<div style="margin-top:6px"><span class="badge">PRODUCTION EVIDENCE</span> verified company dossiers`+
+      t.company_evidence.map(d=>{const f=d.fundamental_memo||{},c=d.catalyst_memo||{};
+        const stance=x=>`<span class="${x==='attractive'?'pos':x==='avoid'?'neg':''}">${esc(x||'unavailable')}</span>`;
+        const thesis=esc((f.thesis||c.thesis||'no directional memo').slice(0,180));
+        return `<div style="margin:3px 0 0 6px"><b>${esc(d.symbol)}</b> business ${stance(f.stance)} · catalyst ${stance(c.stance)} · quality ${pct(d.quality||0,0)} — ${thesis}</div>`;}).join('')+`</div>`;
+  }
   if(!ai) ai=`<div class="dim" style="margin-top:6px">no AI reads yet — enable AI + a key in Config, sentiment/hypothesis appear here after their next run</div>`;
   $('todaybox').innerHTML=`<b>${t.scans}</b> scans · <b>${t.candidates}</b> candidates → ${ord}`+
     (vetoes?`<div class="dim" style="font-size:11px;margin-top:4px">top vetoes: ${vetoes}</div>`:'')+ai;
@@ -498,6 +561,11 @@ let SIM = true;   // set from /api/health; prefixes every $ value in paper mode
 async function refreshHealth(){
   const h = await api('/api/health');
   SIM = h.mode !== 'live';
+  const tradeSource=$('trade_source');
+  if(tradeSource&&!tradeSource.dataset.initialized){
+    tradeSource.value=SIM?'paper':'live';
+    tradeSource.dataset.initialized='1';
+  }
   const mt = $('modetag');
   mt.textContent = SIM ? 'SIMULATION' : 'LIVE $';
   mt.className = 'tag ' + (SIM ? 'sim' : 'live');
@@ -618,13 +686,15 @@ async function refreshApprovals(){
 }
 async function decide(id,d){await post('/api/approvals/'+id,{decision:d});refreshApprovals();}
 async function refreshTrades(){
-  const rows = await api('/api/trades?limit=15');
+  const source=$('trade_source').value||(SIM?'paper':'live');
+  const rows = await api('/api/trades?source='+encodeURIComponent(source)+'&limit=15');
   $('trades').tBodies[0].innerHTML = rows.map(t=>`<tr>
-    <td><b>${t.symbol}</b></td><td class="dim">${t.exit_date}</td>
+    <td><span class="badge">${esc(t.source)}</span>${t.qualified?'':' <span class="neg">legacy</span>'}</td>
+    <td><b>${esc(t.symbol)}</b></td><td class="dim">${esc(t.exit_date)}</td>
     <td class="${cls(t.ret)}">${pct(t.ret)}</td>
-    <td class="dim">${(t.exit_reason||'').split(' ')[0]}</td>
-    <td class="dim" style="font-size:11px">${JSON.parse(t.nodes||'[]').join(', ')}</td></tr>`).join('')
-    || '<tr><td colspan=5 class="dim">no closed trades yet</td></tr>';
+    <td class="dim">${esc((t.exit_reason||'').split(' ')[0])}</td>
+    <td class="dim" style="font-size:11px">${JSON.parse(t.nodes||'[]').map(esc).join(', ')}</td></tr>`).join('')
+    || '<tr><td colspan=6 class="dim">no closed trades for this source</td></tr>';
 }
 
 /* ---------- switchboard ---------- */
@@ -696,13 +766,14 @@ async function refreshCosts(){
   const c = await api('/api/costs');
   $('deepresearch').disabled=!c.ai_available;
   $('deepresearch').title=c.ai_available
-    ?'Use the configured, budget-limited AI to deeply evaluate the top five discoveries.'
-    :'Enable AI, configure an API key, and retain budget in Config before running Deep Research.';
+    ?'Use the configured, budget-limited AI to evaluate the top five discoveries and refresh holdings.'
+    :'Enable a Codex, Claude, or API intelligence route with remaining limits before Deep Research.';
   $('ai_enabled').checked=c.ai_enabled;$('ai_model').value=c.ai_model||'';
   $('ai_model_news').value=(c.ai_models||{}).headline_classification||'';
-  $('ai_model_hypo').value=(c.ai_models||{}).hypothesis||'';
+  $('ai_model_hypo').value=(c.ai_models||{}).investment_memo||
+    (c.ai_models||{}).hypothesis||'';
   $('ai_budget').value=c.ai_daily_budget_usd??1;
-  $('ai_month_budget').value=c.ai_monthly_budget_usd??30;
+  $('ai_month_budget').value=c.ai_monthly_budget_usd??40;
   const hypCap=(c.ai_purpose_monthly_caps||{}).hypothesis;
   $('ai_today').innerHTML=`${fmt$(c.ai_spend_today)} / <b>${fmt$(c.ai_spend_month)}</b>`+
     `<span class="dim"> (strategy ${fmt$(c.ai_spend_month_hypothesis)}${hypCap?' of $'+hypCap+' cap':''})</span>`;
@@ -714,7 +785,10 @@ async function refreshCosts(){
 async function saveAI(){
   const models={};
   if($('ai_model_news').value.trim()) models.headline_classification=$('ai_model_news').value.trim();
-  if($('ai_model_hypo').value.trim()) models.hypothesis=$('ai_model_hypo').value.trim();
+  if($('ai_model_hypo').value.trim()){
+    models.hypothesis=$('ai_model_hypo').value.trim();
+    models.investment_memo=$('ai_model_hypo').value.trim();
+  }
   await post('/api/ai',{enabled:$('ai_enabled').checked,model:$('ai_model').value,
     daily_budget_usd:parseFloat($('ai_budget').value),
     monthly_budget_usd:parseFloat($('ai_month_budget').value), models});
@@ -741,6 +815,85 @@ async function saveProvider(){
   $('ai_key').value='';
   toast('provider & key saved (next scan uses it)'); refreshProvider();
 }
+
+function mandateHtml(m, active=false){
+  if(!m)return '<span class="dim">no active mandate</span>';
+  const p=m.payload||{}, list=(label,v,klass='')=>v&&v.length?
+    `<div style="margin-top:6px"><b>${label}</b> <span class="${klass}">${v.map(esc).join(' · ')}</span></div>`:'';
+  return `<div class="card"><div><span class="badge ${active?'production':'experimental'}">${active?'ACTIVE':'PROPOSED'}</span> `+
+    `<b>${esc(p.summary||'AI strategy')}</b><span class="dim" style="float:right">confidence ${pct(p.confidence||0,0)} · expires ${esc(m.expires_at||p.expiry||'—')}</span></div>`+
+    `<div style="white-space:pre-wrap;margin-top:8px">${esc(p.thesis||'')}</div>`+
+    list('accepted',p.accepted_user_points,'pos')+list('modified',p.modified_user_points)+
+    list('rejected',p.rejected_user_points,'neg')+list('favored symbols',p.favored_symbols,'pos')+
+    list('avoided symbols',p.avoided_symbols,'neg')+list('contrary evidence',p.contrary_evidence,'dim')+
+    list('invalidation',p.invalidation_conditions,'dim')+
+    (!active?`<div style="margin-top:9px"><button class="primary" onclick="activateStrategy('${m.id}')">Activate this mandate</button></div>`:
+      `<div style="margin-top:9px"><button onclick="deactivateStrategy('${m.id}')">Deactivate</button></div>`)+`</div>`;
+}
+async function refreshStrategy(){
+  const [s,j]=await Promise.all([api('/api/strategy/directives'),api('/api/intelligence/jobs')]);
+  $('strategy_active').innerHTML=mandateHtml(s.active,true);
+  const proposed=(s.mandates||[]).find(x=>x.status==='proposed');
+  $('strategy_proposed').innerHTML=proposed?mandateHtml(proposed,false):'<span class="dim">no proposal awaiting activation</span>';
+  $('strategy_history').innerHTML=(s.messages||[]).length?(s.messages||[]).map(m=>
+    `<div style="border-bottom:1px solid var(--line);padding:5px 0"><span class="badge">${esc(m.status)}</span> ${esc(m.text)} <span class="dim" style="float:right">${esc(m.created_at)}</span>${m.error?`<div class="neg">${esc(m.error)}</div>`:''}</div>`).join(''):'<span class="dim">none</span>';
+  const job=(j.jobs||[]).find(x=>x.kind==='strategic_synthesis'&&['queued','running'].includes(x.status));
+  $('strategy_analyze').disabled=!!job;
+  $('strategy_job').textContent=job?`${job.status} · ${(job.progress||{}).phase||'waiting for Strategy AI'}`:'idle';
+}
+async function analyzeStrategy(){
+  const text=$('strategy_input').value.trim();if(!text){toast('Enter strategic direction first');return;}
+  $('strategy_analyze').disabled=true;$('strategy_job').textContent='queueing Strategy AI…';
+  try{const r=await post('/api/strategy/directives/analyze',{text});
+    toast(`Strategy AI job queued: ${r.job.id}`);refreshStrategy();}
+  catch(e){$('strategy_analyze').disabled=false;$('strategy_job').textContent='failed';throw e;}
+}
+async function activateStrategy(id){await post(`/api/strategy/directives/${id}/activate`,{});toast('AI strategy activated and now influences research/model context');refreshStrategy();refreshDecisions();}
+async function deactivateStrategy(id){await post(`/api/strategy/directives/${id}/deactivate`,{});toast('AI strategy deactivated');refreshStrategy();}
+
+async function refreshRouting(){
+  const r=await api('/api/ai/routing'),c=r.config||{},s=r.status||{};
+  $('intel_enabled').checked=!!c.enabled;$('intel_provider').value=c.default_provider||c.default_local_provider||'codex';
+  $('intel_cheap').value=(c.default_models||{}).cheap||'';$('intel_advanced').value=(c.default_models||{}).advanced||'';
+  $('intel_fallback').value=(c.local_fallback||{}).provider||'claude';
+  $('intel_fb_cheap').value=((c.local_fallback||{}).models||{}).cheap||'';
+  $('intel_fb_advanced').value=((c.local_fallback||{}).models||{}).advanced||'';
+  $('intel_api_enabled').checked=!!(c.api_fallback||{}).enabled;
+  $('intel_api_provider').value=(c.api_fallback||{}).provider||'openrouter';
+  $('intel_api_cheap').value=((c.api_fallback||{}).models||{}).cheap||'';
+  $('intel_api_advanced').value=((c.api_fallback||{}).models||{}).advanced||'';
+  $('intel_limit_cheap').value=(c.daily_local_limits||{}).cheap??24;
+  $('intel_limit_advanced').value=(c.daily_local_limits||{}).advanced??4;
+  $('intel_timeout').value=c.request_timeout_seconds??120;$('intel_cache').value=c.cache_ttl_hours??24;
+  $('intel_routes').value=JSON.stringify(c.purpose_routes||{},null,2);
+  const bs=s.binaries||{},u=s.usage_today||{},last=s.last_call||{};
+  $('intel_health').innerHTML=`Codex ${bs.codex?.installed?'installed':'missing'} · Claude ${bs.claude?.installed?'installed':'missing'} · `+
+    `local calls ${u.cheap||0}/${(s.limits||{}).cheap||0} cheap, ${u.advanced||0}/${(s.limits||{}).advanced||0} advanced`+
+    (last.at?`<br>last ${esc(last.purpose||'')} → ${esc(last.provider||'')} / ${esc(last.model||'')} ${last.ok?'✓':'FAILED'}`:'');
+}
+async function saveRouting(){
+  let routes;try{routes=JSON.parse($('intel_routes').value||'{}');}catch(e){toast('Purpose overrides must be valid JSON');return;}
+  const provider=$('intel_api_provider').value;
+  const bases={openrouter:'https://openrouter.ai/api/v1',openai:'https://api.openai.com/v1',anthropic:'https://api.anthropic.com/v1'};
+  await put('/api/ai/routing',{enabled:$('intel_enabled').checked,default_provider:$('intel_provider').value,
+    default_models:{cheap:$('intel_cheap').value.trim(),advanced:$('intel_advanced').value.trim()},
+    local_fallback:{provider:$('intel_fallback').value,models:{cheap:$('intel_fb_cheap').value.trim(),advanced:$('intel_fb_advanced').value.trim()}},
+    api_fallback:{enabled:$('intel_api_enabled').checked,provider,base_url:bases[provider]||$('ai_base_url').value,
+      models:{cheap:$('intel_api_cheap').value.trim(),advanced:$('intel_api_advanced').value.trim()}},
+    purpose_routes:routes,daily_local_limits:{cheap:parseInt($('intel_limit_cheap').value),advanced:parseInt($('intel_limit_advanced').value)},
+    request_timeout_seconds:parseInt($('intel_timeout').value),cache_ttl_hours:parseFloat($('intel_cache').value)});
+  toast('intelligence routing saved; next queued call uses it');refreshRouting();refreshCosts();
+}
+async function doctorRouting(){const s=await post('/api/ai/doctor',{});toast(`Codex auth ${s.binaries?.codex?.authenticated?'OK':'unavailable'} · Claude auth ${s.binaries?.claude?.authenticated?'OK':'unavailable'}`);refreshRouting();}
+async function testProvider(){
+  const selected=$('intel_provider').value;
+  const provider=selected==='api'?$('intel_api_provider').value:selected;
+  const model=selected==='api'?$('intel_api_cheap').value.trim():$('intel_cheap').value.trim();
+  toast(`testing ${provider}/${model}…`);
+  const r=await post('/api/ai/test',{provider,model});
+  toast(`${provider}/${model} operational in ${r.last_call?.latency_ms??'—'}ms`);refreshRouting();
+}
+async function testRouting(){toast('testing complete route…');const r=await post('/api/ai/test',{});toast(`route operational via ${r.last_call?.provider} / ${r.last_call?.model}`);refreshRouting();}
 
 /* ---------- charts / activity ---------- */
 let PV_RANGE='1M';
@@ -796,11 +949,11 @@ async function refreshDecisions(){
         ${w.side.toUpperCase()} ${w.symbol} ${w.qty}@${w.limit_price} · ${w.status}</span>`).join('')
     : '<span class="dim">no orders working at the broker right now</span>';
   const V={APPROVED:'pos',APPROVED_WITH_SIZE_REDUCTION:'pos',REJECTED:'neg',REQUIRES_HUMAN_APPROVAL:''};
-  const rows=(d.considered||[]).map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
+  const rows=(d.considered||[]).map(c=>{const signed=(c.evidence||[]).filter(x=>x.state==='running'&&!String(x.node).startsWith('family:')).map(x=>`${x.node} ${Number(x.signed_alpha||0)>=0?'+':''}${Number(x.signed_alpha||0).toFixed(2)}`).join(' · ');return `<tr title="${esc(c.thesis||'')}">
     <td><b>${c.symbol}</b></td><td>${c.score}</td><td>${c.notional?fmt$(c.notional):'—'}</td>
     <td class="${V[c.verdict]??''}">${c.verdict||'not sized'}</td>
     <td>${c.result||'—'}</td>
-    <td class="dim" style="max-width:420px">${(c.reasons||[]).join('; ')||(c.thesis||'').slice(0,90)}</td></tr>`).join('')
+    <td class="dim" style="max-width:420px"><span class="badge">evidence ${pct(c.evidence_coverage||0,0)}</span> ${esc((c.reasons||[]).join('; ')||signed||(c.thesis||'').slice(0,90))}</td></tr>`}).join('')
     ||'<tr><td colspan=6 class="dim">no candidates in the last scan</td></tr>';
   $('decisions').tBodies[0].innerHTML=rows;
   $('eng_decisions').tBodies[0].innerHTML=rows;   // Engine tab mirrors the trail
@@ -941,12 +1094,16 @@ async function refreshEngine(){
   }).join(arrow);
   $('eng_detail').textContent=s.detail||'—';
   const processes=e.processes||{}, research=processes.research||{}, rstate=research.state||{};
+  const intelligence=processes.intelligence||{}, istate=intelligence.state||{};
   const activeJob=(research.jobs||[]).find(j=>j.status==='running'), queued=(research.jobs||[]).filter(j=>j.status==='queued');
   const jp=activeJob?.progress||{}, jf=progressFraction(jp);
   const rp=rstate.progress||{}, rf=rp.target?Math.max(0,Math.min(1,Number(rp.ready||0)/rp.target)):0;
   const autonomousRunning=!['idle','caught_up','never_ran','error'].includes(rstate.phase);
+  const activeIntel=(intelligence.jobs||[]).find(j=>j.status==='running'), queuedIntel=(intelligence.jobs||[]).filter(j=>j.status==='queued');
+  const ip=activeIntel?.progress||{}, inf=progressFraction(ip), intelRunning=!!activeIntel;
   $('eng_processes').innerHTML=`<div class="process-lane ${running?'running':''}"><b>TRADING LOOP</b><br><span class="${running?'pos':'dim'}">${(s.phase||'unknown').replace('_',' ')}</span><br><span class="dim">${s.detail||'—'}</span></div>`+
-    `<div class="process-lane ${activeJob||autonomousRunning?'running':''}"><b>RESEARCH WORKER</b><br>${activeJob?`<span class="spinner"></span><span class="pos">${activeJob.kind}</span> · ${jp.phase||'working'} ${jp.symbol||''} ${jp.index||''}/${jp.total||''}<br><span class="progress"><i style="width:${Math.round(jf*100)}%"></i></span>${jp.epoch?` epoch ${jp.epoch}/${jp.max_epochs} · loss ${jp.best_loss}`:''}`:`${autonomousRunning?'<span class="spinner"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${rstate.phase||'idle'} · ${rstate.detail||'waiting'}</span>${rp.target?`<br><span class="progress"><i style="width:${Math.round(rf*100)}%"></i></span>${rp.ready||0}/${rp.target}`:''}`}<br><span class="dim">${queued.length} queued · single worker prevents CPU/DB collisions</span></div>`;
+    `<div class="process-lane ${activeJob||autonomousRunning?'running':''}"><b>RESEARCH WORKER</b><br>${activeJob?`<span class="spinner"></span><span class="pos">${activeJob.kind}</span> · ${jp.phase||'working'} ${jp.symbol||''} ${jp.index||''}/${jp.total||''}<br><span class="progress"><i style="width:${Math.round(jf*100)}%"></i></span>${jp.epoch?` epoch ${jp.epoch}/${jp.max_epochs} · loss ${jp.best_loss}`:''}`:`${autonomousRunning?'<span class="spinner"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${rstate.phase||'idle'} · ${rstate.detail||'waiting'}</span>${rp.target?`<br><span class="progress"><i style="width:${Math.round(rf*100)}%"></i></span>${rp.ready||0}/${rp.target}`:''}`}<br><span class="dim">${queued.length} queued · one CPU/DB unit at a time</span></div>`+
+    `<div class="process-lane ${intelRunning?'running':''}"><b>INTELLIGENCE WORKER</b><br>${intelRunning?`<span class="spinner"></span><span class="pos">${activeIntel.kind}</span> · ${ip.phase||'working'} ${ip.completed??''}/${ip.total??''}<br><span class="progress"><i style="width:${Math.round(inf*100)}%"></i></span>`:`<span class="dim">${istate.phase||'idle'} · ${istate.detail||'waiting'}</span>`}<br><span class="dim">${queuedIntel.length} queued · one sandboxed provider call at a time</span></div>`;
   const m=e.market||{}, runs=Object.entries(e.next_runs||{});
   $('eng_cadence').innerHTML=[
     ['loop interval', e.interval_minutes?`every ${e.interval_minutes} min during market hours`
@@ -990,7 +1147,7 @@ async function refreshModel(){
   lastGraph=g;
   $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
     (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
-  $('graph_version').textContent=`${g.topology_provenance==='initial_prior'?'INITIAL TOPOLOGY':g.version} · ${g.status} · effective ${Math.round((g.effective_live_blend||0)*100)}% / cap ${Math.round((g.configured_live_blend||0)*100)}%`;
+  $('graph_version').textContent=`${g.entry_block_reason||(`${g.topology_provenance==='initial_prior'?'INITIAL TOPOLOGY':g.version} · ${g.status}`)} · stage ${g.ramp_stage||0} · live ${Math.round((g.effective_live_blend||0)*100)}%`;
   const nodes=m.nodes;
   const topo=g.topology, snap=g.snapshot?.activations||{}, layers=[1,2,3,4], W=1080, H=620, BW=180, BH=42;
   const pos={};
@@ -999,16 +1156,23 @@ async function refreshModel(){
   const edge=e=>{const a=pos[e.source],b=pos[e.target],w=Number(e.weight||0),c=g.topology_provenance==='initial_prior'?'#606873':w>=0?'var(--green)':'var(--red)';
     if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .25 : .8}" ${e.pruned?'stroke-dasharray="4,4"':''}><title>${e.source} → ${e.target}: ${w.toFixed(4)}${e.pruned?' pruned':''}</title></path>`};
   const box=n=>{const p=pos[n.id],a=snap[n.id]||{},v=Math.min(1,Math.abs(Number(a.value||0))),stroke=n.role==='output'?'var(--cyan)':n.role==='gate'?'var(--amber)':'#7d8799';
-    return `<g onclick="showGraphNode('${n.id}')" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${n.id}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${n.activation} · ${a.value==null?'—':Number(a.value).toFixed(3)}</text></g>`};
+    const state=g.node_state?.[n.id]||'unavailable';
+    return `<g onclick="showGraphNode('${n.id}')" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${n.id}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${state} · ${a.value==null?'neutral':Number(a.value).toFixed(3)}</text></g>`};
   const layerNames=['STOCK-LOCAL','MARKET CONTEXT','INTERACTIONS','FORECASTS'];
   $('modelsvg').innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:900px">${layers.map((l,i)=>`<text x="${30+i*260}" y="20" fill="#7d8799" font-size="10" font-family="monospace">${layerNames[i]} · L${l}</text>`).join('')}${topo.edges.map(edge).join('')}${topo.nodes.map(box).join('')}<rect x="1000" y="270" width="75" height="55" fill="var(--panel)" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/><text x="1008" y="292" fill="var(--text)" font-size="9">GOVERNOR</text><text x="1008" y="309" fill="#7d8799" font-size="8">outside graph</text></svg>`;
   if(!g.snapshot) $('graph_detail').innerHTML=`<span class="dim">No activation snapshot for ${sym}. A completed scan that evaluates this symbol will populate raw values and edge contributions.</span>`;
   const nu=research.neural, rr=research.weekly, rs=research.state||{}, us=research.universe?.tiers||{};
   const temporal=g.temporal||{}, arch=temporal.architecture||{}, held=temporal.holdings||[];
+  const fc=research.fundamental_coverage||{};
+  const ce=research.company_evidence||{}, ceb=ce.budget||{}, cec=ce.counts||{};
+  const nm=(nu&&nu.metrics)||{}, baselines=nm.baselines||{};
   $('learnbox').innerHTML=
     `<div><span class="badge">RESEARCH</span> ${rs.phase||'never_ran'} · ${rs.detail||'—'} · research ${(us.research||0).toLocaleString()} / active ${(us.active||0).toLocaleString()}</div>`+
+    `<div style="margin-top:4px"><span class="badge">SEC FEATURES</span> point-in-time coverage ${fc.covered||0}/${fc.total||0}</div>`+
+    `<div style="margin-top:4px"><span class="badge">COMPANY DOSSIERS</span> ready ${cec.ready||0} · unsupported ${cec.unsupported||0} · AI month ${fmt$(ceb.spent_month_usd||0)} / ${fmt$(ceb.monthly_budget_usd||0)} · remaining ${fmt$(ceb.remaining_month_usd||0)}</div>`+
     `<div style="margin-top:4px"><span class="badge">GLOBAL TCN</span> ${nu ? `${nu.status||'—'} · ${nu.data_as_of||'—'} · ${JSON.stringify(nu.metrics||{}).slice(0,180)}`:'no challenger yet'}</div>`+
-    `<div style="margin-top:4px"><span class="badge">TCN SHAPE</span> ${arch.window||60} sessions → ${(arch.blocks||[]).map(b=>`Conv1d 32 k3 d${b.dilation}`).join(' → ')} → 5d/21d quantiles</div>`+
+    `<div style="margin-top:4px"><span class="badge">BASELINE GATE</span> ${Object.keys(baselines).length?`${nm.beats_baselines?'PASS':'NOT PASSED'} · ${esc(JSON.stringify(baselines).slice(0,220))}`:'awaiting compatible 28-feature challenger'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">TCN SHAPE</span> ${arch.window||60} sessions → ${(arch.blocks||[]).map(b=>`Conv1d 32 k3 d${b.dilation}`).join(' → ')} + all-feature context fusion → 5d/21d quantiles + P(+)</div>`+
     `<div style="margin-top:4px"><span class="badge">HOLDING NETS</span> ${held.length?held.map(h=>`${h.symbol}: ${h.run?h.run.status:'none'} · ${h.bars}/1250 bars · blend ${Math.round((h.effective_blend||0)*100)}%`).join('<br>'):'no live holdings'}</div>`+
     `<div style="margin-top:4px"><span class="badge">WALK-FORWARD</span> ${rr
       ? `${(rr.window||[]).join(' → ')} · ${rr.n_trades} trades · win ${rr.win_rate==null?'—':(rr.win_rate*100).toFixed(0)+'%'} · OOS ${JSON.stringify(rr.out_of_sample_30pct||{}).slice(0,120)} · ran ${(rr.ran_at||'').slice(5,16).replace('T',' ')}`
@@ -1027,6 +1191,7 @@ function refreshAll(){
   guard(refreshCandidates,'candidates'); guard(refreshApprovals,'approvals');
   guard(refreshTrades,'trades'); guard(refreshNodes,'nodes');
   guard(refreshRisk,'risk'); guard(refreshCosts,'ai'); guard(refreshProvider,'ai');
+  guard(refreshRouting,'intel_health'); guard(refreshStrategy,'strategy_active');
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
@@ -1038,6 +1203,7 @@ refreshAll();
 setInterval(()=>{guard(refreshEngine,'eng_strip');},3000);
 setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
 setInterval(()=>{guard(refreshJobs,'actionstate');},5000);
+setInterval(()=>{guard(refreshStrategy,'strategy_active');guard(refreshRouting,'intel_health');},5000);
 setInterval(()=>{guard(refreshMarket,'strip');},30000);
 setInterval(()=>{guard(refreshCandidates,'candidates');guard(refreshTrades,'trades');
   guard(refreshCurve,'curve');guard(refreshMC,'mcnote');guard(refreshCosts,'ai');

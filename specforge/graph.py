@@ -13,7 +13,7 @@ import math
 import random
 from datetime import datetime
 
-from .models import SignalEvent, new_id
+from .models import SignalEvent, new_id, signed_alpha
 
 FORBIDDEN = {"risk_governor", "execution", "broker", "portfolio"}
 MAX_LAYER = 4
@@ -24,14 +24,17 @@ def default_topology() -> dict:
     nodes = [
         # layer 1: stock-local specialists
         *(dict(id=n, layer=1, role="alpha", activation="tanh", base_scale=1.0,
-               bias=0.0) for n in ("momentum", "reversal", "earnings_drift",
-                                    "vol_contraction", "fundamentals", "neural")),
+               bias=0.0) for n in ("momentum", "vol_contraction", "neural")),
+        *(dict(id=n, layer=1, role="alpha", activation="tanh", base_scale=1.0,
+               bias=0.0) for n in ("reversal", "earnings_drift",
+                                   "business_fundamentals")),
         dict(id="quality_value", layer=1, role="gate", activation="sigmoid",
              base_scale=1.0, bias=0.0),
         # layer 2: cross-sectional/context specialists
         *(dict(id=n, layer=2, role="alpha", activation="tanh", base_scale=1.0,
-               bias=0.0) for n in ("sector_rotation", "news_sentiment",
-                                    "congress_trades", "insider", "gap")),
+               bias=0.0) for n in ("sector_rotation", "gap", "company_catalyst",
+                                   "news_sentiment", "congress_trades", "insider",
+                                   "strategy_context")),
         dict(id="macro_regime", layer=2, role="gate", activation="sigmoid",
              base_scale=1.0, bias=0.0),
         # learned interaction and output units
@@ -50,17 +53,19 @@ def default_topology() -> dict:
                       "pruned": False} for s in sources)
     connect(["momentum", "reversal", "vol_contraction", "neural"],
             "trend_confirmation", 0.25)
-    connect(["earnings_drift", "news_sentiment", "gap"],
+    connect(["earnings_drift", "company_catalyst", "news_sentiment", "gap",
+             "congress_trades", "insider"],
             "catalyst_confirmation", 0.30)
-    connect(["fundamentals", "quality_value", "insider", "congress_trades"],
+    connect(["business_fundamentals", "quality_value"],
             "fundamental_confirmation", 0.22)
-    connect(["sector_rotation", "macro_regime"],
+    connect(["sector_rotation", "macro_regime", "strategy_context"],
             "risk_adjusted_conviction", 0.20)
     connect(["trend_confirmation", "catalyst_confirmation",
              "risk_adjusted_conviction"], "output_5d", 0.33)
     connect(["trend_confirmation", "fundamental_confirmation",
              "risk_adjusted_conviction"], "output_21d", 0.33)
-    out = {"schema": "stonk.graph.v1", "nodes": list(nodes), "edges": edges}
+    out = {"schema": "stonk.graph.v4", "nodes": list(nodes), "edges": edges,
+           "excluded_experimental": []}
     validate(out)
     return out
 
@@ -110,8 +115,7 @@ def event_bases(events: list[SignalEvent], symbol: str, regime: str) -> dict[str
     for e in events:
         if e.symbol != symbol:
             continue
-        sign = 1.0 if e.direction in ("long", "long_call") else -1.0
-        bases.setdefault(e.node_id, []).append(sign * e.score * e.confidence)
+        bases.setdefault(e.node_id, []).append(signed_alpha(e))
     out = {k: sum(v) / len(v) for k, v in bases.items()}
     out["macro_regime"] = {"risk_on": 1.0, "neutral": 0.3,
                            "risk_off": -0.5, "stress": -1.0}.get(regime, 0.0)
@@ -243,7 +247,15 @@ def fit_weights(topology: dict, bases: list[dict[str, float]], targets,
         [float(n.get("bias", 0.0)) for n in nodes], dtype=torch.float32))
     params = [edge_w, scales, biases]
     opt = torch.optim.AdamW(params, lr=0.01, weight_decay=1e-4)
-    split1, split2 = int(len(X) * .70), int(len(X) * .85)
+    sample_dates = [b.get("__date") for b in bases]
+    unique_dates = sorted(set(sample_dates)) if all(sample_dates) else []
+    if len(unique_dates) >= 20:
+        val_date = unique_dates[int(len(unique_dates) * .70)]
+        test_date = unique_dates[int(len(unique_dates) * .85)]
+        split1 = next(i for i, d in enumerate(sample_dates) if d >= val_date)
+        split2 = next(i for i, d in enumerate(sample_dates) if d >= test_date)
+    else:
+        split1, split2 = int(len(X) * .70), int(len(X) * .85)
 
     def forward(inp):
         acts = {}
@@ -286,14 +298,25 @@ def fit_weights(topology: dict, bases: list[dict[str, float]], targets,
         group = [e for e in out["edges"] if e["target"] == target]
         denom = sum(abs(e["weight"]) for e in group) or 1.0
         for e in group: e["pruned"] = abs(e["weight"]) / denom < prune_pct
-    with torch.no_grad(): test = forward(X[split2:]).numpy()
+    with torch.no_grad():
+        validation_pred = forward(X[split1:split2]).numpy()
+        test = forward(X[split2:]).numpy()
     truth = Y[split2:].numpy()
+    validation_truth = Y[split1:split2].numpy()
     corrs = [_safe_corr(test[:, i], truth[:, i]) for i in range(2)]
+    coverage = {}
+    for i, h in enumerate((5, 21)):
+        residual = validation_truth[:, i] - validation_pred[:, i]
+        lo, hi = np.quantile(residual, [.10, .90]) if len(residual) else (0, 0)
+        coverage[f"coverage_{h}d"] = round(float(np.mean(
+            (truth[:, i] >= test[:, i] + lo) &
+            (truth[:, i] <= test[:, i] + hi))), 3) if len(residual) else 0.0
     metrics = {"validation_huber": round(best_loss, 6),
                "test_ic_5d": round(corrs[0], 4), "test_ic_21d": round(corrs[1], 4),
                "n_train": split1, "n_validation": split2 - split1,
                "n_test": len(X) - split2,
-               "pruned_edges": sum(bool(e.get("pruned")) for e in out["edges"])}
+               "pruned_edges": sum(bool(e.get("pruned")) for e in out["edges"]),
+               **coverage}
     validate(out)
     return out, metrics
 
@@ -303,31 +326,69 @@ def _safe_corr(a, b) -> float:
     return float(np.corrcoef(a, b)[0, 1]) if len(a) > 5 and np.std(a) and np.std(b) else 0.0
 
 
+def _daily_rank_ic(pred, truth, dates) -> float:
+    """Mean daily cross-sectional Spearman IC; never pool dates together."""
+    import numpy as np
+    values = []
+    dates = np.asarray(dates)
+    for day in np.unique(dates):
+        mask = dates == day
+        if mask.sum() < 8:
+            continue
+        pr = np.argsort(np.argsort(np.asarray(pred)[mask]))
+        tr = np.argsort(np.argsort(np.asarray(truth)[mask]))
+        values.append(_safe_corr(pr, tr))
+    return float(np.mean(values)) if values else 0.0
+
+
 def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
                      folds: int = 5, prune_pct: float = .01) -> tuple[dict, dict]:
-    """Expanding-window topology fit; every fold scores only later rows."""
+    """Expanding-window topology fit with a real 21-session embargo."""
     import numpy as np
-    if len(bases) < 180:
+    dates = np.asarray([b.get("__date") for b in bases])
+    unique_dates = sorted(set(dates)) if len(dates) and all(dates) else []
+    if len(bases) < 180 or len(unique_dates) < 60:
         learned, metrics = fit_weights(topology, bases, targets, prune_pct=prune_pct)
         metrics["walk_forward_folds"] = 0
-        metrics["walk_forward_reason"] = "need at least 180 chronological samples"
+        metrics["walk_forward_reason"] = (
+            "need at least 180 samples across 60 dated sessions")
         return learned, metrics
-    initial = max(100, int(len(bases) * .45))
-    width = max(10, (len(bases) - initial) // folds)
+    embargo = 21
+    initial = max(embargo + 20, int(len(unique_dates) * .45))
+    width = max(1, (len(unique_dates) - initial) // folds)
     fold_metrics = []
     for index in range(folds):
-        train_end = initial + index * width
-        test_end = len(bases) if index == folds - 1 else min(len(bases), train_end + width)
-        learned, _ = fit_weights(topology, bases[:train_end], targets[:train_end],
+        test_start_pos = initial + index * width
+        test_end_pos = len(unique_dates) if index == folds - 1 else min(
+            len(unique_dates), test_start_pos + width)
+        train_last = unique_dates[test_start_pos - embargo - 1]
+        test_first, test_last = (unique_dates[test_start_pos],
+                                 unique_dates[test_end_pos - 1])
+        train_idx = np.flatnonzero(dates <= train_last)
+        test_idx = np.flatnonzero((dates >= test_first) & (dates <= test_last))
+        train_bases = [bases[i] for i in train_idx]
+        train_targets = [targets[i] for i in train_idx]
+        learned, _ = fit_weights(topology, train_bases, train_targets,
                                  max_epochs=30, prune_pct=prune_pct)
         pred = np.asarray([[evaluate(learned, b)["outputs"][5],
                             evaluate(learned, b)["outputs"][21]]
-                           for b in bases[train_end:test_end]])
-        truth = np.asarray(targets[train_end:test_end])
-        fold_metrics.append({"fold": index + 1, "train": train_end,
-                             "test": test_end - train_end,
-                             "ic_5d": round(_safe_corr(pred[:, 0], truth[:, 0]), 4),
-                             "ic_21d": round(_safe_corr(pred[:, 1], truth[:, 1]), 4)})
+                           for b in (bases[i] for i in test_idx)])
+        truth = np.asarray([targets[i] for i in test_idx])
+        fold_dates = dates[test_idx]
+        extra = {}
+        for i, h in enumerate((5, 21)):
+            cutoff = np.quantile(pred[:, i], .9)
+            extra[f"net_alpha_{h}d"] = round(
+                float(truth[pred[:, i] >= cutoff, i].mean() - .0016), 5)
+        fold_metrics.append({"fold": index + 1, "train": len(train_idx),
+                             "train_end": train_last, "test_start": test_first,
+                             "embargo": embargo, "embargo_unit": "sessions",
+                             "test": len(test_idx),
+                             "ic_5d": round(_daily_rank_ic(
+                                 pred[:, 0], truth[:, 0], fold_dates), 4),
+                             "ic_21d": round(_daily_rank_ic(
+                                 pred[:, 1], truth[:, 1], fold_dates), 4),
+                             **extra})
     learned, metrics = fit_weights(topology, bases, targets, prune_pct=prune_pct)
     metrics.update(walk_forward_folds=folds, folds=fold_metrics,
                    median_fold_ic_5d=round(float(np.median(
@@ -338,29 +399,47 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
 
 
 def blend_candidates(candidates, events, regime: str, cfg, store,
-                     cycle_id: str | None = None) -> None:
+                     cycle_id: str | None = None,
+                     node_states: dict[str, str] | None = None) -> None:
     """Apply the validated graph as a capped score blend, in place."""
     champ = champion(store)
-    blend = float(cfg.get("analog_graph", "live_blend", default=0.0) or 0.0)
+    blend = activation_state(cfg, store)["effective_blend"]
     if champ["status"] != "champion":
         blend = 0.0
     snapshots = {}
+    node_states = node_states or {}
     by_symbol = sorted({e.symbol for e in events} | {c.symbol for c in candidates} |
                        set(cfg.get("universe", "symbols", default=[])))
     for symbol in by_symbol:
+        bases = event_bases(events, symbol, regime)
+        from .strategy import contribution as strategy_contribution
+        strategy = strategy_contribution(cfg, store, symbol)
+        bases["strategy_context"] = float(strategy.get("value", 0.0))
         snapshots[symbol] = evaluate(
-            champ["topology"], event_bases(events, symbol, regime))
+            champ["topology"], bases)
+        snapshots[symbol]["node_states"] = {
+            n["id"]: (("running" if strategy.get("state") == "running" else "unavailable")
+                      if n["id"] == "strategy_context" else
+                      node_states.get(n["id"], "unavailable")
+                      if n["role"] in ("alpha", "gate") else "running")
+            for n in champ["topology"]["nodes"]}
+        snapshots[symbol]["activation_complete"] = not any(
+            state in ("unavailable", "blocked")
+            for state in snapshots[symbol]["node_states"].values())
     for c in candidates:
         result = snapshots[c.symbol]
         graph_score = math.tanh(float(result["outputs"][21]))
         if blend:
-            c.final_score = round((1 - blend) * c.final_score + blend * graph_score, 4)
+            prior = c.final_score
+            c.final_score = round((1 - blend) * prior + blend * graph_score, 4)
+            c.learned_contribution = round(c.final_score - prior, 6)
             c.thesis = (c.thesis + f"; analog_graph:{graph_score:+.3f}")[:400]
             c.contributing_nodes = sorted(set(c.contributing_nodes + ["analog_graph"]))
         snapshots[c.symbol] = {"graph_score": graph_score, **result}
     as_of = max((e.data_as_of.strftime("%Y-%m-%d") for e in events), default=None)
     store.kv_set("graph_last_activations", {
-        "as_of": as_of, "cycle_id": cycle_id, "symbols": snapshots})
+        "as_of": as_of, "cycle_id": cycle_id, "graph_version": champ["id"],
+        "topology_schema": champ["topology"].get("schema"), "symbols": snapshots})
     # Evaluate the latest challenger in shadow across every signaled symbol,
     # not merely names selected for a trade. This supplies unbiased forward
     # labels for topology gates while leaving candidate scores untouched.
@@ -372,7 +451,10 @@ def blend_candidates(candidates, events, regime: str, cfg, store,
         by_symbol = sorted({e.symbol for e in events})
         with store.db:
             for symbol in by_symbol:
-                result = evaluate(topology, event_bases(events, symbol, regime))
+                shadow_bases = event_bases(events, symbol, regime)
+                shadow_bases["strategy_context"] = float(
+                    strategy_contribution(cfg, store, symbol).get("value", 0.0))
+                result = evaluate(topology, shadow_bases)
                 symbol_events = [e for e in events if e.symbol == symbol]
                 spread = max(.01, min(.25, sum(e.expected_volatility for e in symbol_events)
                                       / max(1, len(symbol_events))))
@@ -402,11 +484,84 @@ def maybe_promote(cfg, store) -> dict:
         min(f.get("ic_21d", -1) for f in folds) > -.01 and \
         metrics.get("median_fold_ic_5d", 0) >= .015 and \
         metrics.get("median_fold_ic_21d", 0) >= .02
-    passed = fold_gate and sm["sessions"] >= 30 and all(
+    offline_passed = fold_gate and all(
+        .75 <= metrics.get(f"coverage_{h}d", 0) <= .85 and
+        sum(f.get(f"net_alpha_{h}d", -1) > 0 for f in folds) >= 4
+        for h in (5, 21))
+    coverage = metrics.get("sample_coverage") or {}
+    required = [n["id"] for n in default_topology()["nodes"]
+                if n["role"] in ("alpha", "gate") and n["id"] != "strategy_context"]
+    coverage_passed = all(coverage.get(node, 0) >= (.9 if node == "macro_regime" else .01)
+                          for node in required)
+    offline_passed = offline_passed and coverage_passed
+    passed = offline_passed and sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0
         for h in (5, 21))
+    current = store.db.execute("SELECT 1 FROM graph_versions WHERE status='champion'").fetchone()
+    if offline_passed and not current:
+        promote(store, row["id"])
+        store.kv_set("graph_offline_gate", {"passed": True, "id": row["id"],
+                                             "at": datetime.now().astimezone().isoformat()})
+        return {"action": "promote_stage1", "id": row["id"], "metrics": metrics}
     if passed:
         promote(store, row["id"])
         return {"action": "promote", "id": row["id"], "metrics": sm}
     return {"action": "shadow", "id": row["id"], "metrics": sm}
+
+
+def activation_state(cfg, store, refresh_checkpoints: bool = True) -> dict:
+    """Single source of truth for the 0→10→25→50 live ramp."""
+    from .neural import refresh_compatibility, shadow_metrics
+    if refresh_checkpoints:
+        refresh_compatibility(store)
+    graph_row = store.db.execute(
+        "SELECT * FROM graph_versions WHERE status='champion' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    tcn = store.db.execute(
+        "SELECT * FROM model_runs WHERE kind='global_tcn' AND status='champion' "
+        "ORDER BY created_at DESC LIMIT 1").fetchone()
+    if not graph_row or not tcn:
+        missing = "GRAPH" if not graph_row else "GLOBAL TCN"
+        return {"stage": 0, "effective_blend": 0.0, "ready": False,
+                "block_reason": f"BLOCKED: {missing}",
+                "graph_id": graph_row["id"] if graph_row else None,
+                "global_tcn_id": tcn["id"] if tcn else None}
+    try:
+        validate(json.loads(graph_row["topology"]))
+    except Exception as exc:
+        return {"stage": 0, "effective_blend": 0.0, "ready": False,
+                "block_reason": f"BLOCKED: GRAPH integrity ({type(exc).__name__})",
+                "graph_id": graph_row["id"], "global_tcn_id": tcn["id"]}
+    age = (datetime.now().date() - datetime.fromisoformat(tcn["created_at"]).date()).days
+    if age > int(cfg.get("neural", "max_checkpoint_age_days", default=7)):
+        return {"stage": 0, "effective_blend": 0.0, "ready": False,
+                "block_reason": f"BLOCKED: GLOBAL TCN stale ({age}d)",
+                "graph_id": graph_row["id"], "global_tcn_id": tcn["id"]}
+    stage = max(1, int(store.kv_get("model_activation_stage", 1) or 1))
+    gm, tm = shadow_metrics(store, graph_row["id"]), shadow_metrics(store, tcn["id"])
+    metrics = [gm, tm]
+    if stage < 2 and all(m["sessions"] >= 21 and all(
+            m["horizons"].get(str(h), {}).get("n", 0) >= 5000 and
+            m["horizons"][str(h)].get("ic", 0) >= .01 and
+            m["horizons"][str(h)].get("top_decile_alpha", 0) > 0
+            for h in (5, 21)) for m in metrics):
+        stage = 2
+    if stage < 3 and all(m["sessions"] >= 30 and all(
+            m["horizons"].get(str(h), {}).get("n", 0) >= 10000 and
+            .75 <= m["horizons"][str(h)].get("coverage", 0) <= .85 and
+            m["horizons"][str(h)].get("top_decile_alpha", 0) > 0
+            for h in (5, 21)) for m in metrics):
+        stage = 3
+    # Integrity/calibration decay drops back one stage, never below the
+    # offline-approved 10% stage while both champions remain valid.
+    if stage > 1 and any(any(
+            m["horizons"].get(str(h), {}).get("n", 0) >= 1000 and
+            (m["horizons"][str(h)].get("ic", 0) <= 0 or
+             not .70 <= m["horizons"][str(h)].get("coverage", 0) <= .90)
+            for h in (5, 21)) for m in metrics):
+        stage -= 1
+    store.kv_set("model_activation_stage", stage)
+    return {"stage": stage, "effective_blend": {1: .10, 2: .25, 3: .50}[stage],
+            "ready": True, "block_reason": None, "graph_id": graph_row["id"],
+            "global_tcn_id": tcn["id"], "graph_shadow": gm, "tcn_shadow": tm}

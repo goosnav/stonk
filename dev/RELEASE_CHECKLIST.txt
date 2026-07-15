@@ -1,5 +1,5 @@
 STONK TERMINAL M1a RELEASE EVIDENCE
-Updated: 2026-07-12
+Updated: 2026-07-14
 State: ACTIVE — NOT YET CANDIDATE_FOR_ACCEPTANCE
 
 Verified in this slice
@@ -11,11 +11,51 @@ Verified in this slice
 [x] Ctrl-C shuts down the scheduler without a traceback or orphan listener.
 [x] Operator jobs are durable, deduplicated, and visible with progress.
 [x] Browser UI retries transient GET failures and preserves last good state.
-[x] Full offline suite: 114 passed on macOS arm64, 2026-07-12.
+[x] Full offline suite: baseline 114 passed on macOS arm64, 2026-07-12.
+[x] Legacy model checkpoints are hash/schema checked and excluded from inference.
+[x] Audit payload writes redact account identifiers and secret-bearing fields.
+[x] Market/session logic uses XNYS holidays and early closes.
+[x] Partial rebalancing is bounded, sell-first, and cash-confirmed in offline tests.
+[x] Full offline suite after dual-network/rebalance hardening: 124 passed on
+    macOS arm64, 2026-07-12; live Playwright inspection had zero JS errors.
+[x] Live schema-2 trial produced an immutable compatible challenger and was
+    correctly denied promotion on negative holdout IC.
+[x] Schema-3 repairs activate all 18 features, enforce validation-only
+    tournament selection, and bound sealed/fold evaluation. Full offline suite:
+    131 passed on macOS arm64, 2026-07-12.
+[x] Live schema-3 trial 1/6: validation rank-IC +0.0407/+0.0578 (5d/21d),
+    interval coverage 77.4%/75.9%; remains shadow pending final gates.
+[x] Live schema-3 trial 2/6: validation rank-IC +0.0401/+0.0904, coverage
+    76.8%/75.1%; current validation leader, still zero live influence.
+[x] Live schema-3 trial 3/6: validation rank-IC +0.0348/+0.0856; did not
+    displace trial 2, confirming the tournament does not promote newest-wins.
+[x] Two-year corrected research replay: +8.96% after costs, 427 closed trades,
+    profit factor 1.24, final 30% OOS +13.41%; did not beat exposure-matched
+    SPY and therefore is not treated as activation evidence by itself.
 [x] Live smoke: broker connected, scheduler alive, no kill switches or alerts.
 [x] Local macOS app bundle has a valid ad-hoc signature.
+[x] Robinhood OAuth is explicit and single-flight: automatic probes cannot
+    open login tabs, stale state cannot complete a newer flow, and token writes
+    are atomic and owner-only.
+[x] Historical OOS forecasts are excluded from forward-shadow activation
+    metrics; the invalid July 13 champion is identified for rollback.
+[x] TCN trial caps are stable across SEC ingestion, tournament selection uses
+    validation rank/after-cost utility, and sealed predictions cover the graph
+    replay interval without lookahead.
+[x] Full offline suite after OAuth and sealed-evidence repair: 141 passed on
+    macOS arm64, 2026-07-14.
+[x] Evidence-first production repair: canonical direction signing, CAT
+    regression, legacy-backtest quarantine, verified dossier API/nodes,
+    graph-v3 completeness, TCN schema-4 baseline gate, and production-database
+    migration smoke, bounded partial-trim regression, affordable-order fallback,
+    and chunked quote/cached-bar hot path. Full offline suite: 150 passed on
+    macOS arm64, 2026-07-15; 175-symbol live cycles measured 21–41 seconds.
 
 Required before CANDIDATE_FOR_ACCEPTANCE
+[ ] Raise aggregate line coverage across broker/execution/research/graph/neural
+    from the current measured 55% to the required 85%; risk is already 90%.
+[ ] Obtain green offline CI evidence on macOS, Windows, and Ubuntu for the new
+    matrix workflow (local macOS passing alone is not cross-platform evidence).
 [ ] Persist effective host/port/PID/start/session metadata outside the repo.
 [ ] Add a per-launch unguessable session token to privileged local endpoints.
 [ ] Move config, DB, logs, cache, exports, and backups to platform app-data;
@@ -28,6 +68,9 @@ Required before CANDIDATE_FOR_ACCEPTANCE
 [ ] Run clean-user/clean-machine extraction, interrupted setup, restart,
     browser-open failure, and preserved-state acceptance tests.
 [ ] Record artifact checksum, supported platforms, rollback, and known issues.
+[ ] Complete one fresh schema-3 tournament under the repaired stable trial key;
+    require its validation-selected winner and graph to pass every sealed,
+    walk-forward, calibration, and after-cost gate before Stage-1 influence.
 [ ] Obtain explicit user acceptance.
 
 M1b/public distribution note

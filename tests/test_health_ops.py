@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,6 +74,64 @@ def _base_health() -> dict:
 def test_rollup_ok_when_market_closed_and_not_trading():
     status, alerts = rollup(_base_health())
     assert status == "ok" and alerts == []
+
+
+def test_exchange_calendar_handles_holiday_and_early_close():
+    et = ZoneInfo("America/New_York")
+    holiday = health_mod._market_clock(datetime(2026, 7, 3, 11, tzinfo=et))
+    before_close = health_mod._market_clock(datetime(2026, 11, 27, 12, 30, tzinfo=et))
+    after_close = health_mod._market_clock(datetime(2026, 11, 27, 13, 30, tzinfo=et))
+    assert holiday["open"] is False and holiday["session"] == "holiday"
+    assert before_close["open"] is True
+    assert after_close["open"] is False
+
+
+def test_status_account_snapshot_is_single_flight_and_stale_tolerant(
+        cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+    calls = {"n": 0}
+    original = PaperBroker.get_account
+
+    def counted(self):
+        calls["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(PaperBroker, "get_account", counted)
+    app = create_app(cfg, store, with_scheduler=False)
+    with TestClient(app) as c:
+        assert c.get("/api/status").status_code == 200
+        assert c.get("/api/status").json()["account_source"] == "cache"
+        assert calls["n"] == 1
+        app.state.account_cache["at"] = datetime.now().astimezone() - timedelta(seconds=61)
+
+        def unavailable(self):
+            raise RuntimeError("provider temporarily unavailable")
+
+        monkeypatch.setattr(PaperBroker, "get_account", unavailable)
+        stale = c.get("/api/status")
+        assert stale.status_code == 200
+        assert stale.json()["account_stale"] is True
+        assert stale.json()["account_source"] == "stale_cache"
+
+
+def test_status_account_snapshot_survives_service_restart(cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+    first = create_app(cfg, store, with_scheduler=False)
+    with TestClient(first) as c:
+        baseline = c.get("/api/status")
+        assert baseline.status_code == 200
+    assert store.kv_get("account_snapshot_cache")
+
+    def unavailable(self):
+        raise RuntimeError("broker offline after restart")
+
+    monkeypatch.setattr(PaperBroker, "get_account", unavailable)
+    restarted = create_app(cfg, store, with_scheduler=False)
+    with TestClient(restarted) as c:
+        status = c.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["account_stale"] is True
+    assert status.json()["equity"] == baseline.json()["equity"]
 
 
 def test_rollup_degraded_on_broker_disconnect_and_kill_switch():
@@ -150,15 +209,40 @@ def test_system_health_last_error_is_sanitized_and_aged(cfg, store, monkeypatch)
     assert all("934803396" not in a for a in h["alerts"])
 
 
+def test_newer_connected_broker_probe_resolves_old_probe_error(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    store.audit("broker_probe_failed", {"error": "temporary auth failure"})
+    store.kv_set("broker_health", {"adapter": "paper", "connected": True,
+                                   "detail": "", "as_of": _now_iso()})
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["broker"]["connected"] is True
+    assert h["last_error"] is None
+    assert not any("broker_probe_failed" in alert for alert in h["alerts"])
+
+
 def test_closed_market_scheduler_is_idle_not_dead(cfg, store, monkeypatch):
     monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
     h = system_health(cfg, store, scheduler_alive=True)
+    assert h["operational_state"] in ("closed_idle", "researching")
+    assert h["trading_loop"]["state"] == "closed"
+    assert h["research_worker"]["state"] in ("idle", "running")
+    assert "model" in h and "ready" in h["model"]
     assert h["engine"]["operational_state"] == "closed_idle"
     store.kv_set("research_state", {"phase": "tcn", "detail": "training"})
     h = system_health(cfg, store, scheduler_alive=True)
     assert h["engine"]["operational_state"] == "researching"
     h = system_health(cfg, store, scheduler_alive=False)
     assert h["engine"]["operational_state"] == "offline"
+
+
+def test_live_health_reports_learned_stack_shadow_without_blocking_baseline(cfg, store, monkeypatch):
+    cfg.data["mode"] = "live"
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(True))
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["model"]["block_reason"] == "BLOCKED: GRAPH"
+    assert h["model"]["production_evidence"] is True
+    assert not any("new entries blocked" in reason.lower()
+                   for reason in h["readiness"]["reasons"])
 
 
 def test_running_operator_job_surfaces_as_researching(cfg, store, monkeypatch):
@@ -194,6 +278,50 @@ def test_m1a_health_aliases_and_cross_origin_write_guard(client):
     allowed = client.post("/api/research/jobs", json={"kind": "discover"},
                           headers={"Origin": "http://testserver"})
     assert allowed.status_code == 200
+
+
+def test_broker_connect_is_single_flight(client, store, monkeypatch):
+    from specforge.broker.robinhood_mcp import RobinhoodMCPBroker
+    started, release = threading.Event(), threading.Event()
+
+    def slow_probe(self):
+        assert self.interactive_auth is True
+        started.set(); release.wait(2)
+        return {"connected": True, "accounts": []}
+
+    monkeypatch.setattr(RobinhoodMCPBroker, "probe", slow_probe)
+    assert client.post("/api/broker/connect").json()["ok"] is True
+    assert started.wait(1)
+    duplicate = client.post("/api/broker/connect").json()
+    assert duplicate["state"] == "already_connecting"
+    release.set()
+    for _ in range(30):
+        if (store.kv_get("broker_probe") or {}).get("state") == "connected":
+            break
+        time.sleep(.01)
+    assert store.kv_get("broker_probe")["state"] == "connected"
+
+
+def test_broker_status_clears_old_connect_error_after_successful_read(client, store):
+    store.kv_set("broker_probe", {"connected": False, "state": "error",
+                                  "error": "old OAuth failure"})
+    store.kv_set("broker_health", {"adapter": "paper", "connected": True,
+                                   "detail": "", "as_of": _now_iso()})
+    probe = client.get("/api/broker/status").json()["probe"]
+    assert probe["state"] == "connected" and probe["connected"] is True
+    assert "error" not in probe
+
+
+def test_robinhood_token_document_is_atomic_and_recovers_corruption(tmp_path, monkeypatch):
+    from specforge.broker import robinhood_mcp
+    path = tmp_path / "rh_tokens.json"
+    monkeypatch.setattr(robinhood_mcp, "TOKEN_PATH", path)
+    robinhood_mcp._save_token_document({"tokens": {"access_token": "secret"}})
+    assert robinhood_mcp._token_document()["tokens"]["access_token"] == "secret"
+    assert not path.with_suffix(".json.tmp").exists()
+    path.write_text("{not-json")
+    assert robinhood_mcp._token_document() == {}
+    assert list(tmp_path.glob("rh_tokens.json.corrupt-*"))
 
 
 def test_metrics_contract_healthy(client, cfg, store, monkeypatch):
@@ -329,3 +457,17 @@ def test_checker_against_real_server(cfg, store, monkeypatch, capsys):
         assert code == 0 and "OK" in human
     finally:
         server.should_exit = True
+
+
+def test_scheduler_registers_premarket_session_probe(cfg, store):
+    """The unattended service must check auth before the opening bell without
+    relying on a dashboard request (and without entering interactive OAuth)."""
+    app = create_app(cfg, store, with_scheduler=True)
+    try:
+        jobs = {job.id for job in app.state.scheduler.get_jobs()}
+        assert "broker_session_check" in jobs
+        assert "research" in jobs
+        assert "operator_research" in jobs
+    finally:
+        app.state.stopping = True
+        app.state.scheduler.shutdown(wait=False)

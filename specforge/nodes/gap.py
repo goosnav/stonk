@@ -25,18 +25,25 @@ class Node(SignalNode):
 
     def compute(self, ctx: MarketContext) -> list[SignalEvent]:
         live = getattr(ctx, "live_px", None) or {}
-        if not live:
-            return []                      # backtest or no quotes: silent
         events = []
         for sym in ctx.universe:
             px = live.get(sym)
+            daily_open = False
+            df = ctx.df(sym)
             c = ctx.closes(sym)
+            if not px and len(df) >= 60 and df.index[-1] == ctx.as_of:
+                px = float(df["open"].iloc[-1])
+                daily_open = True
             if not px or len(c) < 60:
                 continue
-            # last SETTLED close: drop today's bar if the feed already has it
-            prev = c.iloc[-2] if c.index[-1] == ctx.as_of else c.iloc[-1]
+            # Historical replay uses only today's open and prior settled bars.
+            # Live review uses the current quote against the same prior close.
+            settled = c.iloc[:-1] if c.index[-1] == ctx.as_of else c
+            if len(settled) < 50:
+                continue
+            prev = settled.iloc[-1]
             gap = px / float(prev) - 1
-            sma50 = c.rolling(50).mean().iloc[-1]
+            sma50 = settled.rolling(50).mean().iloc[-1]
             if not (GAP_MIN <= gap <= GAP_MAX) or px < sma50:
                 continue
             atr = ctx.atr_pct(sym) or 0.02
@@ -50,7 +57,8 @@ class Node(SignalNode):
                 expected_return=round(score * vol * 0.5, 5),
                 expected_volatility=round(vol, 5),
                 downside_estimate=round(-2 * vol, 5),
-                evidence=[f"gap {gap:+.1%} ({gap_atr:.1f}×ATR) above 50sma, "
+                evidence=[f"{'opening ' if daily_open else ''}gap {gap:+.1%} "
+                          f"({gap_atr:.1f}×ATR) above 50sma, "
                           f"prev close {float(prev):.2f} → {px:.2f}"],
                 data_as_of=datetime.strptime(ctx.as_of, "%Y-%m-%d"),
                 node_id=self.id, node_version=self.version))

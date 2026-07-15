@@ -4,11 +4,22 @@ CURRENT_MILESTONE: M1a
 STATUS: ACTIVE
 LAST_USER_ACCEPTED_MILESTONE: M0
 NEXT_ALLOWED_MILESTONE: M1a
-CURRENT_SLICE: M1a reliability and operator observability
-LAST_UPDATED: 2026-07-12
+CURRENT_SLICE: M1a evidence-first production model and release hardening
+LAST_UPDATED: 2026-07-15
 
 The local browser product is operational, but M1a has not reached
 CANDIDATE_FOR_ACCEPTANCE. Runtime progress, loopback binding, atomic bounded
 port fallback, liveness/readiness, same-origin mutation checks, and graceful
-scheduler shutdown are verified. Remaining gate evidence is tracked in
+scheduler shutdown are verified. Immutable learned checkpoints, evidence-first
+entry scoring, partial sell-first rebalancing, audit redaction, exchange-calendar
+scheduling, and broker account caching are implemented. Remaining packaging
+and clean-machine evidence is tracked in
 dev/RELEASE_CHECKLIST.txt.
+
+The July 15 decision audit repaired double-signed avoid evidence, quarantined
+legacy backtests, and connected verified SEC/news dossiers to the live score.
+Production evidence remains operational while the 44-feature schema-5 TCN and
+complete analog graph train as shadow challengers. Codex-first intelligence,
+Claude/API fallbacks, durable news jobs, and activated Strategy AI mandates are
+implemented and offline-verified. Learned influence is still zero until the
+sealed, walk-forward, calibration, baseline, and forward-shadow gates pass.

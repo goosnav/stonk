@@ -161,19 +161,52 @@ def status(store) -> dict:
 
 def ingest_next_filing_facts(store, client=httpx) -> dict:
     """Fetch one issuer's point-in-time SEC facts per research task."""
-    row = store.db.execute(
-        "SELECT i.symbol,i.cik FROM instruments i WHERE i.active=1 AND i.cik IS NOT NULL "
-        "AND NOT EXISTS(SELECT 1 FROM filing_facts f WHERE f.cik=i.cik) "
-        "ORDER BY i.last_seen DESC,i.symbol LIMIT 1").fetchone()
+    candidates = store.db.execute(
+        "SELECT i.symbol,i.cik FROM instruments i LEFT JOIN universe_membership u "
+        "ON u.symbol=i.symbol AND u.tier='research' AND u.as_of=(SELECT MAX(as_of) "
+        "FROM universe_membership WHERE tier='research') WHERE i.active=1 AND "
+        "i.cik IS NOT NULL "
+        "ORDER BY CASE WHEN u.rank IS NULL THEN 1 ELSE 0 END,u.rank,i.symbol LIMIT 2000").fetchall()
+    today = datetime.now().astimezone().date().isoformat()
+    def due(candidate) -> bool:
+        attempt = store.kv_get(f"filing_facts_attempted_{candidate['symbol']}") or {}
+        # Facts change when issuers file. Refresh completed issuers weekly;
+        # provider failures retry on a later day rather than poisoning forever.
+        attempted = attempt.get("attempted_on")
+        if attempt.get("status") == "completed" and attempted:
+            try:
+                return (datetime.fromisoformat(today).date() -
+                        datetime.fromisoformat(attempted).date()).days >= 7
+            except ValueError:
+                pass
+        return attempted != today
+    row = next((r for r in candidates if due(r)), None)
     if not row:
         return {"status": "caught_up", "kind": "filing_facts"}
     cik = str(row["cik"]).zfill(10)
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    r = client.get(url, timeout=30,
-                   headers={"User-Agent": "Stonk Terminal research contact=local-user"})
-    r.raise_for_status(); facts = r.json().get("facts", {}).get("us-gaap", {})
-    wanted = {"EarningsPerShareDiluted", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-              "Assets", "StockholdersEquity", "CommonStocksIncludingAdditionalPaidInCapital"}
+    try:
+        r = client.get(url, timeout=30,
+                       headers={"User-Agent": "Stonk Terminal research contact=local-user"})
+        r.raise_for_status(); facts = r.json().get("facts", {}).get("us-gaap", {})
+    except Exception as exc:
+        result = {"status": "failed", "symbol": row["symbol"],
+                  "attempted_on": today,
+                  "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        store.kv_set(f"filing_facts_attempted_{row['symbol']}", result)
+        store.audit("filing_facts_failed", result)
+        return result
+    wanted = {
+        "EarningsPerShareDiluted", "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax", "GrossProfit",
+        "OperatingIncomeLoss", "NetIncomeLoss", "OperatingExpenses",
+        "Assets", "AssetsCurrent", "Liabilities", "LiabilitiesCurrent",
+        "StockholdersEquity", "CashAndCashEquivalentsAtCarryingValue",
+        "NetCashProvidedByUsedInOperatingActivities",
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "LongTermDebtCurrent", "LongTermDebtNoncurrent", "ShortTermBorrowings",
+        "CommonStockSharesOutstanding", "WeightedAverageNumberOfDilutedSharesOutstanding",
+    }
     inserted = 0
     with store.db:
         for tag in wanted & set(facts):
@@ -185,6 +218,23 @@ def ingest_next_filing_facts(store, client=httpx) -> dict:
                             (str(int(cik)), tag, v["end"], v["filed"], float(v["val"]),
                              unit, v.get("form"), v.get("accn")))
                         inserted += 1
-    result = {"symbol": row["symbol"], "cik": str(int(cik)), "inserted": inserted}
+    result = {"status": "completed", "symbol": row["symbol"],
+              "attempted_on": today,
+              "cik": str(int(cik)), "inserted": inserted}
+    store.kv_set(f"filing_facts_attempted_{row['symbol']}", result)
     store.audit("filing_facts_ingested", result)
     return result
+
+
+def ingest_filing_facts_batch(store, limit: int = 10, progress=None) -> dict:
+    results = []
+    for index in range(limit):
+        if progress:
+            progress(index, limit)
+        result = ingest_next_filing_facts(store)
+        if result.get("status") == "caught_up":
+            break
+        results.append(result)
+    return {"status": "completed", "attempted": len(results),
+            "inserted": sum(r.get("inserted", 0) for r in results),
+            "failures": [r for r in results if r.get("status") == "failed"]}

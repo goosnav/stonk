@@ -42,6 +42,9 @@ def cfg(tmp_path):
         # only deterministic offline nodes in tests
         "nodes": {"momentum": {"enabled": True, "weight": 0.5, "horizon_days": 20,
                                "status": "production"}},
+        # Unit tests opt into the legacy fake HTTP adapter explicitly; no test
+        # may invoke a signed-in local Codex/Claude subscription.
+        "intelligence": {"enabled": False},
     })
 
 

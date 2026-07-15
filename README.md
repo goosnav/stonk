@@ -84,9 +84,23 @@ Use the TUI when the terminal itself is the control room:
 
 It shows trading readiness, broker and heartbeat health, account value and
 buying power, P&L, positions, working orders, the active engine phase, recent
-candidate verdicts, kill-switch recovery times, and current AI commentary.
+candidate verdicts, kill-switch recovery times, active Strategy AI mandate,
+intelligence provider/job progress, learned-model gate, and current commentary.
 `Ctrl-C` stops a daemon started by that TUI; attaching to an existing server
 leaves it running.
+
+Useful headless intelligence controls:
+
+```bash
+.venv/bin/stonk --mode live ai doctor --json
+.venv/bin/stonk --mode live ai test --json
+.venv/bin/stonk --mode live strategy analyze "favor durable cash generation"
+.venv/bin/stonk --mode live strategy status
+.venv/bin/stonk --mode live intelligence --status
+```
+
+Operator direction is inert until Strategy AI synthesizes a mandate and the
+operator activates that mandate. It is never interpreted as an order.
 
 `stonk serve` is quiet by default. Use `serve --verbose` only when HTTP request
 diagnostics are useful. The complete structured audit remains available in

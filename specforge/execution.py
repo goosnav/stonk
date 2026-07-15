@@ -156,13 +156,15 @@ class Executor:
         return "filled"
 
     def execute_exit(self, position: dict, last_price: float, reason: str,
-                     account, cycle_id: str, regime: str) -> str:
-        """Close an open position (sell). Exits bypass entry caps by design."""
+                     account, cycle_id: str, regime: str,
+                     qty: float | None = None) -> str:
+        """Sell all or part of a position. Exits bypass entry caps by design."""
         limit = self._limit_price(last_price, "sell")
+        sell_qty = min(position["qty"], qty if qty is not None else position["qty"])
         cand = TradeCandidate(
             id=new_id(), symbol=position["symbol"], asset_type=position["asset_type"],
             side="sell", thesis=f"exit: {reason}", final_score=0.0,
-            target_notional=position["qty"] * limit *
+            target_notional=sell_qty * limit *
             (100 if position["asset_type"] == "option" else 1),
             expected_return=0, ci_low=0,
             ci_high=0, probability_positive=0, expected_apr=0, apr_ci_low=0,
@@ -171,7 +173,7 @@ class Executor:
         # Persist the exit thesis so an asynchronous fill can reconstruct the
         # reason and attribution on a later cycle.
         self.store.record_candidate(cand, cycle_id)
-        intent = OrderIntent.make(cand, qty=position["qty"], limit_price=limit,
+        intent = OrderIntent.make(cand, qty=sell_qty, limit_price=limit,
                                   now_iso=self.now_iso)
         if not self.store.record_order(intent, self.mode):
             return "duplicate"
@@ -181,7 +183,7 @@ class Executor:
                 "SELECT price FROM fills WHERE order_id=? ORDER BY filled_at DESC LIMIT 1",
                 (intent.id,)).fetchone()
             self._record_close(position, row["price"] if row else limit,
-                               reason, cycle_id, regime)
+                               reason, cycle_id, regime, qty=sell_qty)
         return status
 
     def reconcile(self, cycle_id: str) -> dict:
@@ -242,7 +244,8 @@ class Executor:
                     reason = (exit_cand.thesis.removeprefix("exit: ")
                               if exit_cand else "resting_exit_fill")
                     self._record_close(position, fill.price, reason, cycle_id,
-                                       exit_cand.regime if exit_cand else "unknown")
+                                       exit_cand.regime if exit_cand else "unknown",
+                                       qty=fill.qty)
             results[o["symbol"]] = "filled"
         return results
 
@@ -300,11 +303,12 @@ class Executor:
         return results
 
     def _record_close(self, position: dict, exit_price: float, reason: str,
-                      cycle_id: str, regime: str) -> None:
+                      cycle_id: str, regime: str, qty: float | None = None) -> None:
         entry_px = position["avg_cost"]
         mult = 100.0 if position["asset_type"] == "option" else 1.0
-        pnl = (exit_price - entry_px) * position["qty"] * mult
-        self.store.close_position(position["id"])
+        sold_qty = min(position["qty"], qty if qty is not None else position["qty"])
+        pnl = (exit_price - entry_px) * sold_qty * mult
+        self.store.reduce_position(position["id"], sold_qty)
         entry_cand = self._load_candidate(position.get("candidate_id", ""))
         entry_score = entry_cand.final_score if entry_cand else 0.0
         import json as _json
@@ -313,7 +317,7 @@ class Executor:
             "score": entry_score, "score_bucket": score_bucket(entry_score),
             "symbol": position["symbol"], "asset_type": position["asset_type"],
             "entry_date": position["opened_at"][:10], "exit_date": self.now_iso[:10],
-            "entry_price": entry_px, "exit_price": exit_price, "qty": position["qty"],
+            "entry_price": entry_px, "exit_price": exit_price, "qty": sold_qty,
             "pnl": round(pnl, 4), "ret": round(exit_price / entry_px - 1, 6),
             "horizon_days": position["horizon_days"],
             "nodes": _json.loads(nodes) if isinstance(nodes, str) else nodes,
@@ -321,8 +325,12 @@ class Executor:
             "exit_reason": reason,
             "regime": entry_cand.regime if entry_cand else regime,
         })
-        self.store.audit("position_closed", {"symbol": position["symbol"],
-                                             "reason": reason, "pnl": pnl}, cycle_id)
+        remaining = max(0, position["qty"] - sold_qty)
+        self.store.audit("position_closed" if remaining <= 1e-8 else "position_trimmed", {
+                                             "symbol": position["symbol"],
+                                             "reason": reason, "qty": sold_qty,
+                                             "remaining_qty": remaining,
+                                             "pnl": pnl}, cycle_id)
 
     def _load_candidate(self, candidate_id: str) -> TradeCandidate | None:
         import json as _json
