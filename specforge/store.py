@@ -429,6 +429,24 @@ class Store:
                 self._connections.add(conn)
         return conn
 
+    def close_thread_connection(self) -> None:
+        """Release the current worker thread's SQLite handle immediately.
+
+        Background heartbeat threads are intentionally short lived; retaining
+        each of their thread-local handles until service shutdown leaks file
+        descriptors during long autonomous runs.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._connections_lock:
+            self._connections.discard(conn)
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
     def close(self) -> None:
         """Close every thread-local connection during a clean service exit."""
         with self._connections_lock:

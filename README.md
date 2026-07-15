@@ -109,6 +109,32 @@ diagnostics are useful. The complete structured audit remains available in
 `logs/audit-live.jsonl` or `logs/audit-paper.jsonl`; process diagnostics go to
 `logs/runtime-live.log` when launched by the macOS app or restart script.
 
+### Runtime isolation and recovery
+
+The web service does not execute research or PyTorch training in its request
+process. Autonomous research, discovery, deep research, news intelligence, and
+holding training run as one-shot child workers with durable SQLite leases. The
+parent publishes their phase and progress to the GUI/TUI, recovers abandoned
+leases after a restart, and terminates a worker process group if it exceeds its
+declared time budget. A service shutdown also terminates children it started.
+
+Neural dataset materialization is capped at 12,000 training windows per run and
+checks cancellation/deadline state while building the dataset. Exhausting a
+budget produces a visible waiting or timed-out state; it does not make an
+incompatible checkpoint live. Operator jobs remain subject to the same model
+trial, AI budget, evidence, cash, and governor gates as autonomous work.
+
+For a read-only health check before trading:
+
+```bash
+.venv/bin/stonk --mode live tui --once --no-color
+curl -fsS http://127.0.0.1:8420/api/health
+```
+
+If the preferred port is occupied, `serve` chooses a configured fallback and
+publishes it; the TUI attaches to that published service rather than starting a
+second scheduler.
+
 ## Going live (Robinhood)
 
 Read [TUTORIAL.md](TUTORIAL.md) first. Short version:

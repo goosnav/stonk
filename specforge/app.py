@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import OVERRIDES_KEY, ConfigError, apply_override, load_config
 from .data import MarketContext
@@ -31,6 +33,40 @@ AI_PROVIDERS = {
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com/v1",
 }
+
+
+def _public_probe(value):
+    """Return broker-connect state without account identifiers or secrets."""
+    if isinstance(value, list):
+        return [_public_probe(item) for item in value]
+    if isinstance(value, str):
+        from .health import _redact
+        return _redact(value)
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        lowered = str(key).lower()
+        if any(token in lowered for token in ("whitelist", "credential", "token", "secret")):
+            continue
+        if "account" in lowered and isinstance(item, (str, int)):
+            text = str(item)
+            out[key] = f"••••{text[-4:]}" if text else ""
+        else:
+            out[key] = _public_probe(item)
+    return out
+
+
+def _job_summary(job: dict) -> dict:
+    """Compact polling representation; detailed job endpoints retain results."""
+    allowed = ("id", "kind", "status", "state", "priority", "resource_class",
+               "requested_at", "started_at", "completed_at", "updated_at",
+               "heartbeat_at", "lease_expires_at", "next_retry_at", "wait_reason",
+               "error", "depends_on_id", "progress")
+    out = {key: job.get(key) for key in allowed if key in job}
+    if out.get("error"):
+        out["error"] = str(out["error"])[:240]
+    return out
 
 
 def current_config(store: Store, mode: str):
@@ -56,6 +92,12 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     from .quotes import QuoteService
     app = FastAPI(title="Stonk Terminal", docs_url="/api/docs")
+    # A loopback service is still a control plane.  Never derive trust from the
+    # request Host header: that makes DNS rebinding look same-origin.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+    )
     mode = cfg.mode
     quotes = QuoteService(cfg)          # provider chain: broker→stooq→yfinance
     app.state.started_at = datetime.now().astimezone()
@@ -82,15 +124,17 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         """Block browser cross-site writes to the loopback control plane.
 
         Non-browser CLI calls normally omit Origin and remain supported. A
-        browser that supplies Origin must match the exact loopback server it
-        addressed; restrictive CORS headers alone do not stop form/fetch CSRF.
+        browser that supplies Origin must itself be a loopback origin;
+        restrictive CORS headers alone do not stop form/fetch CSRF.
         """
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
-            expected = f"{request.url.scheme}://{request.url.netloc}"
-            if origin and origin.rstrip("/") != expected:
-                return JSONResponse({"detail": "cross-origin mutation refused"},
-                                    status_code=403)
+            if origin:
+                parsed = urlparse(origin)
+                if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+                        "127.0.0.1", "localhost", "::1", "testserver"}:
+                    return JSONResponse({"detail": "cross-origin mutation refused"},
+                                        status_code=403)
         return await call_next(request)
 
     def _process() -> dict:
@@ -230,34 +274,60 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                          "error": "previous attempt was interrupted (likely a "
                                   "server restart mid-login) — click Connect again"}
         ok, why = c.live_trading_allowed()
-        return {"configured_broker": c.get("broker"), "probe": probe,
+        return {"configured_broker": c.get("broker"), "probe": _public_probe(probe),
                 "live_gate_ok": ok, "live_gate_reason": why}
 
     @app.post("/api/broker/connect")
     def broker_connect():
         """Kick off the Robinhood OAuth probe in a background thread — the
         browser opens on this machine for login. Poll /api/broker/status."""
+        c = fresh_cfg()
+        if c.get("broker") != "robinhood_mcp":
+            raise HTTPException(409, "Robinhood connect is unavailable for this broker/mode")
+        probe = store.kv_get("broker_probe") or {}
+        if probe.get("connected") and probe.get("state") == "connected":
+            connected_at = (probe.get("probed_at") or probe.get("as_of") or
+                            probe.get("finished_at"))
+            try:
+                if datetime.now().astimezone() - datetime.fromisoformat(connected_at) < \
+                        timedelta(seconds=60):
+                    return {"ok": True, "state": "already_connected",
+                            "note": "A fresh read already verified this session"}
+            except (TypeError, ValueError):
+                pass
+        # Persist a short cooldown as well as the process-local lock.  This
+        # prevents repeated clicks/restarts from opening an OAuth tab storm.
+        try:
+            last_start = datetime.fromisoformat(probe.get("started_at", ""))
+            if datetime.now().astimezone() - last_start < timedelta(seconds=30):
+                return {"ok": True, "state": "already_connecting",
+                        "note": "A recent Robinhood login attempt is still settling"}
+        except (TypeError, ValueError):
+            pass
         if not app.state.broker_connect_lock.acquire(blocking=False):
             return {"ok": True, "state": "already_connecting",
                     "note": "One Robinhood login is already in progress"}
 
         def _run():
+            attempt_started = datetime.now().astimezone().isoformat(timespec="seconds")
             store.kv_set("broker_probe", {"connected": False, "state": "connecting",
-                                          "started_at": datetime.now().astimezone()
-                                          .isoformat(timespec="seconds")})
+                                          "started_at": attempt_started})
             try:
                 from .broker.robinhood_mcp import RobinhoodMCPBroker
                 b = RobinhoodMCPBroker(fresh_cfg(), store, interactive_auth=True)
-                result = b.probe()
+                result = _public_probe(b.probe())
                 result["state"] = "connected"
                 store.kv_set("broker_probe", result)
                 store.audit("broker_probe_ok", result)
             except Exception as e:                  # noqa: BLE001
+                from .health import _redact
+                error = _redact(str(e))[:500]
                 store.kv_set("broker_probe", {"connected": False, "state": "error",
-                                              "error": str(e)[:500],
+                                              "error": error,
+                                              "started_at": attempt_started,
                                               "finished_at": datetime.now().astimezone()
                                               .isoformat(timespec="seconds")})
-                store.audit("broker_probe_failed", {"error": str(e)[:500]})
+                store.audit("broker_probe_failed", {"error": error})
             finally:
                 app.state.broker_connect_lock.release()
 
@@ -567,6 +637,8 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     @app.get("/api/montecarlo")
     def montecarlo(horizon_days: int = 20):
         from .montecarlo import from_positions, simulate
+        if not 1 <= horizon_days <= 252:
+            raise HTTPException(400, "horizon_days must be between 1 and 252")
         c, broker, ctx = broker_and_ctx()
         acct, _, _, _ = cached_account(broker)
         out = simulate(from_positions(store, ctx, acct, horizon_days))
@@ -799,15 +871,23 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         """Persist provider base_url (+ optional new key) to .env and apply live.
         A blank api_key keeps the current one (so you can switch provider without
         re-typing the key)."""
-        from .config import set_env_var
+        from .config import set_env_vars
         provider = body.get("provider", "custom")
         base_url = (AI_PROVIDERS.get(provider) or body.get("base_url", "") or "").strip()
-        if not base_url.startswith(("http://", "https://")):
-            raise HTTPException(400, "base_url must be a valid http(s) URL")
-        set_env_var("AI_BASE_URL", base_url)
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or \
+                parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise HTTPException(400, "base_url must be a credential-free http(s) origin/path")
+        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise HTTPException(400, "non-loopback custom providers must use https")
         key = (body.get("api_key") or "").strip()
+        settings = {"AI_BASE_URL": base_url}
         if key:
-            set_env_var("AI_API_KEY", key)
+            settings["AI_API_KEY"] = key
+        try:
+            set_env_vars(settings)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
         # audit records the provider/base_url but NEVER the key value
         store.audit("ai_provider_set", {"provider": provider, "base_url": base_url,
                                         "key_changed": bool(key), "via": "gui"})
@@ -1212,15 +1292,17 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
                               {"phase": "idle", "detail": "waiting for cached-news refresh "
                                "or Strategy AI direction", "progress": {},
                                "at": (store.kv_get("intelligence_last_call") or {}).get("at")})
+        worker_snapshot = (getattr(app.state, "worker_snapshot", lambda: {})())
         return {"state": state,
                 "processes": {
                     "trading": {"state": state, "serial": True},
                     "research": {"state": research_state,
-                                 "jobs": research_jobs,
+                                 "jobs": [_job_summary(j) for j in research_jobs],
+                                 "workers": worker_snapshot,
                                  "serial": True,
                                  "detail": "one research task at a time; trading remains responsive"},
                     "intelligence": {"state": intelligence_state,
-                                     "jobs": intelligence_jobs,
+                                     "jobs": [_job_summary(j) for j in intelligence_jobs],
                                      "serial": True,
                                      "detail": "one sandboxed provider call at a time; trading reads cache"}},
                 "market": _market_clock(),
@@ -1249,16 +1331,104 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
         @app.on_event("shutdown")
         def stop_scheduler():
+            import os
+            import signal
             app.state.stopping = True
             scheduler = getattr(app.state, "scheduler", None)
             if scheduler and scheduler.running:
                 scheduler.shutdown(wait=False)
+            for proc in list(getattr(app.state, "worker_processes", {}).values()):
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
     return app
 
 
 def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+    import signal
+
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
+
+    app.state.worker_processes = {}
+    app.state.worker_deadlines = {}
+    app.state.worker_lock = threading.Lock()
+
+    def _worker_snapshot() -> dict:
+        snapshot = {}
+        with app.state.worker_lock:
+            for lane, proc in list(app.state.worker_processes.items()):
+                code = proc.poll()
+                deadline = app.state.worker_deadlines.get(lane)
+                if code is None and deadline is not None and time.monotonic() > deadline:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    snapshot[lane] = {"pid": proc.pid, "state": "timed_out",
+                                      "exit_code": None}
+                    store.kv_set(f"worker_process:{lane}", {
+                        **snapshot[lane], "timed_out_at": datetime.now().astimezone()
+                        .isoformat(timespec="seconds")})
+                    store.audit("research_worker_timed_out", {"lane": lane,
+                                                               "pid": proc.pid})
+                    del app.state.worker_processes[lane]
+                    app.state.worker_deadlines.pop(lane, None)
+                    continue
+                snapshot[lane] = {"pid": proc.pid,
+                                  "state": "running" if code is None else "exited",
+                                  "exit_code": code}
+                if code is not None:
+                    del app.state.worker_processes[lane]
+                    app.state.worker_deadlines.pop(lane, None)
+        return snapshot
+
+    app.state.worker_snapshot = _worker_snapshot
+
+    def _spawn_worker(lane: str, max_seconds: int = 600) -> dict:
+        """Start at most one short-lived process per durable worker lane.
+
+        Pandas/Torch allocations and provider clients are intentionally kept
+        out of Uvicorn's trading/control process; process exit returns their
+        allocator high-water memory to the OS.
+        """
+        with app.state.worker_lock:
+            existing = app.state.worker_processes.get(lane)
+            if existing and existing.poll() is None:
+                return {"lane": lane, "state": "running", "pid": existing.pid}
+            if existing:
+                del app.state.worker_processes[lane]
+                app.state.worker_deadlines.pop(lane, None)
+            log_dir = Path(__file__).resolve().parent.parent / "logs"
+            log_dir.mkdir(exist_ok=True)
+            log = (log_dir / f"worker-{mode}.log").open("a", encoding="utf-8")
+            broker_secret_prefixes = ("RH_", "ROBINHOOD_", "MCP_")
+            env = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith(broker_secret_prefixes)}
+            env["PYTHONUNBUFFERED"] = "1"
+            env["STONK_RESEARCH_WORKER"] = "1"
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "specforge.cli", "--mode", mode,
+                     "worker", lane, "--max-seconds", str(max_seconds)],
+                    cwd=Path(__file__).resolve().parent.parent,
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    env=env, shell=False, start_new_session=True)
+            finally:
+                log.close()
+            app.state.worker_processes[lane] = proc
+            app.state.worker_deadlines[lane] = time.monotonic() + max_seconds + 15
+        detail = {"lane": lane, "state": "running", "pid": proc.pid,
+                  "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        store.kv_set(f"worker_process:{lane}", detail)
+        return detail
 
     def scan_job():
         from .engine import run_cycle
@@ -1376,6 +1546,12 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
 
     from apscheduler.triggers.interval import IntervalTrigger
 
+    # Enforce worker wall-clock budgets even when no dashboard is polling.
+    sched.add_job(_worker_snapshot, IntervalTrigger(seconds=5),
+                  next_run_time=datetime.now().astimezone() + timedelta(seconds=5),
+                  max_instances=1, coalesce=True, misfire_grace_time=30,
+                  id="worker_watchdog")
+
     # D39 continuous heartbeat: full cycle every N minutes while the market is
     # open (the engine.py cycle lock makes overlap with the cron scans a no-op)
     # and a visible "sleeping" stamp when it's closed — the state machine is
@@ -1401,13 +1577,10 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             next_run_time=datetime.now().astimezone() + timedelta(seconds=3),
             misfire_grace_time=120, id="scan_interval")
 
-    # Closed-market research runs nearly continuously but yields before the
-    # open. Torch/data work must not compete with the time-critical trading
-    # cycle; operator jobs remain durable and wait for this same worker.
+    # Closed-market research is one atomic unit per short-lived subprocess.
+    # It never shares Uvicorn's heap/GIL with the trading/control plane.
     def research_job():
-        import time as _t
         from .health import _market_clock
-        c = current_config(store, mode)
         if _market_clock()["open"]:
             return
         import pandas as _pd
@@ -1417,24 +1590,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         budget = min(840, max(0, int(seconds_to_open - 15 * 60)))
         if budget < 30:
             return
-        deadline = _t.monotonic() + budget
         try:
-            from .research import run_next, run_operator_job
-            while True:
-                if getattr(app.state, "stopping", False):
-                    break
-                if _market_clock()["open"]:
-                    break
-                remaining = int(deadline - _t.monotonic())
-                if remaining < 30:
-                    break
-                out = run_operator_job(c, store) or run_next(
-                    c, store, max_seconds=remaining)
-                if (out or {}).get("task") == "caught_up" or \
-                        (out or {}).get("status") == "skipped":
-                    break
-                if getattr(app.state, "stopping", False):
-                    break
+            _spawn_worker("autonomous", min(600, budget))
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "research",
                                             "error": str(e)[:300]})
@@ -1456,11 +1613,20 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
         research.py preserve single execution across multiple app processes.
         """
         try:
-            from .research import run_operator_job
+            from .research import recover_jobs
+            recover_jobs(store)
             state = store.kv_get("engine_state", {}) or {}
             if state.get("phase") not in (None, "idle", "sleeping", "never_ran"):
                 return                    # trading always wins the start boundary
-            run_operator_job(current_config(store, mode), store, {resource})
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            due = store.db.execute(
+                "SELECT 1 FROM research_jobs WHERE status='queued' AND resource_class=? "
+                "AND (eligible_at IS NULL OR eligible_at<=?) "
+                "AND (next_retry_at IS NULL OR next_retry_at<=?) LIMIT 1",
+                (resource, now, now)).fetchone()
+            if not due:
+                return
+            _spawn_worker(f"operator-{resource}", 600)
         except Exception as e:             # noqa: BLE001
             store.audit("scheduler_error", {"job": f"operator_{resource}",
                                             "error": str(e)[:300]})
@@ -1473,7 +1639,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
             # second cheap poll: the durable SQLite lease makes it return
             # immediately, while avoiding APScheduler's repeated noisy
             # "maximum instances" warnings during healthy long jobs.
-            max_instances=2, coalesce=True, misfire_grace_time=30,
+            max_instances=1, coalesce=True, misfire_grace_time=30,
             id=f"operator_{resource}")
 
     # Intelligence is market-safe: it never contacts the broker and trading
@@ -1481,7 +1647,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     # news refreshes are deduplicated and only classify newly ingested items.
     def intelligence_job():
         try:
-            from .intelligence import enqueue, jobs, run_next
+            from .intelligence import enqueue, jobs, recover
+            recover(store)
             rows = jobs(store, limit=5)
             active = any(j.get("status") in ("queued", "running") for j in rows)
             state = store.kv_get("news_intelligence", {}) or {}
@@ -1493,7 +1660,9 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                 pass
             if not active and stale:
                 enqueue(store, "news_refresh", priority=1)
-            run_next(current_config(store, mode), store)
+                rows = jobs(store, limit=5)
+            if any(j.get("status") == "queued" for j in rows):
+                _spawn_worker("news", 600)
         except Exception as exc:              # intelligence never wedges scheduler
             store.audit("scheduler_error", {"job": "intelligence",
                                             "error": str(exc)[:300]})
@@ -1502,7 +1671,7 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
                   next_run_time=datetime.now().astimezone() + timedelta(seconds=12),
                   # run_next owns the same cross-process intelligence lease;
                   # a second scheduler poll is safe and stays short.
-                  max_instances=2, coalesce=True, misfire_grace_time=60,
+                  max_instances=1, coalesce=True, misfire_grace_time=60,
                   id="intelligence")
 
     # D40: the weekend research loop — schedule slot existed since V1 but was
@@ -1511,19 +1680,8 @@ def _start_scheduler(app: FastAPI, store: Store, mode: str) -> None:
     wr = cfg.get("schedule", "weekend_research", default="SAT 10:00")
 
     def weekend_research_job():
-        c = current_config(store, mode)
         try:
-            from .backtest import run_backtest
-            rep = run_backtest(c, years=2, tag="weekly_research")
-            slim = {"window": rep.get("window"), "n_trades": rep.get("n_trades"),
-                    "win_rate": rep.get("win_rate"),
-                    "overall": rep.get("overall"),
-                    "out_of_sample_30pct": rep.get("out_of_sample_30pct"),
-                    "benchmark_buy_hold_return": rep.get("benchmark_buy_hold_return"),
-                    "ran_at": datetime.now().astimezone().isoformat(timespec="seconds")}
-            store.kv_set("research_report", slim)
-            store.audit("weekend_research", slim)
-            print(f"[scheduler] weekend research: {slim}")
+            _spawn_worker("weekend", 1800)
         except Exception as e:                  # noqa: BLE001
             store.audit("scheduler_error", {"job": "weekend_research",
                                             "error": str(e)[:300]})

@@ -216,7 +216,10 @@ neural:
   patience: 5
   max_trials_per_snapshot: 6
   max_windows_per_symbol: 500
-  max_training_windows: 250000
+  # Process-safety ceiling also enforced in code. 12k multivariate windows are
+  # sampled evenly across symbols/history; larger research uses more snapshots,
+  # not a multi-gigabyte in-memory tensor inside the operator service.
+  max_training_windows: 12000
   min_fundamental_coverage: 0.80
   walk_forward_folds: 5
   holding_min_bars: 1250

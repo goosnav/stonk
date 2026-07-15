@@ -104,6 +104,42 @@ def cmd_research(args, cfg, store):
                          indent=2, default=str))
 
 
+def cmd_worker(args, cfg, store):
+    """Internal one-shot worker used by the scheduler's process boundary."""
+    from .config import OVERRIDES_KEY
+    cfg = load_config(cfg.mode, overrides=store.kv_get(OVERRIDES_KEY, {}) or {})
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+    if args.lane == "autonomous":
+        from .research import run_next
+        result = run_next(cfg, store, max_seconds=args.max_seconds)
+    elif args.lane.startswith("operator-"):
+        from .research import run_operator_job
+        resource = args.lane.removeprefix("operator-")
+        result = run_operator_job(cfg, store, {resource})
+    elif args.lane == "news":
+        from .intelligence import recover, run_next
+        recover(store)
+        result = run_next(cfg, store)
+    elif args.lane == "weekend":
+        from datetime import datetime
+        from .backtest import run_backtest
+        report = run_backtest(cfg, years=2, tag="weekly_research")
+        result = {"window": report.get("window"), "n_trades": report.get("n_trades"),
+                  "win_rate": report.get("win_rate"), "overall": report.get("overall"),
+                  "out_of_sample_30pct": report.get("out_of_sample_30pct"),
+                  "benchmark_buy_hold_return": report.get("benchmark_buy_hold_return"),
+                  "ran_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        store.kv_set("research_report", result)
+        store.audit("weekend_research", result)
+    else:  # argparse constrains this; retain a fail-closed worker boundary.
+        raise ValueError(f"unknown worker lane {args.lane}")
+    print(json.dumps(result, default=str))
+    return 0
+
+
 def cmd_serve(args, cfg, store):
     import socket
 
@@ -228,30 +264,59 @@ def _console_api(port: int, path: str, timeout: int = 20):
 
 
 def _console_server(args, cfg, store):
-    """Attach to the local server, or quietly start it in this TUI process."""
+    """Attach to the published service, or start it through the same lock."""
     try:
         version = _console_api(args.port, "/api/version", timeout=2)
         if version.get("mode") != cfg.mode:
             raise RuntimeError(f"port {args.port} is serving {version.get('mode')} mode; "
                                f"requested {cfg.mode}")
-        return None
+        return None, args.port
     except RuntimeError:
         raise
-    except Exception:                         # no server: TUI becomes the daemon
-        import threading
+    except Exception:
+        instance = store.kv_get(f"service_instance:{cfg.mode}") or {}
+        published_port = int(instance.get("effective_port", 0) or 0)
+        published_pid = int(instance.get("pid", 0) or 0)
+        if published_port and published_pid:
+            try:
+                os.kill(published_pid, 0)
+                version = _console_api(published_port, "/api/version", timeout=2)
+                if version.get("mode") == cfg.mode:
+                    return None, published_port
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        # Starting via `serve` preserves its cross-process instance lock and
+        # atomic fallback-port publication; the TUI never owns a hidden second
+        # scheduler again.
+        import subprocess
         import time
-        import uvicorn
-        from .app import create_app
-        server = uvicorn.Server(uvicorn.Config(
-            create_app(cfg, store), host="127.0.0.1", port=args.port,
-            log_level="warning", access_log=False))
-        threading.Thread(target=server.run, daemon=True).start()
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log = (log_dir / f"tui-service-{cfg.mode}.log").open("a", encoding="utf-8")
+        server = subprocess.Popen(
+            [sys.executable, "-m", "specforge.cli", "--mode", cfg.mode,
+             "serve", "--port", str(args.port), "--port-range-end", str(args.port + 10)],
+            cwd=Path(__file__).resolve().parent.parent,
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            shell=False, start_new_session=True)
+        log.close()
         for _ in range(100):
             try:
-                _console_api(args.port, "/api/version", timeout=1)
-                return server
+                instance = store.kv_get(f"service_instance:{cfg.mode}") or {}
+                effective = int(instance.get("effective_port", 0) or args.port)
+                version = _console_api(effective, "/api/version", timeout=1)
+                if version.get("mode") == cfg.mode:
+                    return server, effective
             except Exception:
                 time.sleep(0.1)
+            if server.poll() is not None:
+                break
+        if server.poll() is None:
+            import signal
+            try:
+                os.killpg(server.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
         raise RuntimeError(f"headless server did not start on port {args.port}")
 
 
@@ -422,19 +487,19 @@ def _console_frame(port: int, color: bool) -> str:
         lines.append(D + "AI disabled, over budget, or no current commentary" + X)
 
     lines += ["", D + "Ctrl-C exits · --once prints one agent-friendly snapshot · "
-              "verbose diagnostics stay in logs/audit-live.jsonl" + X]
+              f"verbose diagnostics stay in logs/audit-{s.get('mode', 'paper')}.jsonl" + X]
     return "\n".join(lines)
 
 
 def cmd_tui(args, cfg, store):
     """Quiet operator console. Attaches to a server or becomes the daemon."""
     import time
-    server = _console_server(args, cfg, store)
+    server, effective_port = _console_server(args, cfg, store)
     color = bool(sys.stdout.isatty() and not args.no_color and not args.once)
     try:
         while True:
             try:
-                frame = _console_frame(args.port, color)
+                frame = _console_frame(effective_port, color)
             except Exception as e:                 # transient feed/API errors heal
                 frame = ("STONK TERMINAL · CONSOLE DEGRADED\n"
                          f"{type(e).__name__}: {e}\nretrying in {args.interval}s; "
@@ -447,7 +512,11 @@ def cmd_tui(args, cfg, store):
         pass
     finally:
         if server is not None:
-            server.should_exit = True
+            import signal
+            try:
+                os.killpg(server.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 def cmd_bridge_dump(args, cfg, store):
@@ -567,6 +636,11 @@ def main(argv=None):
     s.add_argument("--id", default="")
     s = sub.add_parser("intelligence")
     s.add_argument("--status", action="store_true", default=True)
+    s = sub.add_parser("worker", help=argparse.SUPPRESS)
+    s.add_argument("lane", choices=("autonomous", "operator-discovery",
+                                    "operator-intelligence", "operator-training",
+                                    "news", "weekend"))
+    s.add_argument("--max-seconds", type=int, default=600)
     sub.add_parser("bridge-dump")
     s = sub.add_parser("bridge-report")
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")

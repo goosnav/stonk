@@ -9,6 +9,8 @@ degrades to connected=false + the error string (fail loudly, not silently).
 from __future__ import annotations
 
 import re
+import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,8 @@ ET = ZoneInfo("America/New_York")
 # and dotted/slashed hostnames+paths (segments stay short) survive.
 # Applied to broker detail, last_error, and rollup alerts.
 _SECRETISH = [
+    re.compile(r"(?i)\bauthorization\s*[:=]\s*bearer\s+[^\s\"']+"),
+    re.compile(r"(?i)\bbearer\s+[^\s\"']+"),
     re.compile(r"(?i)(?:token|key|secret|bearer|authorization|password)"
                r"[\"'=:\s]+[^\s\"']{6,}"),
     re.compile(r"\d{7,}"),
@@ -158,7 +162,8 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
               "next_runs": next_runs or {}}
     research = store.kv_get("research_state") or {"phase": "never_ran"}
     active_research_job = store.db.execute(
-        "SELECT id,kind,status,progress,requested_at,started_at FROM research_jobs "
+        "SELECT id,kind,status,state,progress,requested_at,started_at,updated_at,"
+        "heartbeat_at,lease_expires_at,wait_reason FROM research_jobs "
         "WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,"
         "priority DESC,requested_at LIMIT 1").fetchone()
     if active_research_job:
@@ -166,6 +171,15 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
         active_research_job = dict(active_research_job)
         active_research_job["progress"] = _job_json.loads(
             active_research_job["progress"] or "{}")
+    research_phase = research.get("phase")
+    research_age = _age_s(research.get("at"))
+    training_lease = store.kv_get("research_worker_lease:training") or {}
+    training_lease_valid = float(training_lease.get("expires_at", 0) or 0) > time.time()
+    if training_lease_valid:
+        try:
+            os.kill(int(str(training_lease.get("owner", "0")).split(":", 1)[0]), 0)
+        except (ValueError, ProcessLookupError, PermissionError):
+            training_lease_valid = False
     if scheduler_alive is False:
         operational_state = "offline"
         operational_detail = "scheduler is not running"
@@ -178,7 +192,8 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
     elif active_research_job and active_research_job.get("status") == "running":
         operational_state = "researching"
         operational_detail = f"{active_research_job['kind']} is running"
-    elif research.get("phase") not in ("idle", "caught_up", "never_ran"):
+    elif research_phase not in ("idle", "waiting", "caught_up", "never_ran", "error") \
+            and research_age < 20 * 60 and training_lease_valid:
         operational_state = "researching"
         operational_detail = research.get("detail") or "closed-market research is running"
     else:
@@ -188,6 +203,22 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
                   operational_detail=operational_detail,
                   research_state=research,
                   active_research_job=active_research_job)
+    autonomous_active = (research_phase not in
+                         (None, "idle", "waiting", "caught_up", "never_ran", "error")
+                         and research_age < 20 * 60 and training_lease_valid)
+    if active_research_job and active_research_job.get("status") == "running":
+        research_worker_state = "running"
+    elif autonomous_active:
+        research_worker_state = "running"
+    elif active_research_job:
+        research_worker_state = ("waiting" if active_research_job.get("wait_reason")
+                                 else "queued")
+    elif research_phase == "error":
+        research_worker_state = "failed"
+    elif research_age >= 20 * 60 and research_phase not in (None, "caught_up", "never_ran"):
+        research_worker_state = "stale"
+    else:
+        research_worker_state = "idle"
 
     bench = cfg.get("universe", "benchmark", default="SPY")
     newest = store.latest_bar_date(bench)
@@ -288,7 +319,7 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
                # market-safe operator job can be running while the trading
                # loop remains the top-level operational state, so do not
                # derive this label from operational_state.
-               "state": "running" if active_research_job else "idle",
+               "state": research_worker_state,
                "detail": research.get("detail") or operational_detail,
                "phase": research.get("phase"),
                "active_job": active_research_job,

@@ -860,21 +860,24 @@ def run_operator_job(cfg, store, resource_classes: set[str] | None = None) -> di
             # Provider calls and a single Torch epoch may legitimately run
             # longer than the lease. Renew independently of progress callbacks
             # so another process can never steal a healthy atomic unit.
-            while not heartbeat_stop.wait(max(10, LEASE_SECONDS // 3)):
-                if not _renew_lease(store, lease_owner, resource, LEASE_SECONDS):
-                    lease_lost.set()
-                    return
-                heartbeat = _iso_now()
-                lease = (datetime.now().astimezone() + timedelta(
-                    seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
-                try:
-                    with store.db:
-                        store.db.execute(
-                            "UPDATE research_jobs SET heartbeat_at=?,lease_expires_at=?,"
-                            "updated_at=? WHERE id=? AND status='running' AND worker_id=?",
-                            (heartbeat, lease, heartbeat, jid, worker))
-                except Exception:
-                    pass
+            try:
+                while not heartbeat_stop.wait(max(10, LEASE_SECONDS // 3)):
+                    if not _renew_lease(store, lease_owner, resource, LEASE_SECONDS):
+                        lease_lost.set()
+                        return
+                    heartbeat = _iso_now()
+                    lease = (datetime.now().astimezone() + timedelta(
+                        seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
+                    try:
+                        with store.db:
+                            store.db.execute(
+                                "UPDATE research_jobs SET heartbeat_at=?,lease_expires_at=?,"
+                                "updated_at=? WHERE id=? AND status='running' AND worker_id=?",
+                                (heartbeat, lease, heartbeat, jid, worker))
+                    except Exception:
+                        pass
+            finally:
+                store.close_thread_connection()
         heartbeat_thread = threading.Thread(
             target=heartbeat_loop, name=f"stonk-{resource}-heartbeat", daemon=True)
         heartbeat_thread.start()
@@ -950,6 +953,10 @@ def run_operator_job(cfg, store, resource_classes: set[str] | None = None) -> di
                          timespec="seconds"), _iso_now(), jid, worker)).rowcount
             if not updated:
                 raise InterruptedError("job ownership changed before wait commit")
+            _stamp(store, "waiting", f"{kind} waiting: "
+                   f"{result.get('reason', 'dependency not ready')}",
+                   job={"id": jid, "kind": kind, "status": "queued",
+                        "state": "waiting_dependency", "progress": current_progress})
             return {"job": jid, "kind": kind, **result}
         coarse = "completed" if result_status == "completed" else "partial"
         state = "succeeded" if coarse == "completed" else "succeeded_with_warnings"

@@ -29,6 +29,23 @@ def test_full_paper_cycle_and_audit_reconstruction(cfg, store):
     assert summary["budget_used"] <= summary["budget"] + 1e-6
 
 
+def test_noop_cycle_reuses_account_snapshot(cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+
+    broker = PaperBroker(cfg, store)
+    original = broker.get_account
+    calls = 0
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(broker, "get_account", counted)
+    run_cycle(cfg, store, broker=broker, refresh_data=False, registry={})
+    assert calls <= 2
+
+
 def test_broker_block_halts_remaining_entry_batch(cfg, store, monkeypatch):
     from datetime import datetime
     from specforge.models import AccountState, OrderReview, SignalEvent
@@ -261,6 +278,25 @@ def test_operator_console_frame_is_quiet_and_informative(monkeypatch):
     assert "rh_mcp_call" not in frame
 
 
+def test_console_attaches_to_published_fallback_service(cfg, store, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from specforge import cli
+
+    store.kv_set("service_instance:paper", {
+        "pid": os.getpid(), "effective_port": 8423, "token": "fixture"})
+
+    def api(port, path, timeout=20):
+        if port == 8420:
+            raise OSError("preferred port occupied")
+        assert port == 8423 and path == "/api/version"
+        return {"mode": "paper"}
+
+    monkeypatch.setattr(cli, "_console_api", api)
+    server, port = cli._console_server(SimpleNamespace(port=8420), cfg, store)
+    assert server is None and port == 8423
+
+
 def test_registry_skips_unimplemented_nodes(cfg):
     cfg.data["nodes"]["nonexistent_node"] = {"enabled": True, "weight": 0.5}
     reg = build_registry(cfg)
@@ -413,6 +449,12 @@ def test_ai_provider_endpoint_never_leaks_key(cfg, store, tmp_path, monkeypatch)
     # bad base_url rejected
     assert client.post("/api/ai/provider",
                        json={"provider": "custom", "base_url": "ftp://x"}).status_code == 400
+    before = (tmp_path / ".env").read_text()
+    invalid = client.post("/api/ai/provider", json={
+        "provider": "custom", "base_url": "https://models.example/v1",
+        "api_key": "bad\nLIVE_TRADING_ENABLED=1"})
+    assert invalid.status_code == 400
+    assert (tmp_path / ".env").read_text() == before
 
 
 def test_portfolio_value_and_steering_endpoints(cfg, store):

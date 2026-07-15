@@ -211,6 +211,8 @@ def test_waiting_job_backs_off_without_consuming_attempts(cfg, store, monkeypatc
     row = store.db.execute("SELECT attempts,next_retry_at FROM research_jobs WHERE id=?",
                            (job["id"],)).fetchone()
     assert row["attempts"] == 1 and row["next_retry_at"]
+    state = store.kv_get("research_state")
+    assert state["phase"] == "waiting" and "more data" in state["detail"]
     assert run_operator_job(cfg, store) is None
     assert store.db.execute("SELECT attempts FROM research_jobs WHERE id=?",
                             (job["id"],)).fetchone()["attempts"] == 1

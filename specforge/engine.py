@@ -198,7 +198,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                          mode=source, live_px=live_px)
 
     # 5. human-approved intents from the queue
-    account = broker.get_account()
+    if reconciled or exits:
+        account = broker.get_account()
     cycle = CycleState(governor.cycle_budget(account, reg.deployment_multiplier))
     store.audit("cycle_budget", {"budget": cycle.budget,
                                  "regime_mult": reg.deployment_multiplier}, cycle_id)
@@ -207,6 +208,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # placement; the deterministic ensemble is the proven fallback.
     approvals = executor.process_approval_queue(
         account, ctx, cycle, cycle_id, reg.regime)
+    if approvals:
+        account = broker.get_account()
 
     # 6. signals (AI client injected for ai-flagged nodes; they degrade to
     #    silence when it's disabled/over budget)
@@ -301,7 +304,6 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     candidates = [c for c in candidates if c.expected_return > 0]
 
     st("sizing", f"{len(candidates)} candidates → position sizing")
-    account = broker.get_account()             # refresh after exits
     rebalance = {"weights": {}, "actual_weights": {}, "target_weights": {},
                  "sells": [], "buys": [], "deferred_sells": [], "turnover": 0,
                  "turnover_cap": account.equity * .30}
@@ -319,7 +321,10 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         sell["result"] = executor.execute_exit(
             sell["position"], price, reason, account, cycle_id, reg.regime,
             qty=sell["qty"])
-    account = broker.get_account()         # only confirmed proceeds may fund buys
+    if rebalance["sells"]:
+        # Only a broker refresh after the sell attempts may expose confirmed
+        # proceeds; a theoretical target is never cash.
+        account = broker.get_account()
     targets = portfolio_mod.fit_to_capacity(
         rebalance["buys"], account, cfg, cycle.budget_left)
     store.audit("rebalance_plan", {
@@ -386,7 +391,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # so the P&L chart populates even when no dashboard is open; realized from
     # closed trades + unrealized at current marks — deposit-independent)
     st("mark", "stamping equity + net P&L")
-    account = broker.get_account()
+    if entry_results and not any(status == "filled" for status in entry_results.values()):
+        account = broker.get_account()
     store.record_equity(account.equity, account.cash, source, d=ctx.as_of)
     if refresh_data:                        # live/paper scans only, not backtests
         realized = store.db.execute(

@@ -12,6 +12,20 @@ from specforge import intelligence, strategy
 from specforge.app import create_app
 
 
+def test_expired_orphan_intelligence_job_recovers_on_regular_poll(cfg, store, monkeypatch):
+    job = intelligence.enqueue(store, "news_refresh")
+    with store.db:
+        store.db.execute("UPDATE intelligence_jobs SET status='running',attempts=1 "
+                         "WHERE id=?", (job["id"],))
+    store.kv_set("research_worker_lease:intelligence", {
+        "owner": "dead-worker", "expires_at": 0})
+    monkeypatch.setattr(intelligence, "refresh_news",
+                        lambda *_args, **_kwargs: {"status": "completed", "available": 0})
+    result = intelligence.run_next(cfg, store)
+    assert result["status"] == "completed"
+    assert intelligence.get_job(store, job["id"])["attempts"] == 2
+
+
 def test_codex_stdin_primary_then_claude_fallback(cfg, store, monkeypatch):
     cfg.data["intelligence"] = {
         "enabled": True, "default_provider": "codex",

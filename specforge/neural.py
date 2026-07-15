@@ -45,9 +45,25 @@ TRIAL_SPECS = (
     {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08},
 )
 
+# A 60 x 44 float32 window is roughly 10 KiB before targets, masks, and
+# framework tensors.  Accepting the historical 250k-window setting can
+# therefore consume several GiB while the live service is still resident.
+# This is a process-safety ceiling, not a tuning knob: configuration may lower
+# it, but cannot raise it without a reviewed code change.
+SAFE_MAX_TRAINING_WINDOWS = 12_000
+
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash a checkpoint without duplicating the entire artifact in memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _path(cfg, symbol: str | None = None, challenger: bool = False,
@@ -303,7 +319,18 @@ def _features(b: pd.DataFrame, spy: pd.DataFrame, vix: pd.DataFrame,
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -> dict:
+def _training_window_limit(cfg) -> int:
+    requested = int(cfg.get("neural", "max_training_windows", default=12_000))
+    return max(100, min(requested, SAFE_MAX_TRAINING_WINDOWS))
+
+
+def _dataset_should_yield(deadline: float | None, cancelled) -> bool:
+    return bool((deadline is not None and time.monotonic() >= deadline) or
+                (cancelled is not None and cancelled()))
+
+
+def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
+                  *, deadline: float | None = None, cancelled=None) -> dict:
     window = int(cfg.get("neural", "input_sessions", default=60))
     horizons = tuple(cfg.get("neural", "horizons", default=[5, 21]))
     since = cfg.get("neural", "train_since", default="2011-01-01")
@@ -322,10 +349,13 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -
     if len(spy) < window + max(horizons) + 100:
         return {"error": "not enough benchmark history"}
     X, Y, dates, owners = [], [], [], []
+    window_limit = _training_window_limit(cfg)
     per_symbol_cap = min(int(cfg.get("neural", "max_windows_per_symbol", default=500)),
-                         max(20, int(cfg.get("neural", "max_training_windows",
-                                            default=250_000)) // max(1, len(symbols))))
+                         max(1, window_limit // max(1, len(symbols))))
     for symbol_index, sym in enumerate(symbols, 1):
+        if _dataset_should_yield(deadline, cancelled):
+            return {"status": "yielded", "reason": "dataset build deadline reached",
+                    "windows_built": len(X), "symbols_completed": symbol_index - 1}
         if progress:
             progress({"phase": "dataset", "symbol": sym, "index": symbol_index,
                       "total": len(symbols),
@@ -352,7 +382,13 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -
         if len(indices) > per_symbol_cap:
             indices = indices[np.linspace(0, len(indices) - 1,
                                           per_symbol_cap, dtype=int)]
-        for i in indices:
+        remaining = window_limit - len(X)
+        if remaining <= 0:
+            break
+        for offset, i in enumerate(indices[:remaining]):
+            if offset % 128 == 0 and _dataset_should_yield(deadline, cancelled):
+                return {"status": "yielded", "reason": "dataset build deadline reached",
+                        "windows_built": len(X), "symbols_completed": symbol_index - 1}
             X.append(vals[i - window + 1:i + 1])
             Y.append(yvals[i]); dates.append(f.index[i]); owners.append(sym)
     if len(X) < 100:
@@ -377,8 +413,11 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None) -
     mean = X[masks["train"]].mean((0, 1), keepdims=True)
     std = X[masks["train"]].std((0, 1), keepdims=True) + 1e-6
     target_scale = np.maximum(Y[masks["train"]].std(axis=0), .005).astype(np.float32)
-    X = (X - mean) / std
-    return {"X": X.astype(np.float32), "Y": Y, "dates": d,
+    # Normalize the already-owned float32 array in place.  The prior expression
+    # allocated another full dataset-sized array at peak memory.
+    np.subtract(X, mean, out=X)
+    np.divide(X, std, out=X)
+    return {"X": X, "Y": Y, "dates": d,
             "owners": np.asarray(owners), "masks": masks,
             "mean": mean, "std": std, "horizons": horizons,
             "target_scale": target_scale,
@@ -421,17 +460,27 @@ def _make_model(n_features: int, n_horizons: int):
             temporal = self.blocks(x.transpose(1, 2))[..., -1]
             return torch.cat((temporal, self.context(x[:, -1, :])), dim=1)
 
-        def forward(self, x):
-            z = self.encoded(x)
+        def _quantiles(self, z):
             raw = torch.stack([head(z) for head in self.quantile_heads], dim=1)
             q50 = raw[..., 1]
             q10 = q50 - torch.nn.functional.softplus(raw[..., 0])
             q90 = q50 + torch.nn.functional.softplus(raw[..., 2])
             return torch.stack((q10, q50, q90), dim=-1)
 
-        def probability(self, x):
+        def _probabilities(self, z):
+            return torch.sigmoid(torch.cat(
+                [head(z) for head in self.probability_heads], dim=1))
+
+        def forward_all(self, x):
+            """Return both heads from one temporal/context encoder pass."""
             z = self.encoded(x)
-            return torch.sigmoid(torch.cat([head(z) for head in self.probability_heads], dim=1))
+            return self._quantiles(z), self._probabilities(z)
+
+        def forward(self, x):
+            return self._quantiles(self.encoded(x))
+
+        def probability(self, x):
+            return self._probabilities(self.encoded(x))
     return TCN()
 
 
@@ -479,8 +528,9 @@ def _predict_batches(model, X, indices, scale, device: str, batch_size: int = 20
     with torch.no_grad():
         for chunk in torch.as_tensor(indices).split(batch_size):
             xb = X[chunk].to(device)
-            predictions.append(model(xb).cpu().numpy())
-            probabilities.append(model.probability(xb).cpu().numpy())
+            prediction, probability = model.forward_all(xb)
+            predictions.append(prediction.cpu().numpy())
+            probabilities.append(probability.cpu().numpy())
     pred = np.concatenate(predictions) * np.asarray(scale).reshape(1, -1, 1)
     return pred, np.concatenate(probabilities)
 
@@ -632,6 +682,9 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
                           max_seconds: float | None = None) -> tuple[dict, list[tuple]]:
     """Five expanding, embargoed TCN folds before the final sealed block."""
     import torch
+    if max_seconds is not None and max_seconds <= 0:
+        return {"walk_forward_folds": 0, "folds": [],
+                **{f"median_fold_ic_{h}d": 0.0 for h in ds["horizons"]}}, []
     dates, unique = ds["dates"], sorted(set(ds["dates"]))
     trial_spec = trial_spec or TRIAL_SPECS[0]
     device = _training_device(cfg, torch)
@@ -672,10 +725,10 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
             for idx in tr[torch.randperm(len(tr))].split(512):
                 xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
                 opt.zero_grad()
-                prediction = model(xb)
+                prediction, positive_probability = model.forward_all(xb)
                 loss = _pinball(prediction, yb) + .1 * \
                     torch.nn.functional.binary_cross_entropy(
-                        model.probability(xb), (yr > 0).float())
+                        positive_probability, (yr > 0).float())
                 rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], dates[idx.numpy()])
                            for h in range(len(ds["horizons"]))) / len(ds["horizons"])
                 loss = loss + float(trial_spec["rank_weight"]) * rank
@@ -709,7 +762,7 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
 
 def train_challenger(cfg, store, symbols: list[str] | None = None,
                      symbol: str | None = None, max_seconds: int | None = None,
-                     progress=None) -> dict:
+                     progress=None, cancelled=None) -> dict:
     try:
         import torch
     except ImportError:
@@ -733,8 +786,13 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         if observed < required:
             return {"status": "waiting", "kind": "holding_tcn", "symbol": symbol,
                     "reason": f"need {required} settled observations; have {observed}"}
+    overall_deadline = (time.monotonic() + max_seconds
+                        if max_seconds is not None else None)
     ds = build_dataset(cfg, store, symbols=[symbol] if symbol else symbols,
-                       progress=progress)
+                       progress=progress, deadline=overall_deadline,
+                       cancelled=cancelled)
+    if ds.get("status") == "yielded":
+        return ds
     if "error" in ds:
         return ds
     snapshot = ds["data_as_of"]
@@ -788,7 +846,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     va = torch.from_numpy(np.flatnonzero(ds["masks"]["val"]))
     te = np.flatnonzero(ds["masks"]["test"])
     best, best_loss, stale = None, float("inf"), 0
-    started = time.time()
+    started = time.monotonic()
     max_epochs = int(cfg.get("neural", "max_epochs", default=50))
     sealed_epoch = str(market_snapshot)[:7]
     sealed_key = (f"neural_sealed_inspection_{sealed_epoch}_{MODEL_SCHEMA}_"
@@ -797,31 +855,40 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     final_trial = cap >= 5 and trials == cap - 1 and (bool(symbol) or sealed_available)
     # Preserve enough of the bounded final trial for the five chronological
     # folds; the ordinary validation challengers can use the whole budget.
-    training_seconds = max_seconds * .4 if max_seconds and final_trial else max_seconds
+    remaining_seconds = (max(0.0, overall_deadline - time.monotonic())
+                         if overall_deadline is not None else None)
+    if remaining_seconds is not None and remaining_seconds <= 0:
+        return {"status": "yielded", "reason": "training deadline reached",
+                "data_as_of": snapshot}
+    training_seconds = (remaining_seconds * .4
+                        if remaining_seconds is not None and final_trial
+                        else remaining_seconds)
     for epoch in range(max_epochs):
         model.train()
         for idx in tr[torch.randperm(len(tr))].split(512):
             xb, yb = X[idx].to(device), Y[idx].to(device)
             yr = Yraw[idx].to(device)
             opt.zero_grad()
-            prediction = model(xb)
+            prediction, positive_probability = model.forward_all(xb)
             loss = _pinball(prediction, yb) + .1 * \
                 torch.nn.functional.binary_cross_entropy(
-                    model.probability(xb), (yr > 0).float())
+                    positive_probability, (yr > 0).float())
             rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], ds["dates"][idx.numpy()])
                        for h in range(len(ds["horizons"]))) / len(ds["horizons"])
             loss = loss + float(trial_spec["rank_weight"]) * rank
             loss.backward(); opt.step()
-            if training_seconds and time.time() - started >= training_seconds:
+            if (cancelled is not None and cancelled()) or \
+                    (training_seconds and time.monotonic() - started >= training_seconds):
                 break
         model.eval()
         total_loss = total_rows = 0
         with torch.no_grad():
             for idx in va.split(2048):
                 xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
-                objective = _pinball(model(xb), yb) + .1 * \
+                prediction, positive_probability = model.forward_all(xb)
+                objective = _pinball(prediction, yb) + .1 * \
                     torch.nn.functional.binary_cross_entropy(
-                        model.probability(xb), (yr > 0).float())
+                        positive_probability, (yr > 0).float())
                 total_loss += float(objective) * len(idx)
                 total_rows += len(idx)
         val_loss = total_loss / max(1, total_rows)
@@ -835,7 +902,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                       "best_loss": round(best_loss, 6), "patience": stale,
                       "fraction": .2 + .8 * (epoch + 1) / max_epochs})
         if stale >= int(cfg.get("neural", "patience", default=5)) or \
-                (training_seconds and time.time() - started >= training_seconds):
+                (training_seconds and time.monotonic() - started >= training_seconds):
             break
     model.load_state_dict(best or model.state_dict()); model.eval()
     tournament_winner_id = None
@@ -909,7 +976,8 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     # challengers remain cheap; none can promote without these real folds.
     oos_predictions = []
     if final_trial:
-        remaining = None if max_seconds is None else max(5.0, max_seconds - (time.time() - started))
+        remaining = (None if overall_deadline is None else
+                     max(0.0, overall_deadline - time.monotonic()))
         walk_metrics, oos_predictions = _walk_forward_metrics(
             cfg, ds, trial_spec=winner_trial_spec, max_seconds=remaining)
         metrics.update(walk_metrics)
@@ -930,11 +998,12 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
             baseline_model.load_state_dict(parent["model"]); baseline_model.eval()
             raw = ds["X"] * ds["std"] + ds["mean"]
             bx = (raw - parent["mean"]) / parent["std"]
-            with torch.no_grad(): baseline_pred = baseline_model(
-                torch.from_numpy(bx[eval_idx].astype(np.float32))).numpy() * \
-                np.asarray(parent["target_scale"]).reshape(1, -1, 1)
-            with torch.no_grad(): baseline_probability = baseline_model.probability(
-                torch.from_numpy(bx[eval_idx].astype(np.float32))).numpy()
+            with torch.no_grad():
+                baseline_pred, baseline_probability = baseline_model.forward_all(
+                    torch.from_numpy(bx[eval_idx].astype(np.float32)))
+                baseline_pred = baseline_pred.numpy() * \
+                    np.asarray(parent["target_scale"]).reshape(1, -1, 1)
+                baseline_probability = baseline_probability.numpy()
             baseline_pred, _ = _apply_calibration(
                 baseline_pred, baseline_probability, parent.get("calibration"))
             metrics["global_baseline"] = _metrics(
@@ -1095,7 +1164,7 @@ def _load_checked(path: Path, expected_sha: str | None = None):
     if not path.exists():
         return None, None, "checkpoint missing"
     try:
-        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        actual_sha = _sha256_file(path)
         if expected_sha and actual_sha != expected_sha:
             return None, None, "checkpoint hash mismatch"
         payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -1120,10 +1189,30 @@ def _load(path: Path):
 
 
 def refresh_compatibility(store) -> dict:
-    """Persist checkpoint truth; legacy artifacts stay auditable but unusable."""
+    """Persist cheap checkpoint truth without importing/deserializing Torch.
+
+    Full payload validation still happens at the inference/promotion boundary.
+    Polling the Model view only needs to prove that the immutable file hash and
+    the metadata recorded when that file was created still match the running
+    schema.  This keeps a dashboard GET from loading every model into the web
+    process.
+    """
     out = {"compatible": 0, "incompatible": 0}
     for row in store.db.execute("SELECT * FROM model_runs WHERE status!='retired'").fetchall():
-        _, _, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
+        path = Path(row["checkpoint"] or "")
+        reason = None
+        if not row["checkpoint"] or not path.exists():
+            reason = "checkpoint missing"
+        elif not row["checkpoint_sha256"]:
+            reason = "checkpoint hash missing"
+        elif _sha256_file(path) != row["checkpoint_sha256"]:
+            reason = "checkpoint hash mismatch"
+        elif int(row["schema_version"] or 0) != MODEL_SCHEMA:
+            reason = f"schema {row['schema_version'] or 0} != {MODEL_SCHEMA}"
+        elif row["feature_hash"] != FEATURE_HASH:
+            reason = "feature schema mismatch"
+        elif row["architecture_hash"] != ARCHITECTURE_HASH:
+            reason = "architecture mismatch"
         incompatible = reason is not None
         status = "incompatible" if incompatible else row["status"]
         store.db.execute("UPDATE model_runs SET status=?,incompatibility_reason=? WHERE id=?",
@@ -1155,8 +1244,9 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
             continue
         with torch.no_grad():
             tensor = torch.from_numpy(x[None, ...])
-            pred = model(tensor).numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
-            probability = model.probability(tensor).numpy()[0]
+            pred, probability = model.forward_all(tensor)
+            pred = pred.numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
+            probability = probability.numpy()[0]
         pred, probability = _apply_calibration(
             pred[None, ...], probability[None, ...], payload.get("calibration"))
         pred, probability = pred[0], probability[0]
@@ -1173,8 +1263,9 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
             if hx is not None:
                 with torch.no_grad():
                     ht = torch.from_numpy(hx[None, ...])
-                    local = hm(ht).numpy()[0] * np.asarray(hp["target_scale"]).reshape(-1, 1)
-                    local_probability = hm.probability(ht).numpy()[0]
+                    local, local_probability = hm.forward_all(ht)
+                    local = local.numpy()[0] * np.asarray(hp["target_scale"]).reshape(-1, 1)
+                    local_probability = local_probability.numpy()[0]
                 local, local_probability = _apply_calibration(
                     local[None, ...], local_probability[None, ...], hp.get("calibration"))
                 local, local_probability = local[0], local_probability[0]
@@ -1209,8 +1300,9 @@ def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
             continue
         with torch.no_grad():
             tensor = torch.from_numpy(x[None, ...])
-            pred = model(tensor).numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
-            probability = model.probability(tensor).numpy()[0]
+            pred, probability = model.forward_all(tensor)
+            pred = pred.numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
+            probability = probability.numpy()[0]
         pred, probability = _apply_calibration(
             pred[None, ...], probability[None, ...], payload.get("calibration"))
         pred, probability = pred[0], probability[0]
