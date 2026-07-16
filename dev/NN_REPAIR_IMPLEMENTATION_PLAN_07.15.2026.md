@@ -67,7 +67,11 @@ Ordering follows the brief's Phase 1→5 but front-loads the three
 architecture-independent fixes so the branch improves immediately without a
 checkpoint-schema churn.
 
-### Stage A — independent honest-math fixes (no arch/schema change) ← THIS SESSION
+### Stage A — independent honest-math fixes (no arch/schema change) — DONE
+Local checkpoint commit: **`3b6c4f62adc244fd3a3ab3e9d6f8cc57f4c69090`** (225 tests green).
+Hardened in audit: strict fail-loud forecast validation (finite/horizon/
+provenance, no clamp); staggered all-offset graph metric that fails closed.
+
 - **A1** `specforge/ml/` package + `ml/schema.py`: frozen `NeuralForecast`
   contract (absolute + excess quantiles, both probabilities, provenance ids).
   Additive; nothing consumes it yet. *Check: `test_ml_schema.py` — quantile
