@@ -678,6 +678,25 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
             "ridge": _metrics(ridge, y, horizons, dates)}
 
 
+def _fold_windows(n_unique: int, folds: int, embargo: int) -> list[tuple[int, int, int]]:
+    """Expanding purged walk-forward fold index positions over `n_unique`
+    sorted sessions. Returns (train_pos, test_start_pos, test_end_pos) with a
+    HALF-OPEN test range [test_start_pos, test_end_pos): adjacent folds share no
+    session and none reach into the sealed block (>= 0.85·n). See NN_REPAIR A2.
+    """
+    initial, sealed = int(n_unique * .45), int(n_unique * .85)
+    width = max(1, (sealed - initial - embargo) // folds)
+    out: list[tuple[int, int, int]] = []
+    for fold in range(folds):
+        train_pos = initial + fold * width
+        test_start_pos = train_pos + embargo + 1
+        test_end_pos = sealed if fold == folds - 1 else min(sealed, test_start_pos + width)
+        if test_start_pos >= test_end_pos:
+            continue
+        out.append((train_pos, test_start_pos, test_end_pos))
+    return out
+
+
 def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
                           max_seconds: float | None = None) -> tuple[dict, list[tuple]]:
     """Five expanding, embargoed TCN folds before the final sealed block."""
@@ -690,19 +709,15 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
     device = _training_device(cfg, torch)
     folds = int(cfg.get("neural", "walk_forward_folds", default=5))
     embargo = max(ds["horizons"])
-    initial, sealed = int(len(unique) * .45), int(len(unique) * .85)
-    width = max(1, (sealed - initial - embargo) // folds)
+    windows = _fold_windows(len(unique), folds, embargo)
     raw = ds["X"] * ds["std"] + ds["mean"]
     results, oos = [], []
     started = time.time()
-    for fold in range(folds):
-        train_pos = initial + fold * width
-        test_start_pos = train_pos + embargo + 1
-        test_end_pos = sealed if fold == folds - 1 else min(sealed, test_start_pos + width)
-        if test_start_pos >= test_end_pos:
-            continue
+    for fold, (train_pos, test_start_pos, test_end_pos) in enumerate(windows):
         train_mask = dates <= unique[train_pos]
-        test_mask = (dates >= unique[test_start_pos]) & (dates <= unique[test_end_pos])
+        # Half-open test range [test_start_pos, test_end_pos): adjacent folds
+        # share no session and the last fold never reaches the sealed block.
+        test_mask = (dates >= unique[test_start_pos]) & (dates < unique[test_end_pos])
         mean = raw[train_mask].mean((0, 1), keepdims=True)
         std = raw[train_mask].std((0, 1), keepdims=True) + 1e-6
         X = torch.from_numpy(((raw - mean) / std).astype(np.float32))
@@ -715,7 +730,7 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
         model = _make_model(len(FEATURES), len(ds["horizons"])).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
-        remaining_folds = max(1, folds - fold)
+        remaining_folds = max(1, len(windows) - fold)
         fold_deadline = (time.time() + max(1.0, (max_seconds - (time.time() - started)) /
                          remaining_folds)) if max_seconds else None
         epochs = min(int(cfg.get("neural", "walk_forward_epochs", default=6)),

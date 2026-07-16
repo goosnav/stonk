@@ -472,6 +472,95 @@ def _daily_rank_ic(pred, truth, dates) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+# Staggered-cohort gate thresholds. Fail-closed: below these, the metric is not
+# usable as promotion evidence (it returns a negative utility instead).
+_MIN_COHORTS_PER_OFFSET = 3
+_MIN_VALID_OFFSETS = 8
+
+
+def _cohort_returns(pred_col, truth_col, fold_dates, horizon: int, cost: float,
+                    offset: int = 0, min_names: int = 8) -> list[float]:
+    """After-cost top-decile return per NON-OVERLAPPING decision date, one
+    staggered alignment starting at `offset`.
+
+    Each element is the mean h-session forward return of the top-decile picks on
+    one date, sampled every `horizon` sessions from `offset` so the forward
+    windows never overlap — the only series it is valid to compound into an
+    equity curve or a Sharpe. Compounding the per-*every*-date version (adjacent
+    windows share ~20/21 of their period) double-counts the same price move and
+    understates volatility. Cost is deducted exactly once per cohort. See
+    NN_REPAIR plan A3.
+    """
+    import numpy as np
+    fd = np.asarray(fold_dates)
+    pc, tc = np.asarray(pred_col), np.asarray(truth_col)
+    days = sorted(set(fd.tolist()))                   # sorted-unique decision dates
+    out: list[float] = []
+    for k in range(offset, len(days), horizon):       # stride = horizon → no overlap
+        m = fd == days[k]
+        if int(m.sum()) < min_names:
+            continue
+        cutoff = np.quantile(pc[m], .9)
+        out.append(float(tc[m][pc[m] >= cutoff].mean() - cost))
+    return out
+
+
+def _offset_metrics(cohort: list[float], horizon: int) -> dict | None:
+    """Annualized/Sharpe/drawdown for ONE independent cohort series, or None."""
+    import numpy as np
+    if not cohort:
+        return None
+    arr = np.asarray(cohort, dtype=float)
+    curve = np.cumprod(1 + arr)
+    drawdown = float(np.max(1 - curve / np.maximum.accumulate(curve)))
+    per_year = 252 / horizon
+    return {"annualized": float(arr.mean() * per_year),
+            "sharpe": float(arr.mean() / (arr.std() + 1e-9) * np.sqrt(per_year)),
+            "max_drawdown": drawdown, "n_cohorts": len(cohort)}
+
+
+def _staggered_portfolio_metrics(pred_col, truth_col, fold_dates, horizon: int = 21,
+                                 cost: float = .0016, min_names: int = 8,
+                                 min_cohorts: int = _MIN_COHORTS_PER_OFFSET,
+                                 min_offsets: int = _MIN_VALID_OFFSETS) -> dict:
+    """Portfolio utility over ALL `horizon` staggered non-overlapping cohort
+    alignments (offsets 0..horizon-1), aggregated by median so no single
+    arbitrary phase decides the metric.
+
+    This is an INTERIM forecast-policy diagnostic, not a production equity
+    simulation — a real same-engine policy backtest supersedes it in Stage F.
+    Fails closed: too few valid cohorts/offsets → negative utility, so no
+    promotion gate can pass on thin evidence. Returns {} only for no data.
+    """
+    import numpy as np
+    if not len(np.asarray(fold_dates)):
+        return {}
+    offsets = []
+    for off in range(horizon):
+        m = _offset_metrics(
+            _cohort_returns(pred_col, truth_col, fold_dates, horizon, cost,
+                            offset=off, min_names=min_names), horizon)
+        if m and m["n_cohorts"] >= min_cohorts:
+            offsets.append(m)
+    if len(offsets) < min_offsets:
+        return {"portfolio_utility": -1.0, "oos_sharpe": -99.0, "max_drawdown": 1.0,
+                "n_valid_offsets": len(offsets), "utility_evidence": "insufficient",
+                "utility_basis": "staggered_non_overlapping_21s_cohorts"}
+    ann = [o["annualized"] for o in offsets]
+    shp = [o["sharpe"] for o in offsets]
+    dd = [o["max_drawdown"] for o in offsets]
+    med_ann, med_dd = float(np.median(ann)), float(np.median(dd))
+    return {"portfolio_utility": round(med_ann - .5 * med_dd, 5),
+            "oos_sharpe": round(float(np.median(shp)), 4),
+            "max_drawdown": round(med_dd, 5),
+            "worst_offset_sharpe": round(float(min(shp)), 4),
+            "worst_offset_drawdown": round(float(max(dd)), 5),
+            "n_valid_offsets": len(offsets),
+            "cohorts_per_offset": [o["n_cohorts"] for o in offsets],
+            "utility_evidence": "ok",
+            "utility_basis": "staggered_non_overlapping_21s_cohorts"}
+
+
 def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
                      folds: int = 5, prune_pct: float = .01) -> tuple[dict, dict]:
     """Expanding-window topology fit with a real 21-session embargo."""
@@ -488,6 +577,7 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
     initial = max(embargo + 20, int(len(unique_dates) * .45))
     width = max(1, (len(unique_dates) - initial) // folds)
     fold_metrics = []
+    oos_pred21, oos_truth21, oos_dates = [], [], []   # pooled OOS for the portfolio metric
     for index in range(folds):
         test_start_pos = initial + index * width
         test_end_pos = len(unique_dates) if index == folds - 1 else min(
@@ -511,20 +601,8 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
             cutoff = np.quantile(pred[:, i], .9)
             extra[f"net_alpha_{h}d"] = round(
                 float(truth[pred[:, i] >= cutoff, i].mean() - .0016), 5)
-        daily = []
-        for day in np.unique(fold_dates):
-            mask = fold_dates == day
-            if mask.sum() < 8:
-                continue
-            cutoff = np.quantile(pred[mask, 1], .9)
-            daily.append(float(truth[mask, 1][pred[mask, 1] >= cutoff].mean() - .0016))
-        if daily:
-            curve = np.cumprod(1 + np.asarray(daily))
-            drawdown = float(np.max(1 - curve / np.maximum.accumulate(curve)))
-            annualized = float(np.mean(daily) * 252 / 21)
-            sharpe = float(np.mean(daily) / (np.std(daily) + 1e-9) * np.sqrt(252 / 21))
-            extra.update(portfolio_utility=round(annualized - .5 * drawdown, 5),
-                         oos_sharpe=round(sharpe, 4), max_drawdown=round(drawdown, 5))
+        oos_pred21.append(pred[:, 1]); oos_truth21.append(truth[:, 1])
+        oos_dates.append(fold_dates)
         fold_metrics.append({"fold": index + 1, "train": len(train_idx),
                              "train_end": train_last, "test_start": test_first,
                              "embargo": embargo, "embargo_unit": "sessions",
@@ -535,15 +613,17 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
                                  pred[:, 1], truth[:, 1], fold_dates), 4),
                              **extra})
     learned, metrics = fit_weights(topology, bases, targets, prune_pct=prune_pct)
+    # Portfolio utility is computed ONCE over the pooled out-of-sample span with
+    # all staggered non-overlapping cohort alignments — per-fold test spans are
+    # far too short to hold enough independent 21-session cohorts. Fails closed.
+    port = _staggered_portfolio_metrics(
+        np.concatenate(oos_pred21), np.concatenate(oos_truth21),
+        np.concatenate(oos_dates), horizon=21, cost=.0016) if oos_dates else {}
     metrics.update(walk_forward_folds=folds, folds=fold_metrics,
                    median_fold_ic_5d=round(float(np.median(
                        [f["ic_5d"] for f in fold_metrics])), 4),
                    median_fold_ic_21d=round(float(np.median(
-                       [f["ic_21d"] for f in fold_metrics])), 4),
-                   portfolio_utility=round(float(np.median(
-                       [f.get("portfolio_utility", -1) for f in fold_metrics])), 5),
-                   oos_sharpe=round(float(np.median(
-                       [f.get("oos_sharpe", -99) for f in fold_metrics])), 4))
+                       [f["ic_21d"] for f in fold_metrics])), 4), **port)
     return learned, metrics
 
 
