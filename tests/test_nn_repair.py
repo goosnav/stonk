@@ -292,3 +292,61 @@ def test_dataset_split_respects_full_horizon_embargo(cfg, store):
     embargo = max(ds["horizons"])
     assert unique.index(ds["val_start"]) - unique.index(ds["train_end"]) >= embargo
     assert unique.index(ds["test_start"]) - unique.index(ds["val_end"]) >= embargo
+
+
+# ── B1B: structured dual-output model ─────────────────────────────────────────
+
+def test_structured_output_shapes_ordering_bounds():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2).eval()
+    out = model.forward_structured(torch.randn(4, 60, len(neural.FEATURES)))
+    for q in (out.absolute_quantiles, out.excess_quantiles):
+        assert q.shape == (4, 2, 3)
+        assert torch.all(q[..., 0] <= q[..., 1]) and torch.all(q[..., 1] <= q[..., 2])
+    for p in (out.probability_absolute_edge_positive, out.probability_excess_positive):
+        assert p.shape == (4, 2)
+        assert torch.all((p >= 0) & (p <= 1))
+
+
+def test_gradients_reach_every_head():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2)
+    out = model.forward_structured(torch.randn(3, 60, len(neural.FEATURES)))
+    loss = (out.absolute_quantiles.sum() + out.excess_quantiles.sum()
+            + out.probability_absolute_edge_positive.sum()
+            + out.probability_excess_positive.sum())
+    loss.backward()
+    for name in ("absolute_quantile_heads", "excess_quantile_heads",
+                 "absolute_probability_heads", "excess_probability_heads"):
+        head = getattr(model, name)[0]
+        assert head.weight.grad is not None and torch.any(head.weight.grad != 0)
+
+
+def test_bounded_training_produces_finite_loss(cfg, store):
+    torch = pytest.importorskip("torch")
+    ds = _small_dataset(cfg, store)
+    model = neural._make_model(len(neural.FEATURES), len(ds["horizons"]))
+    X = torch.from_numpy(ds["X"]); tr = np.flatnonzero(ds["masks"]["train"])[:256]
+    Yx = torch.from_numpy(ds["Y_excess"] / ds["target_scale"])
+    Ya = torch.from_numpy(ds["Y_absolute"] / ds["target_scale_absolute"])
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(2):
+        out = model.forward_structured(X[tr])
+        loss = neural._pinball(out.excess_quantiles, Yx[tr]) + \
+            neural._pinball(out.absolute_quantiles, Ya[tr])
+        assert math.isfinite(float(loss.detach()))
+        opt.zero_grad(); loss.backward(); opt.step()
+
+
+def test_checkpoint_roundtrip_reconstructs_outputs(tmp_path):
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2).eval()
+    x = torch.randn(2, 60, len(neural.FEATURES))
+    before = model.forward_structured(x)
+    path = tmp_path / "m.pt"
+    torch.save(model.state_dict(), path)
+    reloaded = neural._make_model(len(neural.FEATURES), 2)
+    reloaded.load_state_dict(torch.load(path)); reloaded.eval()
+    after = reloaded.forward_structured(x)
+    assert torch.allclose(before.absolute_quantiles, after.absolute_quantiles, atol=1e-6)
+    assert torch.allclose(before.excess_quantiles, after.excess_quantiles, atol=1e-6)

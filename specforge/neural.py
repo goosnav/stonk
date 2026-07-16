@@ -14,11 +14,24 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
 
 from .ml import targets as ml_targets
+
+
+class NeuralModelOutput(NamedTuple):
+    """Structured dual-family model output (tensors).
+
+    absolute_quantiles / excess_quantiles: [batch, n_horizons, 3] (q10,q50,q90)
+    probability_* : [batch, n_horizons]
+    """
+    absolute_quantiles: Any
+    excess_quantiles: Any
+    probability_absolute_edge_positive: Any
+    probability_excess_positive: Any
 
 FEATURES = ["r1", "range", "gap", "volume_z", "vol21", "rsi14",
             "atr14", "breakout60", "sma50_d", "sma200_d", "spy_r1", "spy_r21",
@@ -35,7 +48,8 @@ QUANTILES = (0.1, 0.5, 0.9)
 MODEL_SCHEMA = 5
 FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
-    b"tcn-v6:conv32:k3:d1,2,4,8,16:gelu:dropout.1:context16:separate-qheads:probability:rank-loss:calibrated"
+    b"tcn-v7:conv32:k3:d1,2,4,8,16:gelu:dropout.1:context16:"
+    b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated"
 ).hexdigest()[:16]
 
 TRIAL_SPECS = (
@@ -468,36 +482,61 @@ def _make_model(n_features: int, n_horizons: int):
                                         CausalBlock(32, 32, 16))
             self.context = nn.Sequential(nn.Linear(n_features, 16), nn.GELU(),
                                          nn.Dropout(.1))
-            self.quantile_heads = nn.ModuleList(nn.Linear(48, 3)
-                                                for _ in range(n_horizons))
-            self.probability_heads = nn.ModuleList(nn.Linear(48, 1)
-                                                   for _ in range(n_horizons))
+            # Dual return families, one quantile + one probability head per
+            # horizon each. Absolute and excess are separate heads so the node
+            # can read a genuine absolute forecast, not excess reinterpreted.
+            self.excess_quantile_heads = nn.ModuleList(
+                nn.Linear(48, 3) for _ in range(n_horizons))
+            self.excess_probability_heads = nn.ModuleList(
+                nn.Linear(48, 1) for _ in range(n_horizons))
+            self.absolute_quantile_heads = nn.ModuleList(
+                nn.Linear(48, 3) for _ in range(n_horizons))
+            self.absolute_probability_heads = nn.ModuleList(
+                nn.Linear(48, 1) for _ in range(n_horizons))
 
         def encoded(self, x):
             temporal = self.blocks(x.transpose(1, 2))[..., -1]
             return torch.cat((temporal, self.context(x[:, -1, :])), dim=1)
 
-        def _quantiles(self, z):
-            raw = torch.stack([head(z) for head in self.quantile_heads], dim=1)
+        @staticmethod
+        def _quantiles(z, heads):
+            raw = torch.stack([head(z) for head in heads], dim=1)
             q50 = raw[..., 1]
             q10 = q50 - torch.nn.functional.softplus(raw[..., 0])
             q90 = q50 + torch.nn.functional.softplus(raw[..., 2])
             return torch.stack((q10, q50, q90), dim=-1)
 
-        def _probabilities(self, z):
-            return torch.sigmoid(torch.cat(
-                [head(z) for head in self.probability_heads], dim=1))
+        @staticmethod
+        def _probs(z, heads):
+            return torch.sigmoid(torch.cat([head(z) for head in heads], dim=1))
+
+        def forward_structured(self, x):
+            """Full dual-family output from one encoder pass."""
+            z = self.encoded(x)
+            return NeuralModelOutput(
+                absolute_quantiles=self._quantiles(z, self.absolute_quantile_heads),
+                excess_quantiles=self._quantiles(z, self.excess_quantile_heads),
+                probability_absolute_edge_positive=self._probs(
+                    z, self.absolute_probability_heads),
+                probability_excess_positive=self._probs(
+                    z, self.excess_probability_heads))
 
         def forward_all(self, x):
-            """Return both heads from one temporal/context encoder pass."""
+            """Legacy excess-only (quantiles, probabilities). Transitional —
+            unmigrated consumers (inference, calibration, metrics) read this
+            until B4C migrates them to forward_structured."""
             z = self.encoded(x)
-            return self._quantiles(z), self._probabilities(z)
+            return (self._quantiles(z, self.excess_quantile_heads),
+                    self._probs(z, self.excess_probability_heads))
+
+        def forward_legacy_excess(self, x):
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
 
         def forward(self, x):
-            return self._quantiles(self.encoded(x))
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
 
         def probability(self, x):
-            return self._probabilities(self.encoded(x))
+            return self._probs(self.encoded(x), self.excess_probability_heads)
     return TCN()
 
 
@@ -874,6 +913,10 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     Yraw = torch.from_numpy(ds["Y"])
     target_scale = torch.from_numpy(ds["target_scale"])
     Y = Yraw / target_scale
+    # Absolute-family supervision (added in B1B; excess path above unchanged).
+    Yraw_abs = torch.from_numpy(ds["Y_absolute"])
+    Y_abs = Yraw_abs / torch.from_numpy(ds["target_scale_absolute"])
+    rtc = float(ds["round_trip_cost"])
     tr = torch.from_numpy(np.flatnonzero(ds["masks"]["train"]))
     va = torch.from_numpy(np.flatnonzero(ds["masks"]["val"]))
     te = np.flatnonzero(ds["masks"]["test"])
@@ -900,12 +943,20 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         for idx in tr[torch.randperm(len(tr))].split(512):
             xb, yb = X[idx].to(device), Y[idx].to(device)
             yr = Yraw[idx].to(device)
+            yb_abs, yr_abs = Y_abs[idx].to(device), Yraw_abs[idx].to(device)
             opt.zero_grad()
-            prediction, positive_probability = model.forward_all(xb)
-            loss = _pinball(prediction, yb) + .1 * \
-                torch.nn.functional.binary_cross_entropy(
-                    positive_probability, (yr > 0).float())
-            rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], ds["dates"][idx.numpy()])
+            out = model.forward_structured(xb)
+            bce = torch.nn.functional.binary_cross_entropy
+            # Multi-task: absolute + excess pinball, absolute-edge + excess-positive
+            # BCE, and a date-grouped ranking loss on the EXCESS median only
+            # (ranking is a cross-sectional-selection objective; absolute is not).
+            loss = (_pinball(out.excess_quantiles, yb)
+                    + _pinball(out.absolute_quantiles, yb_abs)
+                    + .1 * bce(out.probability_excess_positive, (yr > 0).float())
+                    + .1 * bce(out.probability_absolute_edge_positive,
+                              (yr_abs > rtc).float()))
+            rank = sum(_rank_loss(out.excess_quantiles[:, h, 1], yb[:, h],
+                                  ds["dates"][idx.numpy()])
                        for h in range(len(ds["horizons"]))) / len(ds["horizons"])
             loss = loss + float(trial_spec["rank_weight"]) * rank
             loss.backward(); opt.step()
@@ -1051,6 +1102,9 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                "mean": ds["mean"], "std": ds["std"],
                "target_scale": ds["target_scale"],
+               "target_scale_absolute": ds["target_scale_absolute"],
+               "round_trip_cost": ds["round_trip_cost"],
+               "target_schema_hash": ds["target_schema_hash"],
                "calibration": calibration, "trial_spec": winner_trial_spec,
                "features": FEATURES, "horizons": ds["horizons"],
                "active_features": active_features,
