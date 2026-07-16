@@ -45,10 +45,34 @@ FEATURES = ["r1", "range", "gap", "volume_z", "vol21", "rsi14",
             "dilution", "dilution_missing", "accruals", "accruals_missing",
             "liquidity", "liquidity_missing", "news_sentiment", "news_missing"]
 QUANTILES = (0.1, 0.5, 0.9)
+
+# Feature split (B3): the temporal branch sees ONLY sequence-varying market
+# features across all 60 sessions; the context branch sees ONLY point-in-time
+# company/event state, and only from the latest session. Annual fundamentals
+# were previously fed as 60 identical copies through the TCN — meaningless
+# repetition the sequence model had to learn to ignore.
+TEMPORAL_FEATURES = ("r1", "range", "gap", "volume_z", "vol21", "rsi14",
+                     "atr14", "breakout60", "sma50_d", "sma200_d", "spy_r1",
+                     "spy_r21", "sector_relative_r21", "vix", "vix9d", "vix3m",
+                     "vix6m", "vvix", "vix_curve_9d_3m", "vix_curve_1m_3m",
+                     "implied_realized_spread", "hyg_r21", "tlt_r21",
+                     "vol_context_missing")
+CONTEXT_FEATURES = ("valuation", "valuation_missing", "event_proximity",
+                    "event_missing", "revenue_growth", "revenue_growth_missing",
+                    "operating_margin", "operating_margin_missing", "fcf_margin",
+                    "fcf_margin_missing", "debt_assets", "debt_assets_missing",
+                    "dilution", "dilution_missing", "accruals", "accruals_missing",
+                    "liquidity", "liquidity_missing", "news_sentiment",
+                    "news_missing")
+TEMPORAL_IDX = tuple(FEATURES.index(f) for f in TEMPORAL_FEATURES)
+CONTEXT_IDX = tuple(FEATURES.index(f) for f in CONTEXT_FEATURES)
+TEMPORAL_HASH = hashlib.sha256("|".join(TEMPORAL_FEATURES).encode()).hexdigest()[:16]
+CONTEXT_HASH = hashlib.sha256("|".join(CONTEXT_FEATURES).encode()).hexdigest()[:16]
+
 MODEL_SCHEMA = 5
 FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
-    b"tcn-v7:conv32:k3:d1,2,4,8,16:gelu:dropout.1:context16:"
+    b"tcn-v8:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
     b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated"
 ).hexdigest()[:16]
 
@@ -452,9 +476,12 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
             "test_start": test_start}
 
 
-def _make_model(n_features: int, n_horizons: int):
+def _make_model(n_features: int, n_horizons: int,
+                temporal_idx=None, context_idx=None):
     import torch
     import torch.nn as nn
+    temporal_idx = list(TEMPORAL_IDX if temporal_idx is None else temporal_idx)
+    context_idx = list(CONTEXT_IDX if context_idx is None else context_idx)
 
     class CausalBlock(nn.Module):
         def __init__(self, inp, out, dilation):
@@ -475,12 +502,14 @@ def _make_model(n_features: int, n_horizons: int):
             # Five dilated blocks → receptive field 1+2·(1+2+4+8+16)=63 sessions,
             # so the full 60-session window can influence the output. Three
             # blocks (d1,2,4) reached only ~15 sessions. See NN_REPAIR plan B2.
-            self.blocks = nn.Sequential(CausalBlock(n_features, 32, 1),
+            self.temporal_idx = temporal_idx
+            self.context_idx = context_idx
+            self.blocks = nn.Sequential(CausalBlock(len(temporal_idx), 32, 1),
                                         CausalBlock(32, 32, 2),
                                         CausalBlock(32, 32, 4),
                                         CausalBlock(32, 32, 8),
                                         CausalBlock(32, 32, 16))
-            self.context = nn.Sequential(nn.Linear(n_features, 16), nn.GELU(),
+            self.context = nn.Sequential(nn.Linear(len(context_idx), 16), nn.GELU(),
                                          nn.Dropout(.1))
             # Dual return families, one quantile + one probability head per
             # horizon each. Absolute and excess are separate heads so the node
@@ -495,8 +524,11 @@ def _make_model(n_features: int, n_horizons: int):
                 nn.Linear(48, 1) for _ in range(n_horizons))
 
         def encoded(self, x):
-            temporal = self.blocks(x.transpose(1, 2))[..., -1]
-            return torch.cat((temporal, self.context(x[:, -1, :])), dim=1)
+            # Temporal branch: only sequence-varying features, all sessions.
+            # Context branch: only point-in-time features, latest session.
+            temporal_in = x[:, :, self.temporal_idx].transpose(1, 2)
+            temporal = self.blocks(temporal_in)[..., -1]
+            return torch.cat((temporal, self.context(x[:, -1, self.context_idx])), dim=1)
 
         @staticmethod
         def _quantiles(z, heads):
@@ -1107,6 +1139,9 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                "target_schema_hash": ds["target_schema_hash"],
                "calibration": calibration, "trial_spec": winner_trial_spec,
                "features": FEATURES, "horizons": ds["horizons"],
+               "temporal_features": list(TEMPORAL_FEATURES),
+               "context_features": list(CONTEXT_FEATURES),
+               "temporal_hash": TEMPORAL_HASH, "context_hash": CONTEXT_HASH,
                "active_features": active_features,
                "metrics": metrics, "trained_at": _now(), "data_as_of": snapshot,
                "data_fingerprint": data_fingerprint,
@@ -1177,14 +1212,20 @@ def describe(cfg, store, symbol: str | None = None) -> dict:
         rows = store.db.execute("SELECT * FROM model_forecasts WHERE model_id=? AND symbol=? "
                                 "ORDER BY as_of DESC,horizon", (global_run["id"], symbol)).fetchall()
         forecast = [dict(r) for r in rows[:2]]
-    return {"architecture": {"type": "causal_tcn", "window": int(cfg.get(
+    return {"architecture": {"type": "causal_tcn_dual_branch", "window": int(cfg.get(
                 "neural", "input_sessions", default=60)), "blocks": [
                 {"channels": 32, "kernel": 3, "dilation": d, "activation": "GELU"}
-                for d in (1, 2, 4)], "dropout": .1,
-                "context_fusion": f"all {len(FEATURES)} current features → Linear(16) + GELU",
+                for d in (1, 2, 4, 8, 16)], "dropout": .1, "receptive_field": 63,
+                "temporal_branch": f"{len(TEMPORAL_FEATURES)} sequence features → TCN",
+                "context_branch": f"{len(CONTEXT_FEATURES)} point-in-time features "
+                                  "(latest session) → Linear(16) + GELU",
                 "target_scaling": "train-only per-horizon volatility",
-                "heads": ["5d q10/q50/q90", "21d q10/q50/q90",
-                          "5d/21d probability positive"]},
+                "return_families": list(ml_targets.RETURN_FAMILIES),
+                "heads": ["absolute 5d/21d q10/q50/q90", "excess 5d/21d q10/q50/q90",
+                          "absolute-edge 5d/21d probability",
+                          "excess-positive 5d/21d probability"]},
+            "temporal_features": list(TEMPORAL_FEATURES),
+            "context_features": list(CONTEXT_FEATURES),
             "features": FEATURES, "global": ({**dict(global_run),
                 "metrics": json.loads(global_run["metrics"] or "{}")} if global_run else None),
             "selected_forecast": forecast, "holdings": holdings}

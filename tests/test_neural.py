@@ -23,7 +23,7 @@ def test_tcn_quantiles_are_ordered():
     assert np.all(out[:, :, 1] <= out[:, :, 2])
     probability = model.probability(torch.randn(4, 60, len(neural.FEATURES))).detach().numpy()
     assert probability.shape == (4, 2) and np.all((probability >= 0) & (probability <= 1))
-    assert model.context[0].in_features == len(neural.FEATURES)
+    assert model.context[0].in_features == len(neural.CONTEXT_FEATURES)
     assert len(model.excess_quantile_heads) == 2 and len(model.excess_probability_heads) == 2
     assert len(model.absolute_quantile_heads) == 2 and len(model.absolute_probability_heads) == 2
     assert "news_sentiment" in neural.FEATURES and "dilution_missing" in neural.FEATURES

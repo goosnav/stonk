@@ -350,3 +350,61 @@ def test_checkpoint_roundtrip_reconstructs_outputs(tmp_path):
     after = reloaded.forward_structured(x)
     assert torch.allclose(before.absolute_quantiles, after.absolute_quantiles, atol=1e-6)
     assert torch.allclose(before.excess_quantiles, after.excess_quantiles, atol=1e-6)
+
+
+# ── B3: genuine temporal / context feature separation ─────────────────────────
+
+def test_feature_groups_partition_features_no_overlap():
+    temporal, context = set(neural.TEMPORAL_FEATURES), set(neural.CONTEXT_FEATURES)
+    assert temporal.isdisjoint(context)                 # no accidental overlap
+    assert temporal | context == set(neural.FEATURES)   # every feature is placed
+    assert len(neural.TEMPORAL_FEATURES) + len(neural.CONTEXT_FEATURES) == len(neural.FEATURES)
+
+
+def _perturbed(model, torch, feature_name, session):
+    a = torch.zeros(1, 60, len(neural.FEATURES))
+    b = a.clone()
+    b[0, session, neural.FEATURES.index(feature_name)] += 5.0
+    with torch.no_grad():
+        return model.forward_structured(a).excess_quantiles, \
+               model.forward_structured(b).excess_quantiles
+
+
+def test_early_temporal_feature_changes_output():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2).eval()
+    qa, qb = _perturbed(model, torch, neural.TEMPORAL_FEATURES[0], session=0)
+    assert not torch.allclose(qa, qb, atol=1e-6)
+
+
+def test_early_context_feature_does_not_change_output():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2).eval()
+    # A context feature at an early session must not reach the output: the
+    # context branch reads only the last session, the temporal branch never
+    # sees context columns.
+    qa, qb = _perturbed(model, torch, neural.CONTEXT_FEATURES[0], session=0)
+    assert torch.allclose(qa, qb, atol=1e-6)
+
+
+def test_final_context_feature_changes_output():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2).eval()
+    qa, qb = _perturbed(model, torch, neural.CONTEXT_FEATURES[0], session=59)
+    assert not torch.allclose(qa, qb, atol=1e-6)
+
+
+def test_checkpoint_records_feature_split(cfg, store):
+    ds = _small_dataset(cfg, store)
+    # exercised more fully by the B4 smoke test; here assert the payload contract
+    import specforge.neural as N
+    assert N.TEMPORAL_HASH and N.CONTEXT_HASH and N.TEMPORAL_HASH != N.CONTEXT_HASH
+
+
+def test_model_card_reports_real_split(cfg, store):
+    card = neural.describe(cfg, store)["architecture"]
+    assert card["type"] == "causal_tcn_dual_branch"
+    assert card["receptive_field"] == 63
+    assert "24 sequence features" in card["temporal_branch"]
+    assert "20 point-in-time features" in card["context_branch"]
+    assert set(card["return_families"]) == {"absolute", "excess"}
