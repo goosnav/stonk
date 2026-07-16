@@ -206,6 +206,12 @@ hypothesis:
 # refuses to trade until validation IC (embargoed holdout) clears min_val_ic.
 neural:
   enabled: true
+  # Direct bounded blend of the champion TCN into candidate scoring (Stage C1).
+  # Graph-independent; 0 with deterministic fallback when no valid champion.
+  # A value below min_blend means OFF; values above max_blend are clamped down.
+  experimental_blend: 0.15
+  min_blend: 0.05
+  max_blend: 0.40
   device: auto                     # CUDA, then Apple MPS, then bounded CPU
   checkpoint: data/models/global_tcn.pt
   holdings_dir: data/models/holdings

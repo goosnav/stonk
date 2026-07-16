@@ -289,6 +289,15 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         model_state = {**model_state, "ready": False, "effective_blend": 0.0,
                        "block_reason": f"BLOCKED: NODE {failed_nodes[0]}",
                        "failed_nodes": failed_nodes}
+    # Direct bounded neural blend (Stage C1): graph-independent, audited, zero
+    # with deterministic fallback when the model is unavailable. Reuses the
+    # forecasts the neural node already computed this cycle.
+    from .ml.policy import apply_neural_blend
+    neural_forecasts = getattr(registry.get("neural"), "last_forecasts", None) or {}
+    direct = apply_neural_blend(candidates, neural_forecasts, cfg, store, cycle_id,
+                                graph_blend=model_state["effective_blend"])
+    model_state = {**model_state, "direct_neural_blend": direct["blend"],
+                   "direct_neural_reason": direct["reason"]}
     candidates.sort(key=lambda c: c.final_score, reverse=True)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:

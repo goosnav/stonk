@@ -102,6 +102,8 @@ class TradeCandidate:
     production_score: float = 0.0
     strategy_contribution: float = 0.0
     learned_contribution: float = 0.0
+    neural_blend: float = 0.0        # direct TCN blend weight applied this cycle
+    neural_contribution: float = 0.0  # final_score − pre-blend deterministic score
     strategy_mandate_id: Optional[str] = None
     entry_mode: str = "normal"       # normal | probe
     size_multiplier: float = 1.0     # probe = 25% of otherwise computed target

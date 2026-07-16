@@ -25,6 +25,9 @@ class Node(SignalNode):
             return []                      # backtests: silent, lookahead-clean
         from .. import neural
         preds, meta = neural.predict_today(ctx.cfg, ctx.store, ctx)
+        # Stash for the engine's direct blend (ml/policy.py) — one inference
+        # pass per cycle, consumed twice.
+        self.last_forecasts, self.last_meta = preds, meta
         if not preds:
             self.degraded_reason = meta.get("silent")
             for symbol in ctx.universe:

@@ -689,3 +689,78 @@ def test_smoke_end_to_end_dual_target(cfg, store):
 
     # no network/broker/live-config mutation occurred: assertions above touched
     # only the fixture tmp DB and in-memory objects.
+
+
+# ── C1: direct bounded neural blend, graph-independent ────────────────────────
+
+def _candidate(symbol="AAA", score=0.5, horizon=21):
+    from specforge.models import TradeCandidate
+    return TradeCandidate(
+        id=f"c-{symbol}", symbol=symbol, asset_type="equity", side="buy",
+        thesis="t", final_score=score, target_notional=100.0, expected_return=0.02,
+        ci_low=-0.02, ci_high=0.06, probability_positive=0.6, expected_apr=0.1,
+        apr_ci_low=-0.1, apr_ci_high=0.3, horizon_days=horizon, max_loss=100.0,
+        contributing_nodes=["momentum"])
+
+
+def test_neural_score_negative_for_positive_excess_negative_absolute():
+    from specforge.ml.policy import neural_score
+    nf = _nf_view(-0.05, 0.05, p_abs=0.2)["21"]
+    assert neural_score(nf, 0.0016) < 0        # outperforming a crash is not a buy
+
+
+def test_neural_score_positive_and_bounded_for_real_edge():
+    from specforge.ml.policy import neural_score
+    nf = _nf_view(0.05, 0.03, p_abs=0.75, p_exc=0.7)["21"]
+    s = neural_score(nf, 0.0016)
+    assert 0 < s <= 1.0
+
+
+def test_blend_applied_exactly_once_and_attributed(cfg, store):
+    from specforge.ml.policy import apply_neural_blend
+    c = _candidate(score=0.5)
+    out = apply_neural_blend([c], {"AAA": _nf_view(0.05, 0.03, p_abs=0.75)},
+                             cfg, store, "cyc1", graph_blend=0.0)
+    assert out["blend"] == pytest.approx(0.15) and out["scored"] == 1
+    from specforge.ml.policy import neural_score
+    expected = round(0.85 * 0.5 + 0.15 * neural_score(
+        _nf_view(0.05, 0.03, p_abs=0.75)["21"], 0.0016), 4)
+    assert c.final_score == expected            # exactly once, exact formula
+    assert c.neural_blend == pytest.approx(0.15)
+    assert c.neural_contribution == pytest.approx(c.final_score - 0.5, abs=1e-6)
+    assert "neural_direct" in c.contributing_nodes
+
+
+def test_no_forecasts_means_zero_blend_and_untouched_scores(cfg, store):
+    from specforge.ml.policy import apply_neural_blend
+    c = _candidate(score=0.5)
+    out = apply_neural_blend([c], {}, cfg, store, "cyc1", graph_blend=0.0)
+    assert out["blend"] == 0.0 and "deterministic fallback" in out["reason"]
+    assert c.final_score == 0.5 and c.neural_blend == 0.0
+
+
+def test_active_graph_owns_learned_pathway_no_double_count(cfg, store):
+    from specforge.ml.policy import apply_neural_blend
+    c = _candidate(score=0.5)
+    out = apply_neural_blend([c], {"AAA": _nf_view(0.05, 0.03)}, cfg, store,
+                             "cyc1", graph_blend=0.10)
+    assert out["blend"] == 0.0 and "graph" in out["reason"]
+    assert c.final_score == 0.5                 # direct blend stood down
+
+
+def test_blend_bounds_never_silently_increased(cfg, store):
+    from specforge.ml.policy import effective_blend
+    cfg.data["neural"]["experimental_blend"] = 0.9
+    assert effective_blend(cfg, 0.0, True)[0] == pytest.approx(0.40)   # clamped down
+    cfg.data["neural"]["experimental_blend"] = 0.01
+    assert effective_blend(cfg, 0.0, True)[0] == 0.0                   # below floor = off
+    cfg.data["neural"]["experimental_blend"] = 0.15
+
+
+def test_blend_is_audited(cfg, store):
+    from specforge.ml.policy import apply_neural_blend
+    apply_neural_blend([_candidate()], {"AAA": _nf_view(0.05, 0.03)},
+                       cfg, store, "cyc-audit", graph_blend=0.0)
+    row = store.db.execute("SELECT * FROM audit WHERE event_type='neural_direct_blend' "
+                           "ORDER BY ts DESC LIMIT 1").fetchone()
+    assert row is not None and "0.15" in row["payload"]
