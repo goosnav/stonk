@@ -22,7 +22,7 @@ def _forecast(**over):
     base = dict(symbol="AAA", as_of="2026-07-15", horizon_sessions=21,
                 absolute_q10=-0.03, absolute_q50=0.01, absolute_q90=0.06,
                 excess_q10=-0.02, excess_q50=0.02, excess_q90=0.05,
-                probability_absolute_positive=0.55,
+                probability_absolute_edge_positive=0.55,
                 probability_excess_positive=0.6,
                 model_id="m1", dataset_manifest_id="d1", feature_schema_hash="h1")
     base.update(over)
@@ -61,7 +61,7 @@ def test_forecast_rejects_unordered_excess():
 
 def test_forecast_rejects_probability_below_zero():
     with pytest.raises(ValueError):
-        _forecast(probability_absolute_positive=-0.01)
+        _forecast(probability_absolute_edge_positive=-0.01)
 
 
 def test_forecast_rejects_probability_above_one():
@@ -465,3 +465,68 @@ def test_incompatible_old_checkpoint_rejected_before_inference(tmp_path):
     payload, model, reason = neural._load_checked(stale)
     assert payload is None and model is None
     assert "schema" in reason                              # fails on metadata, no load
+
+
+# ── B4B: explicit dual-family forecast persistence ────────────────────────────
+
+def _nf(symbol="AAA", horizon=5, tsh=None):
+    return NeuralForecast(
+        symbol=symbol, as_of="2026-07-15", horizon_sessions=horizon,
+        absolute_q10=-0.03, absolute_q50=0.02, absolute_q90=0.07,
+        excess_q10=-0.02, excess_q50=0.015, excess_q90=0.05,
+        probability_absolute_edge_positive=0.6, probability_excess_positive=0.58,
+        model_id="m1", dataset_manifest_id="d1", feature_schema_hash="h1")
+
+
+def test_v2_table_migrates_additively_and_keeps_v1(store):
+    from specforge.research import record_forecast_v2
+    # v1 legacy table still readable
+    store.db.execute("INSERT INTO model_forecasts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     ("old", "2020-01-01", "AAA", 5, 0, 0, 0, .5, None, None, "fh"))
+    assert store.db.execute("SELECT COUNT(*) n FROM model_forecasts").fetchone()["n"] == 1
+    # v2 table exists (additive migration on open) and starts empty
+    assert store.db.execute("SELECT COUNT(*) n FROM model_forecasts_v2").fetchone()["n"] == 0
+
+
+def test_v2_preserves_both_families_and_is_idempotent(store):
+    from specforge.research import record_forecast_v2
+    tsh = ml_targets.TARGET_SCHEMA_HASH
+    ok = record_forecast_v2(store, _nf(), model_id="m1", as_of="2026-07-15",
+                            feature_hash="fh", target_schema_hash=tsh)
+    assert ok
+    # idempotent — a second identical write does not duplicate
+    record_forecast_v2(store, _nf(), model_id="m1", as_of="2026-07-15",
+                       feature_hash="fh", target_schema_hash=tsh)
+    rows = store.db.execute("SELECT * FROM model_forecasts_v2").fetchall()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["absolute_q50"] == pytest.approx(0.02) and r["excess_q50"] == pytest.approx(0.015)
+    assert r["probability_absolute_edge_positive"] == pytest.approx(0.6)
+
+
+def test_v2_rejects_incompatible_target_hash(store):
+    from specforge.research import record_forecast_v2
+    ok = record_forecast_v2(store, _nf(), model_id="m1", as_of="2026-07-15",
+                            feature_hash="fh", target_schema_hash="not-the-current-hash")
+    assert ok is False
+    assert store.db.execute("SELECT COUNT(*) n FROM model_forecasts_v2").fetchone()["n"] == 0
+
+
+def test_v2_resolution_writes_both_realized(store):
+    from specforge.research import record_forecast_v2, resolve_forecasts_v2
+    tsh = ml_targets.TARGET_SCHEMA_HASH
+    dates = [r["d"] for r in store.db.execute(
+        "SELECT d FROM bars WHERE symbol='AAA' ORDER BY d").fetchall()]
+    as_of = dates[-30]                                     # leaves >5 future sessions
+    record_forecast_v2(store, _nf(symbol="AAA", horizon=5), model_id="m1",
+                       as_of=as_of, feature_hash="fh", target_schema_hash=tsh)
+    assert resolve_forecasts_v2(store) == 1
+    r = store.db.execute("SELECT * FROM model_forecasts_v2").fetchone()
+    assert r["resolved_at"] is not None
+    assert r["realized_absolute"] is not None and r["realized_excess"] is not None
+    # excess = absolute − benchmark forward return, same window
+    start = store.db.execute("SELECT close FROM bars WHERE symbol='AAA' AND d<=? "
+                             "ORDER BY d DESC LIMIT 1", (as_of,)).fetchone()["close"]
+    end = store.db.execute("SELECT close FROM bars WHERE symbol='AAA' AND d>? "
+                           "ORDER BY d LIMIT 5", (as_of,)).fetchall()[-1]["close"]
+    assert r["realized_absolute"] == pytest.approx(end / start - 1)

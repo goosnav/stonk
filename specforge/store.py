@@ -161,12 +161,22 @@ CREATE TABLE IF NOT EXISTS model_runs(              -- global + holding TCNs
   schema_version INTEGER DEFAULT 1, architecture_hash TEXT,
   checkpoint_sha256 TEXT, incompatibility_reason TEXT
 );
-CREATE TABLE IF NOT EXISTS model_forecasts(         -- shadow/live learning labels
+CREATE TABLE IF NOT EXISTS model_forecasts(         -- shadow/live learning labels (v1, excess-only)
   model_id TEXT, as_of TEXT, symbol TEXT, horizon INTEGER,
   q10 REAL, q50 REAL, q90 REAL, probability_positive REAL,
   resolved_at TEXT, realized_excess REAL, feature_hash TEXT,
   PRIMARY KEY(model_id, as_of, symbol, horizon)
 );
+CREATE TABLE IF NOT EXISTS model_forecasts_v2(      -- dual-family shadow/live labels (B4B)
+  model_id TEXT NOT NULL, as_of TEXT NOT NULL, symbol TEXT NOT NULL, horizon INTEGER NOT NULL,
+  absolute_q10 REAL NOT NULL, absolute_q50 REAL NOT NULL, absolute_q90 REAL NOT NULL,
+  excess_q10 REAL NOT NULL, excess_q50 REAL NOT NULL, excess_q90 REAL NOT NULL,
+  probability_absolute_edge_positive REAL NOT NULL, probability_excess_positive REAL NOT NULL,
+  resolved_at TEXT, realized_absolute REAL, realized_excess REAL,
+  feature_hash TEXT NOT NULL, target_schema_hash TEXT NOT NULL, dataset_manifest_id TEXT,
+  PRIMARY KEY(model_id, as_of, symbol, horizon)
+);
+CREATE INDEX IF NOT EXISTS idx_forecasts_v2_unresolved ON model_forecasts_v2(resolved_at, horizon);
 CREATE TABLE IF NOT EXISTS research_jobs(            -- durable operator/autonomous work
   id TEXT PRIMARY KEY, kind TEXT, status TEXT, priority INTEGER DEFAULT 0,
   requested_at TEXT, started_at TEXT, completed_at TEXT,

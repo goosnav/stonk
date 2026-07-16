@@ -35,8 +35,8 @@ class NeuralForecast:
     excess_q50: float
     excess_q90: float
 
-    probability_absolute_positive: float
-    probability_excess_positive: float
+    probability_absolute_edge_positive: float   # P(absolute return > round-trip cost)
+    probability_excess_positive: float           # P(excess return > 0)
 
     model_id: str
     dataset_manifest_id: str
@@ -54,7 +54,7 @@ class NeuralForecast:
             "excess_q50": self.excess_q50, "excess_q90": self.excess_q90,
         }
         probabilities = {
-            "probability_absolute_positive": self.probability_absolute_positive,
+            "probability_absolute_edge_positive": self.probability_absolute_edge_positive,
             "probability_excess_positive": self.probability_excess_positive,
         }
         for name, value in {**quantiles, **probabilities}.items():

@@ -1058,6 +1058,62 @@ def resolve_forecasts(store) -> int:
     return resolved
 
 
+def record_forecast_v2(store, forecast, *, model_id, as_of, feature_hash,
+                       target_schema_hash, dataset_manifest_id=None) -> bool:
+    """Idempotent write of one dual-family NeuralForecast to model_forecasts_v2.
+
+    Refuses to write when the producing model's target schema does not match the
+    running contract — an incompatible model must not pollute the label store.
+    Legacy `model_forecasts` (v1) is never touched. Returns False on refusal.
+    """
+    from .ml import targets as ml_targets
+    if target_schema_hash != ml_targets.TARGET_SCHEMA_HASH:
+        return False
+    store.db.execute(
+        "INSERT OR IGNORE INTO model_forecasts_v2 VALUES"
+        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (model_id, as_of, forecast.symbol, int(forecast.horizon_sessions),
+         forecast.absolute_q10, forecast.absolute_q50, forecast.absolute_q90,
+         forecast.excess_q10, forecast.excess_q50, forecast.excess_q90,
+         forecast.probability_absolute_edge_positive, forecast.probability_excess_positive,
+         None, None, None, feature_hash, target_schema_hash, dataset_manifest_id))
+    return True
+
+
+def resolve_forecasts_v2(store) -> int:
+    """Resolve matured dual-family forecasts, computing realized_absolute AND
+    realized_excess from the identical start and end sessions."""
+    rows = store.db.execute(
+        "SELECT * FROM model_forecasts_v2 WHERE resolved_at IS NULL ORDER BY as_of LIMIT 5000"
+    ).fetchall()
+    resolved = 0
+    for r in rows:
+        future = store.db.execute(
+            "SELECT d,close FROM bars WHERE symbol=? AND d>? ORDER BY d LIMIT ?",
+            (r["symbol"], r["as_of"], r["horizon"])).fetchall()
+        bench = store.db.execute(
+            "SELECT d,close FROM bars WHERE symbol='SPY' AND d>? ORDER BY d LIMIT ?",
+            (r["as_of"], r["horizon"])).fetchall()
+        start = store.db.execute("SELECT close FROM bars WHERE symbol=? AND d<=? "
+                                 "ORDER BY d DESC LIMIT 1", (r["symbol"], r["as_of"])).fetchone()
+        bstart = store.db.execute("SELECT close FROM bars WHERE symbol='SPY' AND d<=? "
+                                  "ORDER BY d DESC LIMIT 1", (r["as_of"],)).fetchone()
+        if len(future) < r["horizon"] or len(bench) < r["horizon"] or not start or not bstart:
+            continue
+        realized_absolute = future[-1]["close"] / start["close"] - 1
+        realized_excess = realized_absolute - (bench[-1]["close"] / bstart["close"] - 1)
+        store.db.execute(
+            "UPDATE model_forecasts_v2 SET resolved_at=?,realized_absolute=?,realized_excess=? "
+            "WHERE model_id=? AND as_of=? AND symbol=? AND horizon=?",
+            (future[-1]["d"], realized_absolute, realized_excess,
+             r["model_id"], r["as_of"], r["symbol"], r["horizon"]))
+        resolved += 1
+    store.db.commit()
+    if resolved:
+        store.audit("shadow_forecasts_v2_resolved", {"count": resolved})
+    return resolved
+
+
 def record_shadow_forecasts(cfg, store) -> int:
     from .data import MarketContext
     from .neural import predict_run
