@@ -185,3 +185,21 @@ def test_offset_metrics_do_not_compound_overlapping_labels():
     assert m["n_cohorts"] == 3
     assert m["max_drawdown"] == 0.0
     assert math.isfinite(m["sharpe"])
+
+
+# ── B2: the earliest of 60 sessions must be able to influence the output ──────
+
+def test_tcn_receptive_field_reaches_first_session():
+    torch = pytest.importorskip("torch")
+    model = neural._make_model(len(neural.FEATURES), 2)
+    model.eval()
+    torch.manual_seed(0)
+    a = torch.randn(1, 60, len(neural.FEATURES))
+    b = a.clone()
+    b[0, 0, :] += 5.0                          # perturb ONLY the earliest session
+    with torch.no_grad():
+        qa, _ = model.forward_all(a)
+        qb, _ = model.forward_all(b)
+    # The context branch reads only the last row, so any difference here is the
+    # temporal encoder genuinely seeing session 0 (fails for a 15-session field).
+    assert not torch.allclose(qa, qb, atol=1e-6)

@@ -33,7 +33,7 @@ QUANTILES = (0.1, 0.5, 0.9)
 MODEL_SCHEMA = 5
 FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
-    b"tcn-v5:conv32:k3:d1,2,4:gelu:dropout.1:context16:separate-qheads:probability:rank-loss:calibrated"
+    b"tcn-v6:conv32:k3:d1,2,4,8,16:gelu:dropout.1:context16:separate-qheads:probability:rank-loss:calibrated"
 ).hexdigest()[:16]
 
 TRIAL_SPECS = (
@@ -446,9 +446,14 @@ def _make_model(n_features: int, n_horizons: int):
     class TCN(nn.Module):
         def __init__(self):
             super().__init__()
+            # Five dilated blocks → receptive field 1+2·(1+2+4+8+16)=63 sessions,
+            # so the full 60-session window can influence the output. Three
+            # blocks (d1,2,4) reached only ~15 sessions. See NN_REPAIR plan B2.
             self.blocks = nn.Sequential(CausalBlock(n_features, 32, 1),
                                         CausalBlock(32, 32, 2),
-                                        CausalBlock(32, 32, 4))
+                                        CausalBlock(32, 32, 4),
+                                        CausalBlock(32, 32, 8),
+                                        CausalBlock(32, 32, 16))
             self.context = nn.Sequential(nn.Linear(n_features, 16), nn.GELU(),
                                          nn.Dropout(.1))
             self.quantile_heads = nn.ModuleList(nn.Linear(48, 3)
