@@ -621,3 +621,71 @@ def test_build_neural_forecast_single_mapping():
         abs_p=[0.6, 0.55], exc_q=exc_q, exc_p=[0.58, 0.5], meta={"model_id": "m"})
     assert nf.absolute_q50 == pytest.approx(0.02) and nf.excess_q50 == pytest.approx(0.015)
     assert nf.probability_absolute_edge_positive == pytest.approx(0.6)
+
+
+# ── Bounded end-to-end smoke: dataset → train → checkpoint → inference →
+#    NeuralForecast → v2 persistence → resolution → node. Synthetic data only;
+#    no network, no broker, no production DB (fixture store is a tmp file).
+
+def test_smoke_end_to_end_dual_target(cfg, store):
+    torch = pytest.importorskip("torch")
+    import pathlib
+    from specforge.data import MarketContext
+    from specforge.research import record_forecast_v2, resolve_forecasts_v2
+
+    _long_history(store)
+    cfg.data["neural"].update(input_sessions=40, horizons=[5, 21], max_epochs=2,
+                              walk_forward_epochs=1, patience=2)
+
+    # 1) bounded training → challenger checkpoint
+    out = neural.train_challenger(cfg, store, symbols=["AAA", "BBB", "CCC"], max_seconds=25)
+    run_id = out.get("id")
+    assert run_id, out
+    row = store.db.execute("SELECT * FROM model_runs WHERE id=?", (run_id,)).fetchone()
+
+    # 2) checkpoint metadata validates + reloads
+    payload, model, reason = neural._load_checked(
+        pathlib.Path(row["checkpoint"]), row["checkpoint_sha256"])
+    assert reason is None and model is not None
+    assert payload["target_schema_hash"] == ml_targets.TARGET_SCHEMA_HASH
+    assert payload["calibration_structured"]["absolute"]["prob_threshold"] == payload["round_trip_cost"]
+
+    # 3) structured inference → typed NeuralForecast, finite, ordered, bounded
+    preds, meta = neural.predict_run(cfg, store, MarketContext(store, cfg), run_id)
+    assert preds, "structured inference produced no forecasts"
+    seen = 0
+    for hs in preds.values():
+        for nf in hs.values():
+            for v in (nf.absolute_q10, nf.absolute_q50, nf.absolute_q90,
+                      nf.excess_q10, nf.excess_q50, nf.excess_q90):
+                assert math.isfinite(v)
+            assert nf.absolute_q10 <= nf.absolute_q50 <= nf.absolute_q90
+            assert nf.excess_q10 <= nf.excess_q50 <= nf.excess_q90
+            assert 0 <= nf.probability_absolute_edge_positive <= 1
+            assert 0 <= nf.probability_excess_positive <= 1
+            seen += 1
+    assert seen > 0
+
+    # 4) v2 persistence + resolution write both realized families
+    sym, hs = next(iter(preds.items()))
+    dates = [r["d"] for r in store.db.execute(
+        "SELECT d FROM bars WHERE symbol=? ORDER BY d", (sym,)).fetchall()]
+    as_of = dates[-30]
+    for h, nf in hs.items():
+        record_forecast_v2(store, nf, model_id=run_id, as_of=as_of,
+                           feature_hash=meta["feature_hash"],
+                           target_schema_hash=meta["target_schema_hash"])
+    assert resolve_forecasts_v2(store) >= 1
+    r = store.db.execute("SELECT * FROM model_forecasts_v2 WHERE resolved_at IS NOT NULL "
+                         "LIMIT 1").fetchone()
+    assert r["realized_absolute"] is not None and r["realized_excess"] is not None
+
+    # 5) node computation via the real predict_today path (promote to champion)
+    neural.promote(cfg, store, run_id)
+    node = _neural_node(cfg)
+    events = node.compute(MarketContext(store, cfg))
+    for e in events:                                       # may be empty; never malformed
+        assert math.isfinite(e.expected_return) and e.direction in ("long", "avoid")
+
+    # no network/broker/live-config mutation occurred: assertions above touched
+    # only the fixture tmp DB and in-memory objects.
