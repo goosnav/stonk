@@ -18,6 +18,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .ml import targets as ml_targets
+
 FEATURES = ["r1", "range", "gap", "volume_z", "vol21", "rsi14",
             "atr14", "breakout60", "sma50_d", "sma200_d", "spy_r1", "spy_r21",
             "sector_relative_r21", "vix", "valuation", "valuation_missing",
@@ -348,7 +350,8 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
     sectors = {s: _bars(store, s, since) for s in sector_symbols}
     if len(spy) < window + max(horizons) + 100:
         return {"error": "not enough benchmark history"}
-    X, Y, dates, owners = [], [], [], []
+    X, Y, Y_abs, dates, owners = [], [], [], [], []
+    rtc = ml_targets.round_trip_cost(cfg)
     window_limit = _training_window_limit(cfg)
     per_symbol_cap = min(int(cfg.get("neural", "max_windows_per_symbol", default=500)),
                          max(1, window_limit // max(1, len(symbols))))
@@ -366,10 +369,12 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
         f = _features(b, spy, vix, store, sym, sectors, context)
         c = b["close"].astype(float)
         sp = spy["close"].reindex(c.index).ffill().astype(float)
-        targets = pd.DataFrame({h: (c.shift(-h) / c - 1) -
-                                    (sp.shift(-h) / sp - 1) for h in horizons})
+        # Dual targets: absolute stock return AND benchmark-excess return, same
+        # decision date and horizon. Excess reproduces the prior definition.
+        abs_df, exc_df = ml_targets.build_targets(c, spy["close"], horizons)
         vals = f[FEATURES].to_numpy(np.float32)
-        yvals = targets.to_numpy(np.float32)
+        yvals = exc_df.to_numpy(np.float32)
+        yvals_abs = abs_df.to_numpy(np.float32)
         row_valid = np.isfinite(vals).all(axis=1).astype(np.int16)
         # A window is usable only when all 60 rows and both future targets are
         # finite. Select evenly across history instead of materializing every
@@ -378,7 +383,8 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
                                mode="valid") == window
         indices = np.flatnonzero(complete) + window - 1
         indices = indices[(indices < len(f) - max(horizons)) &
-                          np.isfinite(yvals[indices]).all(axis=1)]
+                          np.isfinite(yvals[indices]).all(axis=1) &
+                          np.isfinite(yvals_abs[indices]).all(axis=1)]
         if len(indices) > per_symbol_cap:
             indices = indices[np.linspace(0, len(indices) - 1,
                                           per_symbol_cap, dtype=int)]
@@ -390,10 +396,11 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
                 return {"status": "yielded", "reason": "dataset build deadline reached",
                         "windows_built": len(X), "symbols_completed": symbol_index - 1}
             X.append(vals[i - window + 1:i + 1])
-            Y.append(yvals[i]); dates.append(f.index[i]); owners.append(sym)
+            Y.append(yvals[i]); Y_abs.append(yvals_abs[i])
+            dates.append(f.index[i]); owners.append(sym)
     if len(X) < 100:
         return {"error": f"not enough training windows ({len(X)})"}
-    X, Y = np.stack(X), np.stack(Y)
+    X, Y, Y_abs = np.stack(X), np.stack(Y), np.stack(Y_abs)
     unique = sorted(set(dates))
     if len(unique) < 180:
         return {"error": f"not enough distinct dates ({len(unique)})"}
@@ -413,14 +420,19 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
     mean = X[masks["train"]].mean((0, 1), keepdims=True)
     std = X[masks["train"]].std((0, 1), keepdims=True) + 1e-6
     target_scale = np.maximum(Y[masks["train"]].std(axis=0), .005).astype(np.float32)
+    target_scale_absolute = np.maximum(
+        Y_abs[masks["train"]].std(axis=0), .005).astype(np.float32)
     # Normalize the already-owned float32 array in place.  The prior expression
     # allocated another full dataset-sized array at peak memory.
     np.subtract(X, mean, out=X)
     np.divide(X, std, out=X)
-    return {"X": X, "Y": Y, "dates": d,
+    return {"X": X, "Y": Y, "Y_excess": Y, "Y_absolute": Y_abs, "dates": d,
             "owners": np.asarray(owners), "masks": masks,
             "mean": mean, "std": std, "horizons": horizons,
             "target_scale": target_scale,
+            "target_scale_absolute": target_scale_absolute,
+            "round_trip_cost": rtc, "cost_threshold": rtc,
+            "target_schema_hash": ml_targets.TARGET_SCHEMA_HASH,
             "data_as_of": unique[-1], "train_end": train_end,
             "val_start": val_start, "val_end": val_end,
             "test_start": test_start}

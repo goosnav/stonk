@@ -7,10 +7,12 @@ staggered all-offset portfolio metric that fails closed).
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from specforge.ml import NeuralForecast
 from specforge.ml.schema import SUPPORTED_HORIZONS
+from specforge.ml import targets as ml_targets
 from specforge import graph, neural
 
 
@@ -203,3 +205,90 @@ def test_tcn_receptive_field_reaches_first_session():
     # The context branch reads only the last row, so any difference here is the
     # temporal encoder genuinely seeing session 0 (fails for a 15-session field).
     assert not torch.allclose(qa, qb, atol=1e-6)
+
+
+# ── B1A: explicit absolute + excess target contract ───────────────────────────
+
+def test_absolute_targets_are_stock_forward_returns():
+    close = pd.Series([100.0, 101, 102, 103, 104, 105], index=range(6))
+    bench = pd.Series([100.0, 100, 100, 100, 100, 100], index=range(6))
+    absolute, excess = ml_targets.build_targets(close, bench, horizons=(5,))
+    assert absolute[5].iloc[0] == pytest.approx(105 / 100 - 1)
+    # flat benchmark → excess equals absolute
+    assert excess[5].iloc[0] == pytest.approx(absolute[5].iloc[0])
+
+
+def test_excess_targets_subtract_benchmark():
+    close = pd.Series([100.0, 0, 0, 0, 0, 110], index=range(6))
+    bench = pd.Series([100.0, 0, 0, 0, 0, 104], index=range(6))
+    absolute, excess = ml_targets.build_targets(close, bench, horizons=(5,))
+    assert absolute[5].iloc[0] == pytest.approx(0.10)
+    assert excess[5].iloc[0] == pytest.approx(0.10 - 0.04)
+
+
+def test_both_families_share_index_and_horizons():
+    close = pd.Series(np.linspace(100, 130, 40), index=range(40))
+    bench = pd.Series(np.linspace(100, 110, 40), index=range(40))
+    absolute, excess = ml_targets.build_targets(close, bench)
+    assert absolute.index.equals(excess.index)
+    assert list(absolute.columns) == list(excess.columns) == list(ml_targets.HORIZONS)
+
+
+def test_targets_are_strictly_forward_no_lookahead():
+    close = pd.Series(np.linspace(100, 130, 40), index=range(40))
+    fwd = ml_targets.forward_return(close, 5)
+    assert fwd.iloc[-5:].isna().all()          # last h rows cannot see the future
+    assert fwd.iloc[:-5].notna().all()
+
+
+def test_down_stock_beating_down_benchmark_is_not_a_long():
+    # stock -5%, benchmark -10% → absolute -5%, excess +5%
+    close = pd.Series([100.0, 0, 0, 0, 0, 95], index=range(6))
+    bench = pd.Series([100.0, 0, 0, 0, 0, 90], index=range(6))
+    absolute, excess = ml_targets.build_targets(close, bench, horizons=(5,))
+    assert absolute[5].iloc[0] == pytest.approx(-0.05)
+    assert excess[5].iloc[0] == pytest.approx(0.05)
+    cost = 0.0016
+    abs_label, exc_label = ml_targets.probability_labels(
+        absolute[5].iloc[0], excess[5].iloc[0], cost)
+    assert bool(abs_label) is False            # −5% never clears +0.16% cost
+    assert bool(exc_label) is True
+
+
+def test_round_trip_cost_matches_repo_convention(cfg):
+    # (spread 3bps + slippage 5bps) × 2 sides / 1e4 == the 0.0016 used elsewhere
+    assert ml_targets.round_trip_cost(cfg) == pytest.approx(0.0016)
+
+
+def _long_history(store):
+    from conftest import synth_bars
+    for sym in ("AAA", "BBB", "CCC", "SPY"):
+        store.upsert_bars(sym, synth_bars(n_days=700, daily_drift=.001), "test")
+    store.upsert_bars("^VIX", [{**r, "open": 15, "high": 16, "low": 14, "close": 15}
+                               for r in synth_bars(n_days=700)], "test")
+
+
+def _small_dataset(cfg, store):
+    _long_history(store)
+    cfg.data["neural"]["input_sessions"] = 40
+    cfg.data["neural"]["horizons"] = [5, 21]
+    return neural.build_dataset(cfg, store, symbols=["AAA", "BBB", "CCC"])
+
+
+def test_dataset_carries_both_target_families_and_cost(cfg, store):
+    ds = _small_dataset(cfg, store)
+    assert "error" not in ds, ds
+    assert ds["Y_absolute"].shape == ds["Y_excess"].shape
+    assert np.isfinite(ds["Y_absolute"]).all()
+    assert ds["round_trip_cost"] == pytest.approx(0.0016)
+    assert ds["target_schema_hash"] == ml_targets.TARGET_SCHEMA_HASH
+    # features and targets are disjoint arrays — no forward-looking feature names
+    assert not any(k in " ".join(neural.FEATURES) for k in ("future", "target", "fwd"))
+
+
+def test_dataset_split_respects_full_horizon_embargo(cfg, store):
+    ds = _small_dataset(cfg, store)
+    unique = sorted(set(ds["dates"]))
+    embargo = max(ds["horizons"])
+    assert unique.index(ds["val_start"]) - unique.index(ds["train_end"]) >= embargo
+    assert unique.index(ds["test_start"]) - unique.index(ds["val_end"]) >= embargo
