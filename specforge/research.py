@@ -1141,14 +1141,21 @@ def record_shadow_forecasts(cfg, store) -> int:
     if not model_id:
         return 0
     as_of = store.latest_bar_date(cfg.get("universe", "benchmark", default="SPY"))
+    fh, tsh = meta.get("feature_hash"), meta.get("target_schema_hash")
+    dmi = meta.get("dataset_manifest_id")
     n = 0
     with store.db:
         for sym, hs in preds.items():
-            for horizon, p in hs.items():
+            for horizon, nf in hs.items():
+                # v1 (excess-only) keeps the existing shadow_metrics/resolve path.
                 store.db.execute(
                     "INSERT OR IGNORE INTO model_forecasts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (model_id, as_of, sym, int(horizon), p["q10"], p["q50"], p["q90"],
-                     p["probability_positive"], None, None, None)); n += 1
+                    (model_id, as_of, sym, int(horizon), nf.excess_q10, nf.excess_q50,
+                     nf.excess_q90, nf.probability_excess_positive, None, None, fh)); n += 1
+                # v2 (dual family) records absolute + excess for honest evaluation.
+                record_forecast_v2(store, nf, model_id=model_id, as_of=as_of,
+                                   feature_hash=fh, target_schema_hash=tsh,
+                                   dataset_manifest_id=dmi)
     if n: store.audit("shadow_forecasts_recorded", {"model": model_id, "count": n})
     return n
 

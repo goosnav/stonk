@@ -1406,6 +1406,48 @@ def refresh_compatibility(store) -> dict:
     return out
 
 
+def build_neural_forecast(*, symbol, as_of, horizon, i, abs_q, abs_p, exc_q,
+                          exc_p, meta) -> "NeuralForecast":
+    """The ONE tensor-index → typed-forecast mapping. Every inference path (live,
+    shadow, tests) builds forecasts here so the absolute/excess column mapping
+    exists in exactly one place instead of being re-derived per consumer."""
+    from .ml import NeuralForecast
+    return NeuralForecast(
+        symbol=symbol, as_of=as_of, horizon_sessions=int(horizon),
+        absolute_q10=float(abs_q[i, 0]), absolute_q50=float(abs_q[i, 1]),
+        absolute_q90=float(abs_q[i, 2]),
+        excess_q10=float(exc_q[i, 0]), excess_q50=float(exc_q[i, 1]),
+        excess_q90=float(exc_q[i, 2]),
+        probability_absolute_edge_positive=float(abs_p[i]),
+        probability_excess_positive=float(exc_p[i]),
+        model_id=str(meta["model_id"]),
+        dataset_manifest_id=str(meta.get("dataset_manifest_id") or meta["model_id"]),
+        feature_schema_hash=str(meta.get("feature_hash") or FEATURE_HASH))
+
+
+def _structured_calibrated(model, x, payload, torch):
+    """(abs_q[H,3], abs_p[H], exc_q[H,3], exc_p[H]) — scaled by each family's
+    train-only volatility and calibrated with the frozen validation transform."""
+    with torch.no_grad():
+        out = model.forward_structured(torch.from_numpy(x[None, ...]))
+        abs_q = out.absolute_quantiles.numpy()[0] * np.asarray(
+            payload["target_scale_absolute"]).reshape(-1, 1)
+        abs_p = out.probability_absolute_edge_positive.numpy()[0]
+        exc_q = out.excess_quantiles.numpy()[0] * np.asarray(
+            payload["target_scale"]).reshape(-1, 1)
+        exc_p = out.probability_excess_positive.numpy()[0]
+    cal = payload.get("calibration_structured") or {}
+    abs_q, abs_p = _apply_calibration(abs_q[None], abs_p[None], cal.get("absolute"))
+    exc_q, exc_p = _apply_calibration(exc_q[None], exc_p[None], cal.get("excess"))
+    return abs_q[0], abs_p[0], exc_q[0], exc_p[0]
+
+
+def _forecast_meta(row, payload) -> dict:
+    return {"model_id": row["id"], "feature_hash": payload.get("feature_hash"),
+            "target_schema_hash": payload.get("target_schema_hash"),
+            "dataset_manifest_id": payload.get("dataset_manifest_id")}
+
+
 def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
     try:
         import torch
@@ -1421,47 +1463,31 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
     age = (datetime.now().astimezone() - datetime.fromisoformat(payload["trained_at"])).days
     if age > int(cfg.get("neural", "max_checkpoint_age_days", default=7)):
         return {}, {"silent": f"global champion stale ({age}d)"}
+    meta = {**_forecast_meta(row, payload), "checkpoint_age_days": age}
     out = {}
     for sym in ctx.universe:
         x = _latest_window(cfg, store, ctx, sym, payload)
         if x is None:
             continue
-        with torch.no_grad():
-            tensor = torch.from_numpy(x[None, ...])
-            pred, probability = model.forward_all(tensor)
-            pred = pred.numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
-            probability = probability.numpy()[0]
-        pred, probability = _apply_calibration(
-            pred[None, ...], probability[None, ...], payload.get("calibration"))
-        pred, probability = pred[0], probability[0]
-        # A validated holding champion blends within this node only.
+        abs_q, abs_p, exc_q, exc_p = _structured_calibrated(model, x, payload, torch)
+        # A validated holding champion blends within this node only (both families).
         holding_row = store.db.execute(
             "SELECT * FROM model_runs WHERE kind='holding_tcn' AND symbol=? "
             "AND status='champion' ORDER BY created_at DESC LIMIT 1", (sym,)).fetchone()
-        hp, hm = (None, None)
         if holding_row:
             hp, hm, _ = _load_checked(Path(holding_row["checkpoint"]),
                                       holding_row["checkpoint_sha256"])
-        if hp is not None:
-            hx = _latest_window(cfg, store, ctx, sym, hp)
+            hx = _latest_window(cfg, store, ctx, sym, hp) if hp is not None else None
             if hx is not None:
-                with torch.no_grad():
-                    ht = torch.from_numpy(hx[None, ...])
-                    local, local_probability = hm.forward_all(ht)
-                    local = local.numpy()[0] * np.asarray(hp["target_scale"]).reshape(-1, 1)
-                    local_probability = local_probability.numpy()[0]
-                local, local_probability = _apply_calibration(
-                    local[None, ...], local_probability[None, ...], hp.get("calibration"))
-                local, local_probability = local[0], local_probability[0]
+                ha_q, ha_p, he_q, he_p = _structured_calibrated(hm, hx, hp, torch)
                 w = float(cfg.get("neural", "holding_blend", default=0.25))
-                pred = (1 - w) * pred + w * local
-                probability = (1 - w) * probability + w * local_probability
-        out[sym] = {str(h): {"q10": float(pred[i, 0]), "q50": float(pred[i, 1]),
-                             "q90": float(pred[i, 2]),
-                             "probability_positive": float(probability[i])}
+                abs_q, abs_p = (1 - w) * abs_q + w * ha_q, (1 - w) * abs_p + w * ha_p
+                exc_q, exc_p = (1 - w) * exc_q + w * he_q, (1 - w) * exc_p + w * he_p
+        out[sym] = {str(h): build_neural_forecast(
+                        symbol=sym, as_of=ctx.as_of, horizon=h, i=i, abs_q=abs_q,
+                        abs_p=abs_p, exc_q=exc_q, exc_p=exc_p, meta=meta)
                     for i, h in enumerate(payload["horizons"])}
-    return out, {"model_id": row["id"], "metrics": json.loads(row["metrics"] or "{}"),
-                 "checkpoint_age_days": age}
+    return out, {**meta, "metrics": json.loads(row["metrics"] or "{}")}
 
 
 def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
@@ -1477,24 +1503,18 @@ def predict_run(cfg, store, ctx, run_id: str) -> tuple[dict[str, dict], dict]:
         Path(row["checkpoint"]), row["checkpoint_sha256"])
     if payload is None:
         return {}, {"silent": f"challenger checkpoint unavailable: {reason}"}
+    meta = _forecast_meta(row, payload)
     out = {}
     for sym in ctx.universe:
         x = _latest_window(cfg, store, ctx, sym, payload)
         if x is None:
             continue
-        with torch.no_grad():
-            tensor = torch.from_numpy(x[None, ...])
-            pred, probability = model.forward_all(tensor)
-            pred = pred.numpy()[0] * np.asarray(payload["target_scale"]).reshape(-1, 1)
-            probability = probability.numpy()[0]
-        pred, probability = _apply_calibration(
-            pred[None, ...], probability[None, ...], payload.get("calibration"))
-        pred, probability = pred[0], probability[0]
-        out[sym] = {str(h): {"q10": float(pred[i, 0]), "q50": float(pred[i, 1]),
-                             "q90": float(pred[i, 2]),
-                             "probability_positive": float(probability[i])}
+        abs_q, abs_p, exc_q, exc_p = _structured_calibrated(model, x, payload, torch)
+        out[sym] = {str(h): build_neural_forecast(
+                        symbol=sym, as_of=ctx.as_of, horizon=h, i=i, abs_q=abs_q,
+                        abs_p=abs_p, exc_q=exc_q, exc_p=exc_p, meta=meta)
                     for i, h in enumerate(payload["horizons"])}
-    return out, {"model_id": row["id"], "metrics": json.loads(row["metrics"] or "{}")}
+    return out, {**meta, "metrics": json.loads(row["metrics"] or "{}")}
 
 
 def shadow_metrics(store, model_id: str) -> dict:
@@ -1514,6 +1534,24 @@ def shadow_metrics(store, model_id: str) -> dict:
                                      "top_decile_alpha": round(
                                          _top_decile_alpha(pred, actual, dates), 5),
                                      "coverage": round(float(coverage), 3)}
+    # Absolute-family quality, reported separately from the excess `horizons`
+    # above (which keeps the existing promotion-gate contract).
+    v2 = store.db.execute("SELECT * FROM model_forecasts_v2 WHERE model_id=? "
+                          "AND resolved_at IS NOT NULL", (model_id,)).fetchall()
+    out["families"] = ["excess", "absolute"]
+    out["absolute"] = {}
+    for h in (5, 21):
+        hh = [r for r in v2 if r["horizon"] == h]
+        if not hh:
+            out["absolute"][str(h)] = {"n": 0}; continue
+        ap = np.asarray([r["absolute_q50"] for r in hh])
+        aa = np.asarray([r["realized_absolute"] for r in hh])
+        ad = np.asarray([r["as_of"] for r in hh])
+        acov = np.mean([(r["absolute_q10"] <= r["realized_absolute"] <= r["absolute_q90"])
+                        for r in hh])
+        out["absolute"][str(h)] = {"n": len(hh),
+                                   "ic": round(_rank_ic(ap, aa, ad), 4),
+                                   "coverage": round(float(acov), 3)}
     return out
 
 

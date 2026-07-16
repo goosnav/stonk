@@ -530,3 +530,94 @@ def test_v2_resolution_writes_both_realized(store):
     end = store.db.execute("SELECT close FROM bars WHERE symbol='AAA' AND d>? "
                            "ORDER BY d LIMIT 5", (as_of,)).fetchall()[-1]["close"]
     assert r["realized_absolute"] == pytest.approx(end / start - 1)
+
+
+# ── B4C: structured inference + consumer (node/graph) semantics ───────────────
+
+def _nf_view(abs_q50, exc_q50, p_abs=0.6, p_exc=0.6, horizon=21):
+    return {str(horizon): NeuralForecast(
+        symbol="AAA", as_of="2026-07-15", horizon_sessions=horizon,
+        absolute_q10=abs_q50 - 0.03, absolute_q50=abs_q50, absolute_q90=abs_q50 + 0.03,
+        excess_q10=exc_q50 - 0.02, excess_q50=exc_q50, excess_q90=exc_q50 + 0.02,
+        probability_absolute_edge_positive=p_abs, probability_excess_positive=p_exc,
+        model_id="m", dataset_manifest_id="d", feature_schema_hash="h")}
+
+
+class _NodeCtx:
+    offline = False
+    as_of = "2026-07-15"
+
+    def __init__(self, cfg, universe):
+        self.cfg, self.universe, self.store = cfg, universe, None
+
+    def atr_pct(self, sym):
+        return 0.02
+
+
+def _neural_node(cfg, horizon=21):
+    from specforge.nodes.neural import Node
+    n = Node({"horizon_days": horizon, "weight": 0.15, "status": "experimental"})
+    n.id = "neural"
+    return n
+
+
+def _compute_with(cfg, monkeypatch, forecasts):
+    monkeypatch.setattr(neural, "predict_today",
+                        lambda c, s, ctx: (forecasts, {"model_id": "m", "checkpoint_age_days": 1}))
+    return _neural_node(cfg).compute(_NodeCtx(cfg, list(forecasts)))
+
+
+def test_node_no_long_on_positive_excess_negative_absolute(cfg, monkeypatch):
+    # abs −5%, excess +5%: the exact case the whole migration exists to fix.
+    events = _compute_with(cfg, monkeypatch, {"AAA": _nf_view(-0.05, 0.05)})
+    assert all(e.direction != "long" for e in events)
+    assert events == []                                    # not even a misleading avoid
+
+
+def test_node_long_on_positive_absolute_edge(cfg, monkeypatch):
+    events = _compute_with(cfg, monkeypatch, {"AAA": _nf_view(0.04, 0.03, p_abs=0.7)})
+    assert len(events) == 1 and events[0].direction == "long"
+
+
+def test_node_expected_return_is_absolute_not_excess(cfg, monkeypatch):
+    e = _compute_with(cfg, monkeypatch, {"AAA": _nf_view(0.04, 0.03, p_abs=0.7)})[0]
+    assert e.expected_return == pytest.approx(0.04)         # absolute q50, not excess
+    assert e.downside_estimate == pytest.approx(0.01)       # absolute q10
+
+
+def test_node_score_and_confidence_carry_the_excess_component(cfg, monkeypatch):
+    # The graph ranks on signed_alpha = dir·|score|·confidence — both must be
+    # excess-derived so the graph uses the benchmark-relative signal.
+    e = _compute_with(cfg, monkeypatch, {"AAA": _nf_view(0.04, 0.03, p_abs=0.7, p_exc=0.65)})[0]
+    assert e.score == pytest.approx(min(1.0, 0.03 / 0.06))
+    assert e.confidence == pytest.approx(0.65, abs=1e-3)
+
+
+def test_node_evidence_reports_both_families(cfg, monkeypatch):
+    e = _compute_with(cfg, monkeypatch, {"AAA": _nf_view(0.04, 0.03, p_abs=0.7)})[0]
+    assert "abs" in e.evidence[0] and "excess" in e.evidence[0] and "cost" in e.evidence[0]
+
+
+def test_node_model_failure_yields_no_events(cfg, monkeypatch):
+    monkeypatch.setattr(neural, "predict_today", lambda *a, **k: ({}, {"silent": "no champion"}))
+    n = _neural_node(cfg)
+    assert n.compute(_NodeCtx(cfg, ["AAA"])) == []
+    assert n.degraded_reason == "no champion"
+
+
+def test_deterministic_nodes_operate_independently_of_neural(cfg):
+    from specforge.nodes.base import build_registry
+    cfg.data["nodes"]["neural"] = {"enabled": True, "weight": 0.15,
+                                   "status": "experimental", "horizon_days": 21}
+    reg = build_registry(cfg)
+    assert "momentum" in reg                               # deterministic node loads regardless
+
+
+def test_build_neural_forecast_single_mapping():
+    abs_q = np.array([[-0.03, 0.02, 0.07], [-0.05, 0.01, 0.06]])
+    exc_q = np.array([[-0.02, 0.015, 0.05], [-0.03, 0.02, 0.06]])
+    nf = neural.build_neural_forecast(
+        symbol="AAA", as_of="2026-07-15", horizon=5, i=0, abs_q=abs_q,
+        abs_p=[0.6, 0.55], exc_q=exc_q, exc_p=[0.58, 0.5], meta={"model_id": "m"})
+    assert nf.absolute_q50 == pytest.approx(0.02) and nf.excess_q50 == pytest.approx(0.015)
+    assert nf.probability_absolute_edge_positive == pytest.approx(0.6)
