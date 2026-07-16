@@ -408,3 +408,60 @@ def test_model_card_reports_real_split(cfg, store):
     assert "24 sequence features" in card["temporal_branch"]
     assert "20 point-in-time features" in card["context_branch"]
     assert set(card["return_families"]) == {"absolute", "excess"}
+
+
+# ── B4A: schema-current checkpoints and dual calibration ──────────────────────
+
+def _cal_inputs(q50=0.03, truth=0.05, n=200):
+    pred = np.zeros((n, 2, 3), dtype=float)
+    pred[:, :, 0], pred[:, :, 1], pred[:, :, 2] = q50 - 0.03, q50, q50 + 0.03
+    return pred, np.full((n, 2), 0.5), np.full((n, 2), truth)
+
+
+def test_calibration_corrects_q50_systematic_bias():
+    pred, prob, truth = _cal_inputs(q50=0.03, truth=0.05)   # q50 is 0.02 low
+    cal = neural._calibration(pred, prob, truth, prob_threshold=0.0)
+    assert cal["quantile_offsets"][0][1] == pytest.approx(0.02, abs=1e-9)
+    p2, _ = neural._apply_calibration(pred.copy(), prob.copy(), cal)
+    assert np.allclose(p2[:, 0, 1], 0.05, atol=1e-6)        # q50 now matches truth
+
+
+def test_calibration_is_a_pure_function_of_its_arguments():
+    pred, prob, truth = _cal_inputs()
+    # No hidden state / sealed outcomes: same args → identical calibration.
+    assert neural._calibration(pred, prob, truth) == neural._calibration(pred, prob, truth)
+
+
+def test_calibration_threshold_is_recorded_per_family():
+    pred, prob, truth = _cal_inputs()
+    assert neural._calibration(pred, prob, truth, 0.0)["prob_threshold"] == 0.0
+    assert neural._calibration(pred, prob, truth, 0.0016)["prob_threshold"] == 0.0016
+
+
+def test_apply_calibration_preserves_ordering_and_bounds():
+    rng = np.random.RandomState(3)
+    pred = np.sort(rng.randn(50, 2, 3) * 0.05, axis=2)
+    prob = rng.rand(50, 2)
+    cal = {"quantile_offsets": [[-0.1, 0.2, 0.3], [0.05, -0.2, -0.1]],
+           "probability_logit_offsets": [1.5, -2.0]}
+    p, q = neural._apply_calibration(pred, prob, cal)
+    assert np.all(p[:, :, 0] <= p[:, :, 1]) and np.all(p[:, :, 1] <= p[:, :, 2])
+    assert np.all((q >= 0) & (q <= 1)) and np.all(np.isfinite(q))
+
+
+def test_missing_or_malformed_calibration_is_a_safe_noop():
+    pred, prob, _ = _cal_inputs()
+    for bad in (None, {}, {"quantile_offsets": []}):
+        p, q = neural._apply_calibration(pred.copy(), prob.copy(), bad)
+        assert np.allclose(p, pred) and np.allclose(q, prob)
+
+
+def test_incompatible_old_checkpoint_rejected_before_inference(tmp_path):
+    torch = pytest.importorskip("torch")
+    stale = tmp_path / "old.pt"
+    torch.save({"schema_version": 5, "features": neural.FEATURES,
+                "feature_hash": neural.FEATURE_HASH, "horizons": (5, 21),
+                "architecture_hash": "deadbeef", "model": {}}, stale)
+    payload, model, reason = neural._load_checked(stale)
+    assert payload is None and model is None
+    assert "schema" in reason                              # fails on metadata, no load

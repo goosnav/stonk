@@ -68,7 +68,9 @@ def test_training_writes_challenger_not_champion(cfg, store, tmp_path):
     assert payload["active_features"]
     assert payload["calibration"]["quantile_offsets"]
     assert payload["trial_spec"] == neural.TRIAL_SPECS[0]
-    assert row["schema_version"] == 5
+    assert row["schema_version"] == neural.MODEL_SCHEMA
+    assert payload["calibration_structured"]["absolute"]["prob_threshold"] == payload["round_trip_cost"]
+    assert payload["target_scale_absolute"] is not None
     assert store.db.execute("SELECT COUNT(*) n FROM model_runs WHERE status='champion'").fetchone()["n"] == 0
     assert neural.train_challenger(cfg, store, symbols=["AAA", "BBB", "CCC"])["status"] == "caught_up"
     # Immutable artifact integrity is enforced before inference or promotion.

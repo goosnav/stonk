@@ -69,7 +69,7 @@ CONTEXT_IDX = tuple(FEATURES.index(f) for f in CONTEXT_FEATURES)
 TEMPORAL_HASH = hashlib.sha256("|".join(TEMPORAL_FEATURES).encode()).hexdigest()[:16]
 CONTEXT_HASH = hashlib.sha256("|".join(CONTEXT_FEATURES).encode()).hexdigest()[:16]
 
-MODEL_SCHEMA = 5
+MODEL_SCHEMA = 6           # dual-target (absolute+excess) dual-branch checkpoints
 FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
     b"tcn-v8:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
@@ -95,6 +95,19 @@ SAFE_MAX_TRAINING_WINDOWS = 12_000
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _code_commit() -> str | None:
+    """Best-effort training-code commit for checkpoint provenance; None if git
+    is unavailable. Never raises — provenance is a nice-to-have, not a gate."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=2,
+                             cwd=os.path.dirname(os.path.dirname(__file__)))
+        return out.stdout.strip()[:12] or None if out.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -623,14 +636,41 @@ def _predict_batches(model, X, indices, scale, device: str, batch_size: int = 20
     return pred, np.concatenate(probabilities)
 
 
-def _calibration(pred, probability, truth) -> dict:
-    out = {"quantile_offsets": [], "probability_logit_offsets": []}
+def _predict_structured(model, X, indices, scale_excess, scale_absolute,
+                        device: str, batch_size: int = 2048):
+    """Both return families in one pass: (abs_pred, abs_prob, exc_pred, exc_prob),
+    each unscaled by its own train-only volatility scale."""
+    import torch
+    ap, aq, ep, eq = [], [], [], []
+    model.eval()
+    with torch.no_grad():
+        for chunk in torch.as_tensor(indices).split(batch_size):
+            out = model.forward_structured(X[chunk].to(device))
+            ap.append(out.absolute_quantiles.cpu().numpy())
+            aq.append(out.probability_absolute_edge_positive.cpu().numpy())
+            ep.append(out.excess_quantiles.cpu().numpy())
+            eq.append(out.probability_excess_positive.cpu().numpy())
+    sa = np.asarray(scale_absolute).reshape(1, -1, 1)
+    se = np.asarray(scale_excess).reshape(1, -1, 1)
+    return (np.concatenate(ap) * sa, np.concatenate(aq),
+            np.concatenate(ep) * se, np.concatenate(eq))
+
+
+def _calibration(pred, probability, truth, prob_threshold: float = 0.0) -> dict:
+    """Validation-only calibration for one return family. Pure function of its
+    arguments — it never sees sealed/forward outcomes because they are not
+    passed in. Per horizon: q50 median-bias offset, q10/q90 coverage offsets,
+    and a probability logit offset toward the observed rate of exceeding
+    `prob_threshold` (0 for excess-positive, round-trip cost for absolute-edge).
+    """
+    out = {"quantile_offsets": [], "probability_logit_offsets": [],
+           "prob_threshold": float(prob_threshold)}
     for i in range(truth.shape[1]):
         out["quantile_offsets"].append([
             float(np.quantile(truth[:, i] - pred[:, i, 0], .10)),
-            0.0,
+            float(np.median(truth[:, i] - pred[:, i, 1])),   # q50 systematic bias
             float(np.quantile(truth[:, i] - pred[:, i, 2], .90))])
-        observed = np.clip((truth[:, i] > 0).mean(), 1e-4, 1 - 1e-4)
+        observed = np.clip((truth[:, i] > prob_threshold).mean(), 1e-4, 1 - 1e-4)
         expected = np.clip(probability[:, i].mean(), 1e-4, 1 - 1e-4)
         out["probability_logit_offsets"].append(float(
             np.log(observed / (1 - observed)) - np.log(expected / (1 - expected))))
@@ -1055,8 +1095,18 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     # receive the same frozen calibration without seeing their outcomes.
     validation_pred, validation_probability = _predict_batches(
         model, X, va.numpy(), ds["target_scale"], device)
-    calibration = _calibration(validation_pred, validation_probability,
-                               ds["Y"][va.numpy()])
+    # Dual-family calibration, validation rows only. The flat `calibration`
+    # stays the excess one for the legacy inference path; `calibration_structured`
+    # carries both families for the B4C structured inference migration.
+    val_abs_pred, val_abs_prob, _, _ = _predict_structured(
+        model, X, va.numpy(), ds["target_scale"], ds["target_scale_absolute"], device)
+    excess_cal = _calibration(validation_pred, validation_probability,
+                              ds["Y_excess"][va.numpy()], prob_threshold=0.0)
+    absolute_cal = _calibration(val_abs_pred, val_abs_prob,
+                                ds["Y_absolute"][va.numpy()],
+                                prob_threshold=ds["round_trip_cost"])
+    calibration = excess_cal
+    calibration_structured = {"excess": excess_cal, "absolute": absolute_cal}
     pred, probability = _predict_batches(
         model, X, eval_idx, ds["target_scale"], device)
     pred, probability = _apply_calibration(pred, probability, calibration)
@@ -1137,11 +1187,14 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                "target_scale_absolute": ds["target_scale_absolute"],
                "round_trip_cost": ds["round_trip_cost"],
                "target_schema_hash": ds["target_schema_hash"],
-               "calibration": calibration, "trial_spec": winner_trial_spec,
+               "calibration": calibration,
+               "calibration_structured": calibration_structured,
+               "trial_spec": winner_trial_spec,
                "features": FEATURES, "horizons": ds["horizons"],
                "temporal_features": list(TEMPORAL_FEATURES),
                "context_features": list(CONTEXT_FEATURES),
                "temporal_hash": TEMPORAL_HASH, "context_hash": CONTEXT_HASH,
+               "dataset_manifest_id": data_fingerprint, "code_commit": _code_commit(),
                "active_features": active_features,
                "metrics": metrics, "trained_at": _now(), "data_as_of": snapshot,
                "data_fingerprint": data_fingerprint,
@@ -1301,8 +1354,12 @@ def _load_checked(path: Path, expected_sha: str | None = None):
             return None, None, "feature schema mismatch"
         if payload.get("architecture_hash") != ARCHITECTURE_HASH:
             return None, None, "architecture mismatch"
+        if payload.get("target_schema_hash") != ml_targets.TARGET_SCHEMA_HASH:
+            return None, None, "target schema mismatch"
         if "target_scale" not in payload or len(payload["target_scale"]) != len(payload["horizons"]):
             return None, None, "target scaling metadata missing"
+        if "target_scale_absolute" not in payload:
+            return None, None, "absolute target scaling metadata missing"
         model = _make_model(len(payload["features"]), len(payload["horizons"]))
         model.load_state_dict(payload["model"]); model.eval()
         return payload, model, None
