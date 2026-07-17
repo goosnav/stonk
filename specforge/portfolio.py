@@ -210,6 +210,10 @@ def construct(candidates: list[TradeCandidate], account: AccountState,
             if scenario.get("recommended_scale", 1) < 1:
                 c.risk_flags.append(
                     f"bootstrap size ×{scenario['recommended_scale']:.2f} for drawdown")
+        # entry_mode="probe" sizing happens HERE exactly once. The rebalance
+        # path scales weights (never a construct() notional) and a candidate
+        # flows through one path per cycle, so it is never re-applied.
+        notional *= max(0.0, min(1.0, float(c.size_multiplier)))
         if notional < 5.0:
             continue
         c.target_notional = round(notional, 2)

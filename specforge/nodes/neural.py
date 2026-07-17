@@ -21,6 +21,12 @@ class Node(SignalNode):
     role = "alpha"
 
     def compute(self, ctx: MarketContext) -> list[SignalEvent]:
+        # Fail-closed forecast cache (C2 audit): cleared BEFORE anything can
+        # raise or early-return, so a prior cycle's forecasts can never leak
+        # into this cycle's blend or probe. The as_of stamp binds the stash to
+        # exactly one cycle; consumers must match it.
+        self.last_forecasts, self.last_meta = {}, {}
+        self.last_forecast_as_of = None
         if ctx.offline:
             return []                      # backtests: silent, lookahead-clean
         from .. import neural
@@ -28,6 +34,7 @@ class Node(SignalNode):
         # Stash for the engine's direct blend (ml/policy.py) — one inference
         # pass per cycle, consumed twice.
         self.last_forecasts, self.last_meta = preds, meta
+        self.last_forecast_as_of = ctx.as_of
         if not preds:
             self.degraded_reason = meta.get("silent")
             for symbol in ctx.universe:

@@ -212,6 +212,17 @@ neural:
   experimental_blend: 0.15
   min_blend: 0.05
   max_blend: 0.40
+  # Bounded neural-disagreement probe (Stage C2): at most one quarter-sized
+  # exploration position beyond the deterministic batch. Still passes the
+  # governor, cash/deployment caps, and duplicate checks like any order.
+  exploration:
+    enabled: true
+    max_open_positions: 1
+    budget_fraction: 0.20          # cap: fraction of equity a probe may use
+    size_multiplier: 0.25          # quarter of the normal calculated position
+    min_absolute_edge: 0.0075      # abs q50 − round-trip cost must clear this
+    min_probability: 0.57          # P(absolute return > cost)
+    max_uncertainty: 0.15          # abs q90 − q10 cap
   device: auto                     # CUDA, then Apple MPS, then bounded CPU
   checkpoint: data/models/global_tcn.pt
   holdings_dir: data/models/holdings

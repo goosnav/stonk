@@ -293,9 +293,16 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # with deterministic fallback when the model is unavailable. Reuses the
     # forecasts the neural node already computed this cycle.
     from .ml.policy import apply_neural_blend
-    neural_forecasts = getattr(registry.get("neural"), "last_forecasts", None) or {}
+    neural_node = registry.get("neural")
+    neural_forecasts = getattr(neural_node, "last_forecasts", None) or {}
+    neural_meta = getattr(neural_node, "last_meta", None) or {}
+    # Cycle binding (C2 audit): a stash stamped for a different as_of is stale
+    # and must be inert — fail closed to the deterministic path.
+    if getattr(neural_node, "last_forecast_as_of", None) != ctx.as_of:
+        neural_forecasts, neural_meta = {}, {}
     direct = apply_neural_blend(candidates, neural_forecasts, cfg, store, cycle_id,
-                                graph_blend=model_state["effective_blend"])
+                                graph_blend=model_state["effective_blend"],
+                                as_of=ctx.as_of, meta=neural_meta)
     model_state = {**model_state, "direct_neural_blend": direct["blend"],
                    "direct_neural_reason": direct["reason"]}
     candidates.sort(key=lambda c: c.final_score, reverse=True)
@@ -361,6 +368,16 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # deployment room, and the remaining cycle budget before sending order 1.
     requested = round(sum(n for _, n in targets), 2)
     targets = portfolio_mod.fit_to_capacity(targets, account, cfg, cycle.budget_left)
+    # 8.1 bounded neural exploration probe (Stage C2): at most one dedicated
+    # slot beyond the deterministic batch, sized once via construct() and
+    # capped by the exploration budget fraction and remaining cash headroom.
+    # The governor below remains the final authority on every limit.
+    from .ml.policy import select_exploration_probe
+    probe = select_exploration_probe(
+        candidates, targets, neural_forecasts, neural_meta, cfg, store, cycle_id,
+        account, ctx, as_of=ctx.as_of, allocated=sum(n for _, n in targets))
+    if probe:
+        targets = targets + [probe]
     store.audit("batch_allocation", {
         "requested": requested, "allocated": round(sum(n for _, n in targets), 2),
         "cash": account.cash, "buying_power": account.buying_power,

@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS positions(               -- engine-side open position
   id TEXT PRIMARY KEY, symbol TEXT, asset_type TEXT, qty REAL, avg_cost REAL,
   opened_at TEXT, horizon_days INTEGER, stop_price REAL, candidate_id TEXT,
   nodes TEXT, option_symbol TEXT, status TEXT DEFAULT 'open',  -- open|closed
-  mode TEXT DEFAULT 'paper'                          -- paper|live (shared DB)
+  mode TEXT DEFAULT 'paper',                         -- paper|live (shared DB)
+  entry_mode TEXT DEFAULT 'normal'                   -- normal|probe (durable, C2)
 );
 CREATE TABLE IF NOT EXISTS trades(                  -- closed round-trips (+ backtest analogs)
   id TEXT PRIMARY KEY, symbol TEXT, asset_type TEXT,
@@ -266,6 +267,14 @@ class Store:
         # migration for DBs created before positions.mode existed
         try:
             self.db.execute("ALTER TABLE positions ADD COLUMN mode TEXT DEFAULT 'paper'")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass    # column already there
+        # migration for DBs created before positions.entry_mode existed (C2:
+        # durable probe identity — never inferred through audit joins)
+        try:
+            self.db.execute(
+                "ALTER TABLE positions ADD COLUMN entry_mode TEXT DEFAULT 'normal'")
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
@@ -681,11 +690,12 @@ class Store:
             self.db.commit()
             return
         self.db.execute(
-            "INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, p["symbol"], p["asset_type"], p["qty"], p["avg_cost"], p["opened_at"],
              p["horizon_days"], p["stop_price"], p.get("candidate_id", ""),
              json.dumps(p.get("nodes", [])), p.get("option_symbol"),
-             p.get("status", "open"), p.get("mode", "paper")))
+             p.get("status", "open"), p.get("mode", "paper"),
+             p.get("entry_mode", "normal")))
         self.db.commit()
 
     def close_position(self, pid: str) -> None:

@@ -152,7 +152,8 @@ class Executor:
                 "horizon_days": cand.horizon_days, "stop_price": stop,
                 "candidate_id": cand.id, "nodes": cand.contributing_nodes,
                 "option_symbol": intent.option_symbol, "status": "open",
-                "mode": self.mode})
+                "mode": self.mode,
+                "entry_mode": getattr(cand, "entry_mode", "normal")})
         return "filled"
 
     def execute_exit(self, position: dict, last_price: float, reason: str,
@@ -234,7 +235,8 @@ class Executor:
                     "candidate_id": o["candidate_id"],
                     "nodes": cand.contributing_nodes if cand else [],
                     "option_symbol": o["option_symbol"], "status": "open",
-                    "mode": self.mode})
+                    "mode": self.mode,
+                    "entry_mode": getattr(cand, "entry_mode", "normal") if cand else "normal"})
             else:
                 key = o["option_symbol"] or o["symbol"]
                 position = next((p for p in self.store.open_positions(mode=self.mode)

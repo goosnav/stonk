@@ -534,13 +534,18 @@ def test_v2_resolution_writes_both_realized(store):
 
 # ── B4C: structured inference + consumer (node/graph) semantics ───────────────
 
-def _nf_view(abs_q50, exc_q50, p_abs=0.6, p_exc=0.6, horizon=21):
+def _nf_view(abs_q50, exc_q50, p_abs=0.6, p_exc=0.6, horizon=21, symbol="AAA",
+             as_of="2026-07-15", width=0.03):
     return {str(horizon): NeuralForecast(
-        symbol="AAA", as_of="2026-07-15", horizon_sessions=horizon,
-        absolute_q10=abs_q50 - 0.03, absolute_q50=abs_q50, absolute_q90=abs_q50 + 0.03,
+        symbol=symbol, as_of=as_of, horizon_sessions=horizon,
+        absolute_q10=abs_q50 - width, absolute_q50=abs_q50, absolute_q90=abs_q50 + width,
         excess_q10=exc_q50 - 0.02, excess_q50=exc_q50, excess_q90=exc_q50 + 0.02,
         probability_absolute_edge_positive=p_abs, probability_excess_positive=p_exc,
-        model_id="m", dataset_manifest_id="d", feature_schema_hash="h")}
+        model_id="m", dataset_manifest_id="d",
+        feature_schema_hash=neural.FEATURE_HASH)}
+
+
+_META = {"model_id": "m"}          # matches _nf_view provenance for policy validation
 
 
 class _NodeCtx:
@@ -720,7 +725,7 @@ def test_blend_applied_exactly_once_and_attributed(cfg, store):
     from specforge.ml.policy import apply_neural_blend
     c = _candidate(score=0.5)
     out = apply_neural_blend([c], {"AAA": _nf_view(0.05, 0.03, p_abs=0.75)},
-                             cfg, store, "cyc1", graph_blend=0.0)
+                             cfg, store, "cyc1", graph_blend=0.0, as_of="2026-07-15", meta=_META)
     assert out["blend"] == pytest.approx(0.15) and out["scored"] == 1
     from specforge.ml.policy import neural_score
     expected = round(0.85 * 0.5 + 0.15 * neural_score(
@@ -734,7 +739,7 @@ def test_blend_applied_exactly_once_and_attributed(cfg, store):
 def test_no_forecasts_means_zero_blend_and_untouched_scores(cfg, store):
     from specforge.ml.policy import apply_neural_blend
     c = _candidate(score=0.5)
-    out = apply_neural_blend([c], {}, cfg, store, "cyc1", graph_blend=0.0)
+    out = apply_neural_blend([c], {}, cfg, store, "cyc1", graph_blend=0.0, as_of="2026-07-15", meta=_META)
     assert out["blend"] == 0.0 and "deterministic fallback" in out["reason"]
     assert c.final_score == 0.5 and c.neural_blend == 0.0
 
@@ -743,7 +748,7 @@ def test_active_graph_owns_learned_pathway_no_double_count(cfg, store):
     from specforge.ml.policy import apply_neural_blend
     c = _candidate(score=0.5)
     out = apply_neural_blend([c], {"AAA": _nf_view(0.05, 0.03)}, cfg, store,
-                             "cyc1", graph_blend=0.10)
+                             "cyc1", graph_blend=0.10, as_of="2026-07-15", meta=_META)
     assert out["blend"] == 0.0 and "graph" in out["reason"]
     assert c.final_score == 0.5                 # direct blend stood down
 
@@ -760,7 +765,222 @@ def test_blend_bounds_never_silently_increased(cfg, store):
 def test_blend_is_audited(cfg, store):
     from specforge.ml.policy import apply_neural_blend
     apply_neural_blend([_candidate()], {"AAA": _nf_view(0.05, 0.03)},
-                       cfg, store, "cyc-audit", graph_blend=0.0)
+                       cfg, store, "cyc-audit", graph_blend=0.0, as_of="2026-07-15", meta=_META)
     row = store.db.execute("SELECT * FROM audit WHERE event_type='neural_direct_blend' "
                            "ORDER BY ts DESC LIMIT 1").fetchone()
     assert row is not None and "0.15" in row["payload"]
+
+
+# ── C2: neural exploration probe — bounded, validated, governor-subordinate ───
+
+def _probe_env(cfg, store, equity=1000.0, cash=500.0, positions=None):
+    from specforge.data import MarketContext
+    from specforge.models import AccountState
+    ctx = MarketContext(store, cfg)
+    account = AccountState(equity=equity, cash=cash, buying_power=cash,
+                           positions=positions or [], as_of=ctx.as_of)
+    return ctx, account
+
+
+def _probe_forecasts(ctx, **by_symbol):
+    """{sym: forecast-dict} with as_of bound to the live ctx (validation passes)."""
+    return {sym: _nf_view(*args, symbol=sym, as_of=ctx.as_of)
+            for sym, args in by_symbol.items()}
+
+
+def _select(cfg, store, ctx, account, candidates, targets, forecasts):
+    from specforge.ml.policy import select_exploration_probe
+    return select_exploration_probe(candidates, targets, forecasts, _META,
+                                    cfg, store, "cyc-probe", account, ctx,
+                                    as_of=ctx.as_of,
+                                    allocated=sum(n for _, n in targets))
+
+
+def test_probe_stale_forecast_rejected(cfg, store):
+    ctx, account = _probe_env(cfg, store)
+    stale = {"BBB": _nf_view(0.05, 0.03, p_abs=0.75, symbol="BBB",
+                             as_of="2020-01-01")}
+    assert _select(cfg, store, ctx, account,
+                   [_candidate("BBB", 0.5)], [], stale) is None
+
+
+def test_probe_negative_absolute_positive_excess_rejected(cfg, store):
+    ctx, account = _probe_env(cfg, store)
+    fc = _probe_forecasts(ctx, BBB=(-0.05, 0.05, 0.75))
+    assert _select(cfg, store, ctx, account,
+                   [_candidate("BBB", 0.5)], [], fc) is None
+
+
+def test_probe_qualified_creates_exactly_one(cfg, store):
+    ctx, account = _probe_env(cfg, store)
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75))
+    out = _select(cfg, store, ctx, account, [_candidate("BBB", 0.5)], [], fc)
+    assert out is not None
+    cand, notional = out
+    assert cand.entry_mode == "probe" and cand.size_multiplier == 0.25
+    assert cand.symbol == "BBB" and notional >= 5.0
+    assert "neural exploration" in cand.entry_mode_reason and "m" in cand.entry_mode_reason
+    row = store.db.execute("SELECT * FROM audit WHERE event_type='neural_probe_selected'"
+                           " ORDER BY ts DESC LIMIT 1").fetchone()
+    assert row is not None and "BBB" in row["payload"]
+
+
+def test_probe_highest_neural_score_wins_and_only_one(cfg, store):
+    ctx, account = _probe_env(cfg, store)
+    fc = _probe_forecasts(ctx, BBB=(0.02, 0.01, 0.60), CCC=(0.06, 0.04, 0.85))
+    out = _select(cfg, store, ctx, account,
+                  [_candidate("BBB", 0.5), _candidate("CCC", 0.4)], [], fc)
+    assert out is not None and out[0].symbol == "CCC"
+
+
+def test_probe_excludes_held_and_normally_selected(cfg, store):
+    from specforge.models import Position
+    held = Position(symbol="BBB", asset_type="equity", qty=1.0, avg_cost=100,
+                    opened_at="2026-07-01")
+    ctx, account = _probe_env(cfg, store, positions=[held])
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75), CCC=(0.05, 0.03, 0.75))
+    normal = _candidate("CCC", 0.6)
+    out = _select(cfg, store, ctx, account,
+                  [_candidate("BBB", 0.5), normal], [(normal, 50.0)], fc)
+    assert out is None                          # held excluded; selected excluded
+
+
+def test_probe_multiplier_applied_exactly_once(cfg, store):
+    from specforge import portfolio
+    ctx, account = _probe_env(cfg, store, cash=10_000.0)
+    cfg.data["neural"]["exploration"]["budget_fraction"] = 1.0
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75))
+    out = _select(cfg, store, ctx, account, [_candidate("BBB", 0.5)], [], fc)
+    assert out is not None
+    baseline = _candidate("BBB", 0.5)           # identical, but normal mode
+    full = portfolio.construct([baseline], account, ctx, cfg)
+    assert full and out[1] == pytest.approx(0.25 * full[0][1], rel=1e-6)
+
+
+def test_probe_budget_fraction_caps_notional(cfg, store):
+    ctx, account = _probe_env(cfg, store, equity=1000.0, cash=10_000.0)
+    cfg.data["neural"]["exploration"]["budget_fraction"] = 0.005   # $5 cap
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75))
+    out = _select(cfg, store, ctx, account, [_candidate("BBB", 0.5)], [], fc)
+    assert out is not None and out[1] == pytest.approx(5.0)
+
+
+def test_probe_extra_slot_beyond_batch_but_not_global_limit(cfg, store):
+    from specforge.models import Position
+    ctx, account = _probe_env(cfg, store)
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75))
+    # deterministic batch already full → probe still gets its dedicated slot
+    full_batch = [(_candidate(s, 0.9), 50.0) for s in ("AAA", "CCC", "DDD")]
+    out = _select(cfg, store, ctx, account, [_candidate("BBB", 0.5)], full_batch, fc)
+    assert out is not None
+    # ...but the GLOBAL max_open_positions cap is never exceeded
+    cfg.data.setdefault("risk", {})["max_open_positions"] = 1
+    held = Position(symbol="ZZZ", asset_type="equity", qty=1.0, avg_cost=10,
+                    opened_at="2026-07-01")
+    ctx2, account2 = _probe_env(cfg, store, positions=[held])
+    fc2 = _probe_forecasts(ctx2, BBB=(0.05, 0.03, 0.75))
+    assert _select(cfg, store, ctx2, account2,
+                   [_candidate("BBB", 0.5)], [], fc2) is None
+    cfg.data["risk"]["max_open_positions"] = 12
+
+
+def test_probe_slot_occupied_by_open_probe_blocks_second(cfg, store):
+    ctx, account = _probe_env(cfg, store)
+    store.save_position("probe-1", {
+        "symbol": "QQQ", "asset_type": "equity", "qty": 1.0, "avg_cost": 10,
+        "opened_at": "2026-07-01", "horizon_days": 21, "stop_price": 9.0,
+        "status": "open", "mode": "paper", "entry_mode": "probe"})
+    fc = _probe_forecasts(ctx, BBB=(0.05, 0.03, 0.75))
+    assert _select(cfg, store, ctx, account,
+                   [_candidate("BBB", 0.5)], [], fc) is None
+    row = store.db.execute("SELECT * FROM audit WHERE event_type='neural_probe_skipped'"
+                           " ORDER BY ts DESC LIMIT 1").fetchone()
+    assert row is not None and "occupied" in row["payload"]
+
+
+def test_probe_position_entry_mode_is_durable(cfg, store):
+    store.save_position("p-dur", {
+        "symbol": "QQQ", "asset_type": "equity", "qty": 1.0, "avg_cost": 10,
+        "opened_at": "2026-07-01", "horizon_days": 21, "stop_price": 9.0,
+        "status": "open", "mode": "paper", "entry_mode": "probe"})
+    rows = store.open_positions(mode="paper")
+    assert any(r["entry_mode"] == "probe" for r in rows)
+    normal = [r for r in rows if r["symbol"] != "QQQ"]
+    assert all(r.get("entry_mode", "normal") == "normal" for r in normal)
+
+
+def test_probe_cannot_bypass_governor(cfg, store):
+    from specforge.models import AccountState, OrderIntent
+    from specforge.risk import CycleState, Governor
+    gov = Governor(cfg, store)
+    cand = _candidate("BBB", 0.5)
+    cand.entry_mode, cand.size_multiplier = "probe", 0.25
+    cand.target_notional = 900.0                # oversized vs cash below
+    poor = AccountState(equity=1000.0, cash=10.0, buying_power=10.0,
+                        positions=[], as_of="2026-07-15")
+    intent = OrderIntent.make(cand, qty=9.0, limit_price=100.0)
+    # The governor keeps full authority over a probe: an unaffordable request
+    # is cut down to real spendable cash, and hard blocks still reject outright.
+    resized = gov.review(intent, cand, poor, CycleState(1000.0), data_age_days=1)
+    assert resized.verdict in ("APPROVED_WITH_SIZE_REDUCTION", "REJECTED")
+    if resized.verdict == "APPROVED_WITH_SIZE_REDUCTION":
+        assert resized.approved_notional < 900.0
+    stale = gov.review(intent, cand, poor, CycleState(1000.0), data_age_days=99)
+    assert stale.verdict == "REJECTED"          # probes obey the same governor
+
+
+def test_node_cache_cleared_every_compute_even_offline(cfg):
+    node = _neural_node(cfg)
+    node.last_forecasts = {"AAA": object()}     # poison from a "previous cycle"
+    node.last_meta = {"model_id": "old"}
+    node.last_forecast_as_of = "2020-01-01"
+    ctx = _NodeCtx(cfg, ["AAA"])
+    ctx.offline = True
+    assert node.compute(ctx) == []
+    assert node.last_forecasts == {} and node.last_meta == {}
+    assert node.last_forecast_as_of is None
+
+
+def test_engine_offline_cycle_never_runs_inference_no_probe_exits_ok(
+        cfg, store, monkeypatch):
+    # Offline/replay cycles (refresh_data=False) must NEVER touch the live
+    # model: zero inference, zero probes, deterministic completion.
+    from specforge.engine import run_cycle
+    cfg.data["nodes"]["neural"] = {"enabled": True, "weight": 0.15,
+                                   "horizon_days": 21, "status": "experimental"}
+    calls = {"n": 0}
+
+    def failing_predict(c, s, ctx):
+        calls["n"] += 1
+        return {}, {"silent": "no validated global TCN champion"}
+
+    monkeypatch.setattr(neural, "predict_today", failing_predict)
+    summary = run_cycle(cfg, store, refresh_data=False)
+    assert calls["n"] == 0                      # offline: model untouched
+    assert summary["cycle_id"]                  # cycle completed deterministically
+    assert store.db.execute("SELECT COUNT(*) n FROM audit WHERE "
+                            "event_type='neural_probe_selected'").fetchone()["n"] == 0
+    blend = store.db.execute("SELECT payload FROM audit WHERE "
+                             "event_type='neural_direct_blend' "
+                             "ORDER BY ts DESC LIMIT 1").fetchone()
+    assert blend is not None and "deterministic fallback" in blend["payload"]
+
+
+def test_inference_runs_once_per_cycle_engine_reads_stash(cfg, monkeypatch):
+    # One online compute → exactly one predict_today; the engine consumes the
+    # node's stash and has no predict_today call site of its own.
+    import pathlib
+    calls = {"n": 0}
+
+    def counted(c, s, ctx):
+        calls["n"] += 1
+        return {}, {"silent": "no champion"}
+
+    monkeypatch.setattr(neural, "predict_today", counted)
+    node = _neural_node(cfg)
+    ctx = _NodeCtx(cfg, ["AAA"])
+    node.compute(ctx)
+    assert calls["n"] == 1
+    assert node.last_forecast_as_of == ctx.as_of      # stash bound to this cycle
+    engine_src = pathlib.Path("specforge/engine.py").read_text()
+    assert "predict_today" not in engine_src          # engine reads only the stash
