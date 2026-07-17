@@ -47,18 +47,33 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
               refresh_data: bool = True, registry=None, log=print,
               live_quotes: dict | None = None) -> dict:
     if not _CYCLE_LOCK.acquire(blocking=False):
-        store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode})
+        store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode,
+                                              "scope": "in_process"})
         return {"skipped": "a cycle is already running — this one was not started"}
+    lease_resource = f"trading_cycle:{cfg.mode}"
+    lease_owner = None
     try:
+        # Cross-process authority (Sprint E1): the SQLite lease — not the
+        # thread lock — decides. Daemon, CLI, GUI, and a restarted process can
+        # never run concurrent cycles; a crashed worker's lease expires.
+        lease_owner = store.acquire_lease(
+            lease_resource, float(cfg.get("risk", "cycle_lease_seconds", default=900)))
+        if not lease_owner:
+            store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode,
+                                                  "scope": "cross_process"})
+            return {"skipped": "another process holds the trading-cycle lease"}
         return _run_cycle(cfg, store, broker, as_of, refresh_data, registry,
-                          log, live_quotes)
+                          log, live_quotes, lease=(lease_resource, lease_owner))
     finally:
+        if lease_owner:
+            store.release_lease(lease_resource, lease_owner)
         _CYCLE_LOCK.release()
 
 
 def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                refresh_data: bool = True, registry=None, log=print,
-               live_quotes: dict | None = None) -> dict:
+               live_quotes: dict | None = None,
+               lease: tuple[str, str] | None = None) -> dict:
     cycle_id = new_id()
     trace: list = []
     source = "live" if cfg.mode == "live" else "paper"
@@ -78,10 +93,10 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         active = tier_symbols(store, "active")
         if active:
             symbols = active
-            cfg.data["universe"]["symbols"] = symbols
     # hypothesis watchlist merge (V4/D34): the active short-term hypothesis may
-    # add a bounded set of symbols to this cycle's scan universe. In-memory
-    # config mutation only — the file/override universe is untouched.
+    # add a bounded set of symbols to this cycle's scan universe. The cycle
+    # universe is CYCLE-LOCAL (passed into MarketContext below) — shared
+    # config is never mutated during execution (Sprint E1).
     if cfg.get("hypothesis", "enabled", default=False):
         from . import hypothesis as hypo_mod
         extra = [s for s in hypo_mod.watchlist(
@@ -90,7 +105,6 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                  if s not in symbols]
         if extra:
             symbols = symbols + extra
-            cfg.data["universe"]["symbols"] = symbols
             store.audit("hypothesis_watchlist_merged", {"added": extra}, cycle_id)
     volatility_symbols = (cfg.get("universe", "volatility_symbols", default={}) or {}).values()
     aux = list(dict.fromkeys([cfg.get("universe", "vix_symbol", default="^VIX"),
@@ -111,7 +125,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         else:
             st("data", f"refreshing daily bars for {len(symbols) + len(aux)} symbols")
             data_mod.refresh(store, symbols + aux, log=log)
-    ctx = MarketContext(store, cfg, as_of, offline=not refresh_data)
+    ctx = MarketContext(store, cfg, as_of, offline=not refresh_data,
+                        symbols=symbols)
 
     # 1.5 live prices (D35). Without these, limit prices come from the LAST
     # DAILY CLOSE — live orders rest unfilled all day (the GE order, D26).
@@ -280,7 +295,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # fallback; an unvalidated graph has a zero live blend.
     from .graph import blend_candidates
     blend_candidates(candidates, graph_events, reg.regime, cfg, store, cycle_id,
-                     node_states=node_states, symbol_states=symbol_states)
+                     node_states=node_states, symbol_states=symbol_states,
+                     universe=ctx.universe)
     required_graph_nodes = {n["id"] for n in default_topology()["nodes"]
                             if n["role"] in ("alpha", "gate")}
     failed_nodes = sorted(n for n, state in node_states.items()
@@ -384,6 +400,14 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         "cycle_budget_left": cycle.budget_left,
         "orders": [{"symbol": c.symbol, "notional": n} for c, n in targets],
     }, cycle_id)
+    # Fence (Sprint E1): a worker that lost the cross-process lease between
+    # planning and placement must not commit orders — another process may
+    # already be trading. Protective exits above are deliberately NOT fenced.
+    if lease and targets and not store.holds_lease(*lease):
+        store.audit("cycle_fenced_lost_lease", {
+            "resource": lease[0], "dropped_orders": len(targets)}, cycle_id)
+        st("fenced", "trading lease lost before order placement — no orders sent")
+        targets = []
     entry_results = {}
     broker_blocked = "broker_rejected" in approvals
     for i, (cand, notional) in enumerate(targets):

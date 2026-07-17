@@ -136,7 +136,8 @@ class MarketContext:
     """As-of view over stored bars. All pipeline reads go through here."""
 
     def __init__(self, store: Store, cfg, as_of: str | None = None,
-                 offline: bool = False, historical: bool = False):
+                 offline: bool = False, historical: bool = False,
+                 symbols: list[str] | None = None):
         self.store = store
         self.cfg = cfg
         self.as_of = as_of or date.today().isoformat()
@@ -146,10 +147,16 @@ class MarketContext:
         # Historical replay additionally enforces source-availability time.
         # Cache-only live discovery is offline but is not a replay.
         self.historical = historical
+        # Explicit cycle-local universe (Sprint E1): callers pass the symbols
+        # they mean instead of mutating cfg.data — shared config stays
+        # immutable during execution, so state cannot leak between cycles.
+        self._symbols = list(symbols) if symbols is not None else None
         self._cache: dict[str, pd.DataFrame] = {}
 
     @property
     def universe(self) -> list[str]:
+        if self._symbols is not None:
+            return list(self._symbols)
         return list(self.cfg.get("universe", "symbols", default=[]))
 
     def df(self, symbol: str, lookback: int = 400) -> pd.DataFrame:

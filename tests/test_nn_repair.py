@@ -1177,3 +1177,81 @@ def test_experimental_live_serves_at_permitted_blend_cap(cfg, store):
     assert effective_blend(cfg, 0.0, True, permitted=0.10)[0] == pytest.approx(0.10)
     assert effective_blend(cfg, 0.0, True, permitted=0.0)[0] == 0.0   # fail closed
     assert effective_blend(cfg, 0.0, True, permitted=None)[0] == pytest.approx(0.15)
+
+
+# ── Sprint E1: cross-process trading lease + immutable cycle config ──────────
+
+def test_lease_blocks_second_acquirer(store):
+    a = store.acquire_lease("trading_cycle:paper", 60)
+    assert a is not None
+    assert store.acquire_lease("trading_cycle:paper", 60) is None
+    store.release_lease("trading_cycle:paper", a)
+
+
+def test_expired_lease_is_recoverable(store):
+    import time
+    a = store.acquire_lease("trading_cycle:paper", 0.01)
+    assert a is not None
+    time.sleep(1.05)                       # min TTL is clamped to 1s
+    b = store.acquire_lease("trading_cycle:paper", 60)
+    assert b is not None and b != a        # crashed worker healed
+    store.release_lease("trading_cycle:paper", b)
+
+
+def test_release_only_by_owner(store):
+    a = store.acquire_lease("trading_cycle:paper", 60)
+    store.release_lease("trading_cycle:paper", "not-the-owner")
+    assert store.acquire_lease("trading_cycle:paper", 60) is None   # still held
+    store.release_lease("trading_cycle:paper", a)
+    assert store.acquire_lease("trading_cycle:paper", 60) is not None
+
+
+def test_stale_worker_is_fenced_after_losing_lease(store):
+    import json as j
+    a = store.acquire_lease("trading_cycle:paper", 60)
+    assert store.holds_lease("trading_cycle:paper", a)
+    # force-expire A (simulates a hung worker outliving its TTL)…
+    lease = store.kv_get("lease:trading_cycle:paper")
+    lease["expires_at"] = 0
+    store.kv_set("lease:trading_cycle:paper", lease)
+    b = store.acquire_lease("trading_cycle:paper", 60)
+    assert b is not None
+    # …A must now fail the fencing check and cannot commit
+    assert not store.holds_lease("trading_cycle:paper", a)
+    assert store.holds_lease("trading_cycle:paper", b)
+    store.release_lease("trading_cycle:paper", b)
+
+
+def test_run_cycle_skips_when_another_process_holds_lease(cfg, store):
+    from specforge.engine import run_cycle
+    other = store.acquire_lease("trading_cycle:paper", 60)
+    out = run_cycle(cfg, store, refresh_data=False)
+    assert "skipped" in out and "lease" in out["skipped"]
+    row = store.db.execute("SELECT payload FROM audit WHERE "
+                           "event_type='cycle_skipped_overlap' "
+                           "ORDER BY ts DESC LIMIT 1").fetchone()
+    assert "cross_process" in row["payload"]
+    store.release_lease("trading_cycle:paper", other)
+
+
+def test_run_cycle_releases_lease_on_completion(cfg, store):
+    from specforge.engine import run_cycle
+    out = run_cycle(cfg, store, refresh_data=False)
+    assert "cycle_id" in out
+    assert store.acquire_lease("trading_cycle:paper", 60) is not None  # free again
+
+
+def test_market_context_symbols_override_never_touches_cfg(cfg, store):
+    from specforge.data import MarketContext
+    before = list(cfg.data["universe"]["symbols"])
+    ctx = MarketContext(store, cfg, symbols=["XXX", "YYY"])
+    assert ctx.universe == ["XXX", "YYY"]
+    assert cfg.data["universe"]["symbols"] == before          # untouched
+    assert MarketContext(store, cfg).universe == before       # default path intact
+
+
+def test_no_shared_config_mutation_remains_in_cycle_code():
+    import pathlib
+    for module in ("specforge/engine.py", "specforge/research.py"):
+        src = pathlib.Path(module).read_text()
+        assert 'cfg.data["universe"]["symbols"] =' not in src, module

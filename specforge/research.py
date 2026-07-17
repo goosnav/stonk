@@ -369,13 +369,12 @@ def discover_opportunities(cfg, store, progress=None) -> dict:
     if progress:
         progress({"phase": "load_universe", "index": 0, "total": len(syms),
                   "fraction": 0.02})
-    old = cfg.data["universe"]["symbols"]
-    cfg.data["universe"]["symbols"] = syms
     try:
         # Discovery is deliberately cache-only. Provider refreshes are
         # separate resumable tasks; a button press must not fan out hundreds
-        # of synchronous yfinance/SEC requests.
-        ctx = MarketContext(store, cfg, offline=True)
+        # of synchronous yfinance/SEC requests. The research universe is
+        # passed cycle-locally — shared config is never mutated (Sprint E1).
+        ctx = MarketContext(store, cfg, offline=True, symbols=syms)
         registry = build_registry(cfg)
         # Discovery reads every broker-free cached analysis that can influence
         # production, not merely the technical starter set. Missing evidence
@@ -402,7 +401,7 @@ def discover_opportunities(cfg, store, progress=None) -> dict:
                 if event:
                     events.append(event)
     finally:
-        cfg.data["universe"]["symbols"] = old
+        pass    # cycle-local universe; nothing to restore
     components: dict[str, list[dict]] = {s: [] for s in syms}
     from .models import signed_alpha
     for event in events:
@@ -1121,22 +1120,19 @@ def record_shadow_forecasts(cfg, store) -> int:
     syms = symbols(store, "research")
     if not syms:
         return 0
-    # Research inference uses an in-memory universe only.
-    old = cfg.data["universe"]["symbols"]
-    cfg.data["universe"]["symbols"] = syms
-    try:
-        # Shadow the newest challenger.  A champion is only the fallback: if
-        # we always preferred it, challengers could never accumulate the
-        # forward evidence required to replace it.
-        row = store.db.execute("SELECT id FROM model_runs WHERE kind='global_tcn' "
-                               "AND status IN ('champion','challenger') "
-                               "ORDER BY CASE status WHEN 'challenger' THEN 0 ELSE 1 END, "
-                               "created_at DESC LIMIT 1").fetchone()
-        if not row:
-            return 0
-        preds, meta = predict_run(cfg, store, MarketContext(store, cfg), row["id"])
-    finally:
-        cfg.data["universe"]["symbols"] = old
+    # Research inference uses a cycle-local universe (Sprint E1) — shared
+    # config is never mutated.
+    # Shadow the newest challenger.  A champion is only the fallback: if
+    # we always preferred it, challengers could never accumulate the
+    # forward evidence required to replace it.
+    row = store.db.execute("SELECT id FROM model_runs WHERE kind='global_tcn' "
+                           "AND status IN ('champion','challenger') "
+                           "ORDER BY CASE status WHEN 'challenger' THEN 0 ELSE 1 END, "
+                           "created_at DESC LIMIT 1").fetchone()
+    if not row:
+        return 0
+    preds, meta = predict_run(cfg, store, MarketContext(store, cfg, symbols=syms),
+                              row["id"])
     model_id = meta.get("model_id")
     if not model_id:
         return 0

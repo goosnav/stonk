@@ -587,6 +587,64 @@ class Store:
                         (key, json.dumps(value, default=str)))
         self.db.commit()
 
+    # ---------- cross-process leases (Sprint E1) ----------
+    # The generic mechanism for any resource that must never run twice across
+    # processes (daemon vs CLI vs GUI vs a restarted instance). SQLite is the
+    # authority: BEGIN IMMEDIATE serializes writers, the kv row is the lock.
+    # Same design as research.py's worker lease; the trading cycle uses
+    # resource "trading_cycle:<mode>".
+    def acquire_lease(self, resource: str, seconds: float) -> str | None:
+        """Return an owner token, or None if a live lease is held elsewhere.
+        An expired lease is recoverable by anyone (crashed workers heal)."""
+        import os
+        import threading
+        import time
+        import uuid
+        owner = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex[:8]}"
+        key, now = f"lease:{resource}", time.time()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            lease = json.loads(row["value"]) if row else {}
+            if float(lease.get("expires_at", 0)) > now:
+                self.db.commit()
+                return None
+            self.db.execute(
+                "INSERT INTO kv(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps({"owner": owner, "acquired_at": now,
+                                  "pid": os.getpid(),
+                                  "expires_at": now + max(1.0, float(seconds))})))
+            self.db.commit()
+            return owner
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def holds_lease(self, resource: str, owner: str | None) -> bool:
+        """Fencing check: a worker that lost ownership must not commit."""
+        import time
+        if not owner:
+            return False
+        lease = self.kv_get(f"lease:{resource}") or {}
+        return (lease.get("owner") == owner and
+                float(lease.get("expires_at", 0)) > time.time())
+
+    def release_lease(self, resource: str, owner: str | None) -> None:
+        """Release only what we own — never another worker's lease."""
+        if not owner:
+            return
+        key = f"lease:{resource}"
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            lease = json.loads(row["value"]) if row else {}
+            if lease.get("owner") == owner:
+                self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
     # ---------- bars ----------
     def upsert_bars(self, symbol: str, rows: list[dict], source: str) -> int:
         """rows: [{d, open, high, low, close, volume}]. Returns inserted/updated count."""

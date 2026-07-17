@@ -645,7 +645,8 @@ def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,
 def blend_candidates(candidates, events, regime: str, cfg, store,
                      cycle_id: str | None = None,
                      node_states: dict[str, str] | None = None,
-                     symbol_states: dict[str, dict[str, str]] | None = None) -> None:
+                     symbol_states: dict[str, dict[str, str]] | None = None,
+                     universe: list[str] | None = None) -> None:
     """Apply the validated graph as a capped score blend, in place."""
     champ = champion(store)
     blend = activation_state(cfg, store)["effective_blend"]
@@ -656,8 +657,10 @@ def blend_candidates(candidates, events, regime: str, cfg, store,
     enabled = {node_id for node_id, node_cfg in
                (cfg.get("nodes", default={}) or {}).items()
                if node_cfg.get("enabled")}
+    scan = (universe if universe is not None
+            else cfg.get("universe", "symbols", default=[]))
     by_symbol = sorted({e.symbol for e in events} | {c.symbol for c in candidates} |
-                       set(cfg.get("universe", "symbols", default=[])))
+                       set(scan))
     for symbol in by_symbol:
         bases = event_bases(events, symbol, regime)
         from .strategy import contribution as strategy_contribution
