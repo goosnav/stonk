@@ -1510,3 +1510,24 @@ def test_compare_policies_identical_conditions_isolated_books(cfg, store, tmp_pa
     assert det["overall"] == blend["overall"]
     # comparison artifact persisted
     assert (tmp_path / "policy_comparison_research.json").exists()
+
+
+# ── incident 2026-07-17: /api/health must report config errors, not 500 ─────
+
+def test_health_reports_config_error_instead_of_500(cfg, store, monkeypatch):
+    from fastapi.testclient import TestClient
+    import specforge.app as app_mod
+    from specforge.config import ConfigError
+    app = app_mod.create_app(cfg, store, with_scheduler=False)
+
+    def broken_config(s, m):
+        raise ConfigError("Dangerous config rejected: test breakage")
+
+    monkeypatch.setattr(app_mod, "current_config", broken_config)
+    with TestClient(app) as client:
+        r = client.get("/api/health")
+    assert r.status_code == 200                      # never a retry-loop 500
+    body = r.json()
+    assert body["status"] == "error"
+    assert "test breakage" in body["config_error"]
+    assert any("config invalid" in a for a in body["alerts"])

@@ -351,10 +351,25 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
         return liveness()
 
     def _system_health():
+        from .config import ConfigError
         from .health import system_health
         sched = getattr(app.state, "scheduler", None)
         jobs = {j.id: str(j.next_run_time) for j in sched.get_jobs()} if sched else {}
-        return system_health(fresh_cfg(), store, next_runs=jobs,
+        try:
+            cfg_now = fresh_cfg()
+        except ConfigError as e:
+            # Config files are re-read from disk on EVERY request, so a file
+            # edited under a running (older) server can fail validation here.
+            # Trading is fail-closed elsewhere; health's one job is to say WHY
+            # — a visible error status, never a 500 the feed retries forever.
+            # (2026-07-17 incident: yaml migrated on disk, old process 500'd
+            # all day instead of naming the problem.)
+            return {"status": "error", "mode": mode,
+                    "config_error": str(e),
+                    "alerts": [f"config invalid: {e} — restart the server to "
+                               "load current code, or fix the config file"],
+                    "not_trading_because": [f"config invalid: {e}"]}
+        return system_health(cfg_now, store, next_runs=jobs,
                              scheduler_alive=_scheduler_alive())
 
     @app.get("/api/health")
