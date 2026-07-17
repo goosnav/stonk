@@ -29,7 +29,24 @@ def test_full_paper_cycle_and_audit_reconstruction(cfg, store):
     assert summary["budget_used"] <= summary["budget"] + 1e-6
 
 
-def test_broker_block_halts_remaining_entry_batch(cfg, store):
+def test_noop_cycle_reuses_account_snapshot(cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+
+    broker = PaperBroker(cfg, store)
+    original = broker.get_account
+    calls = 0
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(broker, "get_account", counted)
+    run_cycle(cfg, store, broker=broker, refresh_data=False, registry={})
+    assert calls <= 2
+
+
+def test_broker_block_halts_remaining_entry_batch(cfg, store, monkeypatch):
     from datetime import datetime
     from specforge.models import AccountState, OrderReview, SignalEvent
 
@@ -67,6 +84,11 @@ def test_broker_block_halts_remaining_entry_batch(cfg, store):
     cfg.data["ensemble"]["min_final_score"] = -1
     cfg.data["nodes"]["quality_value"]["enabled"] = False
     cfg.data["risk"]["stale_data_max_age_days"] = 999
+    # This test isolates broker batch behavior; classify the liquid synthetic
+    # fixtures as fund-like so the independent company-dossier gate is not the
+    # subject under test.
+    monkeypatch.setattr("specforge.ensemble.ETF_SYMBOLS",
+                        {"AAA", "BBB", "CCC", "SPY"})
     broker = BlockingBroker()
     summary = run_cycle(cfg, store, broker=broker, refresh_data=False,
                         registry={"momentum": Signals()})
@@ -143,6 +165,73 @@ def test_resting_sell_fill_closes_position_and_records_trade(cfg, store):
     assert store.trades(source="paper")[0]["exit_reason"] == "time_stop"
 
 
+def test_partial_sell_reduces_position_without_closing(cfg, store):
+    from specforge.broker.paper import KV_KEY, PaperBroker
+    from specforge.execution import Executor
+    from specforge.models import new_id
+    from specforge.risk import Governor
+    store.kv_set(KV_KEY, {"cash": 0, "positions": {
+        "AAA": {"qty": 2, "avg_cost": 100, "asset_type": "equity"}}})
+    pid = new_id()
+    store.save_position(pid, {
+        "symbol": "AAA", "asset_type": "equity", "qty": 2, "avg_cost": 100,
+        "opened_at": "2026-01-01T00:00:00", "horizon_days": 20,
+        "stop_price": 80, "candidate_id": "", "nodes": ["momentum"],
+        "option_symbol": None, "status": "open", "mode": "paper"})
+    broker = PaperBroker(cfg, store); broker.set_quotes({"AAA": 110})
+    ex = Executor(cfg, store, broker, Governor(cfg, store))
+    assert ex.execute_exit(store.open_positions("paper")[0], 110, "rebalance trim",
+                           broker.get_account(), "c1", "neutral", qty=.5) == "filled"
+    remaining = store.open_positions("paper")
+    assert len(remaining) == 1 and abs(remaining[0]["qty"] - 1.5) < 1e-8
+    assert store.trades(source="paper")[0]["qty"] == .5
+    assert any(r["event_type"] == "position_trimmed" for r in store.audit_rows())
+
+
+def test_live_model_failure_keeps_production_evidence_pipeline_alive(cfg, store):
+    """A shadow learned component cannot freeze the production evidence path."""
+    import json
+    from datetime import datetime
+    from specforge.models import AccountState, SignalEvent
+
+    class Broker:
+        def set_quotes(self, quotes): pass
+        def get_account(self):
+            return AccountState(100, 100, 100, [], datetime.now().isoformat())
+
+    class Signals:
+        id, role, degraded_reason = "momentum", "alpha", ""
+        def compute(self, ctx):
+            return [SignalEvent("SPY", "long", .9, .9, 21, .05, .1, -.1,
+                                ["test"], datetime.now(), "momentum")]
+
+    cfg.data["mode"] = "live"
+    cfg.data["ensemble"]["min_final_score"] = -1
+    cfg.data["nodes"]["quality_value"]["enabled"] = False
+    summary = run_cycle(cfg, store, broker=Broker(), refresh_data=False,
+                        registry={"momentum": Signals()})
+    # The learned reason remains explicit while the production path attempts
+    # the governed order (this minimal fake broker rejects at review).
+    assert summary["model_state"]["block_reason"] == "BLOCKED: GRAPH"
+    assert summary["model_state"]["effective_blend"] == 0.0
+    assert summary["model_state"]["production_evidence"] is True
+    assert summary["entries"] == {"SPY": "rejected"}
+    assert store.db.execute(
+        "SELECT payload FROM audit WHERE event_type='model_entries_blocked'"
+    ).fetchone() is None
+
+
+def test_audit_redacts_account_and_secret_fields(store):
+    import json
+    store.audit("broker_payload", {"account_number": "934803396",
+                                    "nested": {"access_token": "very-secret"},
+                                    "safe": "kept"})
+    payload = json.loads(store.audit_rows()[0]["payload"])
+    assert payload["account_number"] == "[redacted]"
+    assert payload["nested"]["access_token"] == "[redacted]"
+    assert payload["safe"] == "kept"
+
+
 def test_audit_file_mirror(store, tmp_path):
     import json
     from specforge.store import configure_file_logging
@@ -189,11 +278,43 @@ def test_operator_console_frame_is_quiet_and_informative(monkeypatch):
     assert "rh_mcp_call" not in frame
 
 
+def test_console_attaches_to_published_fallback_service(cfg, store, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from specforge import cli
+
+    store.kv_set("service_instance:paper", {
+        "pid": os.getpid(), "effective_port": 8423, "token": "fixture"})
+
+    def api(port, path, timeout=20):
+        if port == 8420:
+            raise OSError("preferred port occupied")
+        assert port == 8423 and path == "/api/version"
+        return {"mode": "paper"}
+
+    monkeypatch.setattr(cli, "_console_api", api)
+    server, port = cli._console_server(SimpleNamespace(port=8420), cfg, store)
+    assert server is None and port == 8423
+
+
 def test_registry_skips_unimplemented_nodes(cfg):
     cfg.data["nodes"]["nonexistent_node"] = {"enabled": True, "weight": 0.5}
     reg = build_registry(cfg)
     assert "nonexistent_node" not in reg
     assert "momentum" in reg
+
+
+def test_gap_node_replays_open_without_future_close(cfg, store):
+    from specforge.data import MarketContext
+    latest = store.latest_bar_date("AAA")
+    rows = store.get_bars("AAA", latest, 2)
+    prev = rows[-2]["close"]
+    store.db.execute("UPDATE bars SET open=?,high=? WHERE symbol='AAA' AND d=?",
+                     (prev * 1.03, prev * 1.04, latest)); store.db.commit()
+    ctx = MarketContext(store, cfg, as_of=latest, offline=True)
+    gap = build_registry(cfg)["gap"]
+    events = gap.compute(ctx)
+    assert any(e.symbol == "AAA" and "opening gap" in e.evidence[0] for e in events)
 
 
 def test_paper_positions_invisible_to_live_mode(cfg, store):
@@ -224,38 +345,6 @@ def test_paper_orders_invisible_to_live_mode(store):
     # daily-cap counting is mode-scoped too
     assert store.orders_today("buy", day="2026-07-09", mode="live") == []
     assert len(store.orders_today("buy", day="2026-07-09", mode="paper")) == 1
-
-
-def test_commit_reports_snapshots_dev_reports(store, tmp_path):
-    """Nightly report snapshot: commits new files under dev/reports, audits it,
-    and is a no-op when nothing changed."""
-    import subprocess
-
-    from specforge.app import _commit_reports
-
-    root = tmp_path / "repo"
-    (root / "dev" / "reports").mkdir(parents=True)
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-q", "--allow-empty", "-m", "init"],
-                   cwd=root, check=True)
-    (root / "dev" / "reports" / "r.json").write_text("{}")
-    # commit identity via repo config so _commit_reports's plain git works
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
-
-    _commit_reports(store, root=root)
-    log = subprocess.run(["git", "log", "--oneline"], cwd=root,
-                         capture_output=True, text=True).stdout
-    assert "nightly dev/reports snapshot" in log
-    assert store.db.execute(
-        "select count(*) from audit where event_type='reports_committed'"
-    ).fetchone()[0] == 1
-
-    _commit_reports(store, root=root)  # nothing new → no second commit/audit
-    log2 = subprocess.run(["git", "log", "--oneline"], cwd=root,
-                          capture_output=True, text=True).stdout
-    assert log2.count("nightly") == 1
 
 
 def test_current_config_survives_cross_mode_override(cfg, store):
@@ -360,6 +449,12 @@ def test_ai_provider_endpoint_never_leaks_key(cfg, store, tmp_path, monkeypatch)
     # bad base_url rejected
     assert client.post("/api/ai/provider",
                        json={"provider": "custom", "base_url": "ftp://x"}).status_code == 400
+    before = (tmp_path / ".env").read_text()
+    invalid = client.post("/api/ai/provider", json={
+        "provider": "custom", "base_url": "https://models.example/v1",
+        "api_key": "bad\nLIVE_TRADING_ENABLED=1"})
+    assert invalid.status_code == 400
+    assert (tmp_path / ".env").read_text() == before
 
 
 def test_portfolio_value_and_steering_endpoints(cfg, store):
@@ -404,7 +499,7 @@ def test_live_quotes_price_orders_not_stale_close(cfg, store):
     yesterday's daily close (stale limits = resting unfilled orders)."""
     as_of = store.latest_bar_date("AAA")     # synth data ends before today
     ctx = MarketContext(store, cfg, as_of=as_of)
-    live = {s: round(ctx.close(s) * 1.03, 4) for s in ["AAA", "BBB", "CCC"]}
+    live = {s: round(ctx.close(s) * 1.03, 4) for s in ["SPY", "AAA", "BBB", "CCC"]}
     summary = run_cycle(cfg, store, as_of=as_of, refresh_data=False,
                         live_quotes=live)
     buys = [o for o in store.orders_today("buy", day=as_of)

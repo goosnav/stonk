@@ -18,11 +18,42 @@ def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+_POSITIVE_DIRECTIONS = {"long", "long_call"}
+
+
+def direction_sign(direction: Direction | str) -> float:
+    """Canonical sign contract: direction owns sign; score owns magnitude."""
+    allowed = _POSITIVE_DIRECTIONS | {
+        "short_bias", "avoid", "hedge", "long_put",
+    }
+    if direction not in allowed:
+        raise ValueError(f"unsupported signal direction: {direction}")
+    return 1.0 if direction in _POSITIVE_DIRECTIONS else -1.0
+
+
+def signed_alpha(event_or_direction, score: float | None = None,
+                 confidence: float | None = None) -> float:
+    """Signed activation for live objects and legacy persisted signal rows.
+
+    `abs(score)` repairs rows written under the old mixed signed/unsigned
+    convention without allowing a negative avoid score to become positive.
+    """
+    if isinstance(event_or_direction, SignalEvent):
+        direction = event_or_direction.direction
+        magnitude = event_or_direction.score
+        certainty = event_or_direction.confidence
+    else:
+        direction = event_or_direction
+        magnitude = 0.0 if score is None else score
+        certainty = 1.0 if confidence is None else confidence
+    return direction_sign(direction) * abs(float(magnitude)) * float(certainty)
+
+
 @dataclass
 class SignalEvent:
     symbol: str
     direction: Direction
-    score: float                 # -1..+1
+    score: float                 # magnitude 0..1; direction owns sign
     confidence: float            # 0..1
     horizon_days: int
     expected_return: float       # simple return over horizon, pre-cost
@@ -32,6 +63,15 @@ class SignalEvent:
     data_as_of: datetime
     node_id: str
     node_version: str = "1"
+
+    def __post_init__(self) -> None:
+        direction_sign(self.direction)
+        if not 0.0 <= float(self.score) <= 1.0:
+            raise ValueError("SignalEvent.score must be a magnitude in [0,1]")
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("SignalEvent.confidence must be in [0,1]")
+        if self.horizon_days < 1:
+            raise ValueError("SignalEvent.horizon_days must be positive")
 
 
 @dataclass
@@ -56,6 +96,18 @@ class TradeCandidate:
     risk_flags: list[str] = field(default_factory=list)
     confidence_label: str = "low"   # low | medium | high (basis size)
     regime: str = "neutral"
+    evidence_version: str = "evidence.v1"
+    evidence_coverage: float = 0.0
+    evidence_details: list[dict] = field(default_factory=list)
+    production_score: float = 0.0
+    strategy_contribution: float = 0.0
+    learned_contribution: float = 0.0
+    neural_blend: float = 0.0        # direct TCN blend weight applied this cycle
+    neural_contribution: float = 0.0  # final_score − pre-blend deterministic score
+    strategy_mandate_id: Optional[str] = None
+    entry_mode: str = "normal"       # normal | probe
+    size_multiplier: float = 1.0     # probe = 25% of otherwise computed target
+    entry_mode_reason: Optional[str] = None
     # option-only fields
     option_symbol: Optional[str] = None
     option_details: Optional[dict] = None

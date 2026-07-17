@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,6 +75,64 @@ def _base_health() -> dict:
 def test_rollup_ok_when_market_closed_and_not_trading():
     status, alerts = rollup(_base_health())
     assert status == "ok" and alerts == []
+
+
+def test_exchange_calendar_handles_holiday_and_early_close():
+    et = ZoneInfo("America/New_York")
+    holiday = health_mod._market_clock(datetime(2026, 7, 3, 11, tzinfo=et))
+    before_close = health_mod._market_clock(datetime(2026, 11, 27, 12, 30, tzinfo=et))
+    after_close = health_mod._market_clock(datetime(2026, 11, 27, 13, 30, tzinfo=et))
+    assert holiday["open"] is False and holiday["session"] == "holiday"
+    assert before_close["open"] is True
+    assert after_close["open"] is False
+
+
+def test_status_account_snapshot_is_single_flight_and_stale_tolerant(
+        cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+    calls = {"n": 0}
+    original = PaperBroker.get_account
+
+    def counted(self):
+        calls["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(PaperBroker, "get_account", counted)
+    app = create_app(cfg, store, with_scheduler=False)
+    with TestClient(app) as c:
+        assert c.get("/api/status").status_code == 200
+        assert c.get("/api/status").json()["account_source"] == "cache"
+        assert calls["n"] == 1
+        app.state.account_cache["at"] = datetime.now().astimezone() - timedelta(seconds=61)
+
+        def unavailable(self):
+            raise RuntimeError("provider temporarily unavailable")
+
+        monkeypatch.setattr(PaperBroker, "get_account", unavailable)
+        stale = c.get("/api/status")
+        assert stale.status_code == 200
+        assert stale.json()["account_stale"] is True
+        assert stale.json()["account_source"] == "stale_cache"
+
+
+def test_status_account_snapshot_survives_service_restart(cfg, store, monkeypatch):
+    from specforge.broker.paper import PaperBroker
+    first = create_app(cfg, store, with_scheduler=False)
+    with TestClient(first) as c:
+        baseline = c.get("/api/status")
+        assert baseline.status_code == 200
+    assert store.kv_get("account_snapshot_cache")
+
+    def unavailable(self):
+        raise RuntimeError("broker offline after restart")
+
+    monkeypatch.setattr(PaperBroker, "get_account", unavailable)
+    restarted = create_app(cfg, store, with_scheduler=False)
+    with TestClient(restarted) as c:
+        status = c.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["account_stale"] is True
+    assert status.json()["equity"] == baseline.json()["equity"]
 
 
 def test_rollup_degraded_on_broker_disconnect_and_kill_switch():
@@ -150,6 +210,70 @@ def test_system_health_last_error_is_sanitized_and_aged(cfg, store, monkeypatch)
     assert all("934803396" not in a for a in h["alerts"])
 
 
+def test_newer_connected_broker_probe_resolves_old_probe_error(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    store.audit("broker_probe_failed", {"error": "temporary auth failure"})
+    store.kv_set("broker_health", {"adapter": "paper", "connected": True,
+                                   "detail": "", "as_of": _now_iso()})
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["broker"]["connected"] is True
+    assert h["last_error"] is None
+    assert not any("broker_probe_failed" in alert for alert in h["alerts"])
+
+
+def test_closed_market_scheduler_is_idle_not_dead(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["operational_state"] in ("closed_idle", "researching")
+    assert h["trading_loop"]["state"] == "closed"
+    assert h["research_worker"]["state"] in ("idle", "running")
+    assert "model" in h and "ready" in h["model"]
+    assert h["engine"]["operational_state"] == "closed_idle"
+    store.kv_set("research_state", {"phase": "tcn", "detail": "training",
+                                    "at": _now_iso()})
+    store.kv_set("research_worker_lease:training", {
+        "owner": f"{os.getpid()}:1", "expires_at": time.time() + 60})
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["engine"]["operational_state"] == "researching"
+    h = system_health(cfg, store, scheduler_alive=False)
+    assert h["engine"]["operational_state"] == "offline"
+
+
+def test_live_health_reports_learned_stack_shadow_without_blocking_baseline(cfg, store, monkeypatch):
+    cfg.data["mode"] = "live"
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(True))
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["model"]["block_reason"] == "BLOCKED: GRAPH"
+    assert h["model"]["production_evidence"] is True
+    assert not any("new entries blocked" in reason.lower()
+                   for reason in h["readiness"]["reasons"])
+
+
+def test_running_operator_job_surfaces_as_researching(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    now = _now_iso()
+    store.db.execute(
+        "INSERT INTO research_jobs(id,kind,status,priority,requested_at,started_at,payload,"
+        "progress,attempts,state,resource_class,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("j1", "train_holdings", "running", 10, now, now, "{}",
+         '{"symbol":"AAPL","index":1,"total":7}', 1, "running", "training", now))
+    store.db.commit()
+    h = system_health(cfg, store, scheduler_alive=True)
+    assert h["engine"]["operational_state"] == "researching"
+    assert h["engine"]["active_research_job"]["progress"]["symbol"] == "AAPL"
+
+
+def test_dead_research_owner_never_looks_running(cfg, store, monkeypatch):
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    store.kv_set("research_state", {"phase": "tcn", "detail": "training",
+                                    "at": _now_iso()})
+    store.kv_set("research_worker_lease:training", {
+        "owner": "99999999:1", "expires_at": time.time() + 600})
+    health = system_health(cfg, store, scheduler_alive=True)
+    assert health["research_worker"]["state"] != "running"
+    assert health["operational_state"] == "closed_idle"
+
+
 # ---------------- endpoints ----------------
 
 def test_liveness_endpoint_is_dependency_free(client):
@@ -158,6 +282,132 @@ def test_liveness_endpoint_is_dependency_free(client):
     body = r.json()
     assert body["ok"] is True and body["pid"] > 0 and body["uptime_s"] >= 0
     assert body["mode"] == "paper"
+
+
+def test_m1a_health_aliases_and_cross_origin_write_guard(client):
+    live = client.get("/health/live")
+    ready = client.get("/health/ready")
+    assert live.status_code == 200 and live.json()["ok"] is True
+    assert ready.status_code == 200 and ready.json()["ready"] is True
+    refused = client.post("/api/research/jobs", json={"kind": "discover"},
+                          headers={"Origin": "https://malicious.example"})
+    assert refused.status_code == 403
+    allowed = client.post("/api/research/jobs", json={"kind": "discover"},
+                          headers={"Origin": "http://testserver"})
+    assert allowed.status_code == 200
+    rebound = client.post("/api/risk", json={"max_daily_loss": 0.01},
+                          headers={"Host": "attacker.test"})
+    assert rebound.status_code == 400
+
+
+def test_montecarlo_horizon_is_bounded_before_allocation(client):
+    response = client.get("/api/montecarlo?horizon_days=100000000")
+    assert response.status_code == 400
+    assert "between 1 and 252" in response.json()["detail"]
+
+
+def test_broker_connect_is_single_flight(client, cfg, store, monkeypatch):
+    from specforge.broker.robinhood_mcp import RobinhoodMCPBroker
+    cfg.data["broker"] = "robinhood_mcp"
+    monkeypatch.setattr("specforge.app.current_config", lambda _store, _mode: cfg)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_probe(self):
+        assert self.interactive_auth is True
+        started.set(); release.wait(2)
+        return {"connected": True, "accounts": []}
+
+    monkeypatch.setattr(RobinhoodMCPBroker, "probe", slow_probe)
+    assert client.post("/api/broker/connect").json()["ok"] is True
+    assert started.wait(1)
+    duplicate = client.post("/api/broker/connect").json()
+    assert duplicate["state"] == "already_connecting"
+    release.set()
+    for _ in range(30):
+        if (store.kv_get("broker_probe") or {}).get("state") == "connected":
+            break
+        time.sleep(.01)
+    assert store.kv_get("broker_probe")["state"] == "connected"
+
+
+def test_paper_mode_cannot_start_robinhood_connect(client):
+    response = client.post("/api/broker/connect")
+    assert response.status_code == 409
+    assert "unavailable" in response.json()["detail"]
+
+
+def test_failed_broker_probe_is_redacted_and_cooldown_persists(
+        client, cfg, store, monkeypatch):
+    from specforge.broker.robinhood_mcp import RobinhoodMCPBroker
+    cfg.data["broker"] = "robinhood_mcp"
+    monkeypatch.setattr("specforge.app.current_config", lambda _store, _mode: cfg)
+    calls = 0
+
+    def failed_probe(self):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("Authorization: Bearer sk_supersecretvalue123456 account 123456789")
+
+    monkeypatch.setattr(RobinhoodMCPBroker, "probe", failed_probe)
+    assert client.post("/api/broker/connect").status_code == 200
+    for _ in range(100):
+        if (store.kv_get("broker_probe") or {}).get("state") == "error":
+            break
+        time.sleep(.01)
+    status_text = client.get("/api/broker/status").text
+    assert "sk_supersecretvalue123456" not in status_text and "123456789" not in status_text
+    audit = next(row for row in store.audit_rows()
+                 if row["event_type"] == "broker_probe_failed")
+    assert "sk_supersecretvalue123456" not in audit["payload"] and "123456789" not in audit["payload"]
+    assert client.post("/api/broker/connect").json()["state"] == "already_connecting"
+    assert calls == 1
+
+
+def test_stale_connected_probe_allows_explicit_reconnect(client, cfg, store, monkeypatch):
+    from specforge.broker.robinhood_mcp import RobinhoodMCPBroker
+    cfg.data["broker"] = "robinhood_mcp"
+    monkeypatch.setattr("specforge.app.current_config", lambda _store, _mode: cfg)
+    store.kv_set("broker_probe", {"connected": True, "state": "connected",
+                                  "probed_at": "2020-01-01T00:00:00+00:00"})
+    started = threading.Event()
+    monkeypatch.setattr(RobinhoodMCPBroker, "probe",
+                        lambda self: (started.set() or {"connected": True, "accounts": []}))
+    result = client.post("/api/broker/connect").json()
+    assert result.get("state") != "already_connected"
+    assert started.wait(1)
+    for _ in range(100):
+        if (store.kv_get("broker_probe") or {}).get("state") == "connected":
+            break
+        time.sleep(.01)
+    assert store.kv_get("broker_probe")["state"] == "connected"
+
+
+def test_bridge_mode_never_opens_mcp_oauth(client, cfg, store, monkeypatch):
+    cfg.data["broker"] = "robinhood_bridge"
+    monkeypatch.setattr("specforge.app.current_config", lambda _store, _mode: cfg)
+    assert client.post("/api/broker/connect").status_code == 409
+
+
+def test_broker_status_clears_old_connect_error_after_successful_read(client, store):
+    store.kv_set("broker_probe", {"connected": False, "state": "error",
+                                  "error": "old OAuth failure"})
+    store.kv_set("broker_health", {"adapter": "paper", "connected": True,
+                                   "detail": "", "as_of": _now_iso()})
+    probe = client.get("/api/broker/status").json()["probe"]
+    assert probe["state"] == "connected" and probe["connected"] is True
+    assert "error" not in probe
+
+
+def test_robinhood_token_document_is_atomic_and_recovers_corruption(tmp_path, monkeypatch):
+    from specforge.broker import robinhood_mcp
+    path = tmp_path / "rh_tokens.json"
+    monkeypatch.setattr(robinhood_mcp, "TOKEN_PATH", path)
+    robinhood_mcp._save_token_document({"tokens": {"access_token": "secret"}})
+    assert robinhood_mcp._token_document()["tokens"]["access_token"] == "secret"
+    assert not path.with_suffix(".json.tmp").exists()
+    path.write_text("{not-json")
+    assert robinhood_mcp._token_document() == {}
+    assert list(tmp_path.glob("rh_tokens.json.corrupt-*"))
 
 
 def test_metrics_contract_healthy(client, cfg, store, monkeypatch):
@@ -293,3 +543,79 @@ def test_checker_against_real_server(cfg, store, monkeypatch, capsys):
         assert code == 0 and "OK" in human
     finally:
         server.should_exit = True
+
+
+def test_scheduler_registers_premarket_session_probe(cfg, store):
+    """The unattended service must check auth before the opening bell without
+    relying on a dashboard request (and without entering interactive OAuth)."""
+    app = create_app(cfg, store, with_scheduler=True)
+    try:
+        jobs = {job.id for job in app.state.scheduler.get_jobs()}
+        assert "broker_session_check" in jobs
+        assert "research" in jobs
+        assert {"operator_discovery", "operator_intelligence",
+                "operator_training"} <= jobs
+    finally:
+        app.state.stopping = True
+        app.state.scheduler.shutdown(wait=False)
+
+
+def test_closed_market_research_spawns_isolated_one_shot_worker(cfg, store, monkeypatch):
+    """The scheduler must not import/run Torch research in the web process."""
+    calls = []
+
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(health_mod, "_market_clock", _clock(False))
+    monkeypatch.setenv("RH_ACCOUNT_WHITELIST", "must-not-reach-worker")
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    app = create_app(cfg, store, with_scheduler=True)
+    try:
+        app.state.scheduler.get_job("research").func()
+        assert len(calls) == 1
+        argv, kwargs = calls[0]
+        assert argv[-3:] == ["autonomous", "--max-seconds", "600"]
+        assert kwargs["shell"] is False and kwargs["start_new_session"] is True
+        assert "RH_ACCOUNT_WHITELIST" not in kwargs["env"]
+        assert kwargs["env"]["STONK_RESEARCH_WORKER"] == "1"
+        # A second tick observes the live child and does not duplicate it.
+        app.state.scheduler.get_job("research").func()
+        assert len(calls) == 1
+        killed = []
+        monkeypatch.setattr("os.killpg", lambda pid, sig: killed.append(pid))
+        app.state.worker_deadlines["autonomous"] = 0
+        state = app.state.worker_snapshot()
+        assert state["autonomous"]["state"] == "timed_out"
+        assert killed == [4242]
+    finally:
+        app.state.stopping = True
+        app.state.scheduler.shutdown(wait=False)
+
+
+def test_operator_poll_recovers_worker_that_died_after_startup(cfg, store):
+    from specforge.research import enqueue_job
+    app = create_app(cfg, store, with_scheduler=True)
+    try:
+        # Simulate a crash after the startup recovery pass, then the ordinary
+        # discovery lane poll that must repair it.
+        job = enqueue_job(store, "discover")
+        with store.db:
+            store.db.execute(
+                "UPDATE research_jobs SET status='running',state='running',attempts=1,"
+                "worker_id='99999999:1:discovery',"
+                "lease_expires_at='2020-01-01T00:00:00+00:00' WHERE id=?", (job["id"],))
+        app.state.scheduler.get_job("operator_discovery").func("discovery")
+        row = store.db.execute("SELECT status,state FROM research_jobs WHERE id=?",
+                               (job["id"],)).fetchone()
+        assert row["status"] == "queued" and row["state"] == "retry_wait"
+    finally:
+        app.state.stopping = True
+        app.state.scheduler.shutdown(wait=False)

@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import tempfile
+import unicodedata
 from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "configs"
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _load_dotenv() -> None:
@@ -22,10 +26,67 @@ def _load_dotenv() -> None:
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+            key = k.strip()
+            if os.environ.get("STONK_RESEARCH_WORKER") == "1" and \
+                    key.upper().startswith(("RH_", "ROBINHOOD_", "MCP_")):
+                continue
+            os.environ.setdefault(key, v.strip())
 
 
 _load_dotenv()
+
+
+def _validate_env_pair(key: str, value: str) -> None:
+    if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+        raise ValueError("invalid environment variable name")
+    if not isinstance(value, str):
+        raise TypeError("environment variable value must be a string")
+    if any(unicodedata.category(char).startswith("C") or
+           unicodedata.category(char) in {"Zl", "Zp"} for char in value):
+        raise ValueError("environment variable value contains control characters")
+
+
+def set_env_vars(values: dict[str, str]) -> None:
+    """Atomically persist one or more validated environment settings."""
+    for key, value in values.items():
+        _validate_env_pair(key, value)
+    env = ROOT / ".env"
+    lines = env.read_text().splitlines() if env.exists() else []
+    for key, value in values.items():
+        prefix = f"{key}="
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith(prefix):
+                lines[i] = f"{key}={value}"
+                break
+        else:
+            lines.append(f"{key}={value}")
+
+    # Write beside the destination and replace it atomically.  The restrictive
+    # mode is applied at creation time so a crash cannot briefly expose a
+    # secret through a world-readable temporary file.
+    fd, temp_name = tempfile.mkstemp(prefix=".env.", dir=ROOT)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            temp_file.write("\n".join(lines) + "\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, env)
+        try:
+            env.chmod(0o600)            # secrets live here — keep it owner-only
+        except OSError:
+            pass                        # temp file was already created as 0600
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    os.environ.update(values)
 
 
 def set_env_var(key: str, value: str) -> None:
@@ -33,21 +94,7 @@ def set_env_var(key: str, value: str) -> None:
     This is the persistent secret store (.env is gitignored, chmod 600). Live
     apply means the next AIClient() — built fresh each scan — picks it up
     without a server restart. Callers must never log `value`."""
-    env = ROOT / ".env"
-    lines = env.read_text().splitlines() if env.exists() else []
-    prefix = f"{key}="
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith(prefix):
-            lines[i] = f"{key}={value}"
-            break
-    else:
-        lines.append(f"{key}={value}")
-    env.write_text("\n".join(lines) + "\n")
-    try:
-        env.chmod(0o600)                # secrets live here — keep it owner-only
-    except OSError:
-        pass
-    os.environ[key] = value
+    set_env_vars({key: value})
 
 # (path, predicate, message) — governor-level sanity on config itself
 _DANGEROUS = [

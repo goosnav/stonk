@@ -64,8 +64,12 @@ class Node(SignalNode):
                 continue
             c = ctx.closes(sym)
             if len(c) < 30:
+                self.symbol_states[sym] = "unavailable"
                 continue
-            for ev in self._earnings(ctx, sym):
+            rows = self._earnings(ctx, sym)
+            self.symbol_states[sym] = ("unavailable" if self.degraded_reason and not rows
+                                       else "verified_neutral")
+            for ev in rows:
                 ev_date = ev["date"]
                 if ev_date > ctx.as_of:                   # future event: not tradable
                     continue
@@ -92,5 +96,6 @@ class Node(SignalNode):
                     evidence=[f"EPS surprise {ev['surprise_pct']:+.1%} on {ev_date}, "
                               f"reaction {reaction:+.1%}, {days_ago}d ago"],
                     data_as_of=as_of, node_id=self.id, node_version=self.version))
+                self.symbol_states[sym] = "running"
                 break                                     # one signal per symbol
         return events

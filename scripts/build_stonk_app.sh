@@ -41,6 +41,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>Stonk</string>
   <key>CFBundleIconFile</key><string>stonk</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSArchitecturePriority</key><array><string>arm64</string><string>x86_64</string></array>
+  <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
 
@@ -50,6 +52,27 @@ cat > "$APP/Contents/MacOS/Stonk" <<LAUNCH
 open -a Terminal "$REPO/scripts/stonk_app.sh"
 LAUNCH
 chmod +x "$APP/Contents/MacOS/Stonk" "$REPO/scripts/stonk_app.sh"
+
+# Local builds are ad-hoc signed and verify on Apple Silicon. A release build
+# becomes Gatekeeper-distributable when a Developer ID and notary profile are
+# supplied; credentials never live in the repository.
+IDENTITY="${STONK_CODESIGN_IDENTITY:--}"
+if [ "$IDENTITY" = "-" ]; then
+  codesign --force --deep --options runtime --sign - "$APP"
+else
+  codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" "$APP"
+fi
+codesign --verify --deep --strict --verbose=2 "$APP"
+if [ -n "${STONK_NOTARY_PROFILE:-}" ] && [ "$IDENTITY" != "-" ]; then
+  ditto -c -k --keepParent "$APP" "$APP.zip"
+  xcrun notarytool submit "$APP.zip" --keychain-profile "$STONK_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  rm -f "$APP.zip"
+  spctl --assess --type execute --verbose=2 "$APP"
+else
+  echo "local ad-hoc signature applied; set STONK_CODESIGN_IDENTITY and " \
+       "STONK_NOTARY_PROFILE for notarized Gatekeeper distribution"
+fi
 
 # refresh Finder's icon cache for this bundle
 touch "$APP"

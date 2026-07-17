@@ -58,7 +58,9 @@ Post-close job: mark-to-market equity curve, close matured trade records,
 | `broker/` | Adapter protocol + paper + robinhood_mcp + bridge | BrokerAdapter |
 | `backtest.py` | Walk-forward daily sim, costs, SPY baseline, writes analog trades used by forecast.py | — |
 | `attribution.py` | Fill→node linkage, scorecards, Bayesian-shrunk bounded weight updates, pruning | — |
-| `ai.py` | OpenRouter-compatible client, reserve-then-commit budget ledger, cache | — |
+| `ai.py` | One-shot router: Codex CLI → Claude CLI → budgeted API, with schemas/cache/circuit breakers | AIClient |
+| `intelligence.py` | Durable news/strategy jobs, classification batches, deterministic company aggregation | — |
+| `strategy.py` | Immutable operator direction → validated AI mandate → bounded model context | — |
 | `hypothesis.py` | V4/D34: two-tier AI hypotheses (north star + short term), file mirror + dated archive, strict-JSON generation, staleness | — |
 | `steering.py` | V4/D34: non-blocking strategic-choice queue, tiered expiry defaults, validated apply paths, post-close maintenance | — |
 | `montecarlo.py` | Portfolio path simulation (AGENTS.md §25) for GUI/risk | — |
@@ -90,6 +92,66 @@ either. No ORM — schema in `store.py`, plain SQL.
 - Nightly: recompute node scorecards (hit rate, expectancy, IC, drawdown, by-regime).
 - Weight update: `w_new = clamp(base_w × shrunk_expectancy_multiplier, bounds)`,
   shrinkage toward zero edge until `min_trades_before_update` reached.
-- Pruning: auto-disable on negative live expectancy with n≥30, node drawdown breach,
-  or cost > edge. Promotion (experimental→probation→production) requires human
+- Pruning: automatically deemphasize toward a status-specific nonzero floor on
+  negative live expectancy or cost exceeding edge; only the operator toggle
+  can fully disable a node. Promotion (experimental→probation→production) requires human
   approval via GUI; the system only *proposes*.
+
+## Dual-network research plane (D41)
+
+Specialist equations also feed `graph.py`, a bounded analog-neural DAG:
+
+```text
+specialist base equation
+  → base scale + learned incoming edges + bias
+  → role-compatible activation
+  → interaction nodes
+  → 5d/21d outputs
+  → capped blend with deterministic ensemble
+  → portfolio → governor → execution
+```
+
+The graph learns connections, not hidden replacements for specialist logic.
+The governor, portfolio accounting, execution, and broker are structurally
+forbidden graph nodes. `neural.py` is a causal quantile TCN specialist inside
+the graph, with optional complete per-holding clones. Champions are immutable;
+research produces challengers and promotion swaps checkpoints atomically.
+
+The market-hours production path is `evidence.v2`, not the learned graph's
+initial priors. Individual-company family budgets are fixed at business 30%,
+catalyst 20%, point-in-time financial quality 15%, market/sector context 15%,
+and price/liquidity behavior 20%. Direction owns sign through the shared
+`signed_alpha()` contract. Missing evidence contributes zero and reduces
+coverage/position size. A failed learned overlay rolls back to zero; it does not
+disable this production path or protective exits.
+
+`research.py` is the closed-market state machine. It derives due work from
+durable watermarks rather than owning a second queue system. `universe.py`
+maintains official catalog/research/active tiers and fails back to the committed
+universe. Market-hours cycles consume the last good active snapshot.
+
+## GPT-first intelligence and TCN schema 5 (D47)
+
+Every intelligence caller uses one router. Codex runs first as a one-shot
+`codex exec` process with its prompt on stdin, an ephemeral read-only empty
+workspace, a purpose JSON schema, no application secrets, and no interactive
+login. Claude is the local fallback with tools, MCP, Chrome, and persistence
+disabled; configured OpenRouter/OpenAI/Anthropic/custom API access is last and
+remains covered by the dollar budget. Routes are editable globally or per
+purpose and apply to the next background job.
+
+Operator direction is immutable advisory text. Strategy AI synthesizes a
+separate mandate and explains accepted, modified, and rejected points. Only an
+explicitly activated mandate can affect discovery or the `strategy_context`
+node. Its signed vote is capped at ±0.15 and is zero unless independent
+production-evidence, coverage, after-cost, liquidity, tradability, and governor
+gates pass. Raw operator text is never a TCN feature or an order input.
+
+TCN schema 5 uses 44 point-in-time market, sector, volatility-structure, SEC,
+news, event, and missingness inputs. Three residual dilated convolution blocks
+feed separate 5d/21d quantile and probability heads. Six immutable trials vary
+optimizer and same-date ranking loss; validation alone selects and calibrates a
+challenger before sealed testing. Training chooses CUDA, Apple MPS, or bounded
+CPU and retains train-only normalization, embargoes, hashes, and simple-model
+comparisons. It remains exactly one temporal graph node and contributes nothing
+until the objective ramp gates pass.

@@ -35,6 +35,8 @@ def _seed_backtest_db(src_path: str, bt_path: Path) -> Store:
     bt = Store(bt_path)
     bt.db.execute("ATTACH DATABASE ? AS src", (str(src_path),))
     bt.db.execute("INSERT INTO bars SELECT * FROM src.bars")
+    bt.db.execute("INSERT OR IGNORE INTO instruments SELECT * FROM src.instruments")
+    bt.db.execute("INSERT OR IGNORE INTO filing_facts SELECT * FROM src.filing_facts")
     # carry over kv caches for flaky external data (earnings/fundamentals)
     bt.db.execute("INSERT OR IGNORE INTO kv SELECT * FROM src.kv WHERE "
                   "key LIKE 'earnings_%' OR key LIKE 'fundamentals_%'")
@@ -43,21 +45,29 @@ def _seed_backtest_db(src_path: str, bt_path: Path) -> Store:
     return bt
 
 
-def run_backtest(cfg, years: int = 10, tag: str = "default",
+def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "research",
                  copy_analogs_to: Store | None = None, log=print) -> dict:
     src_db = cfg.get("db_path", default="data/specforge.db")
-    bt_path = Path(f"data/backtest_{tag}.db")
+    if scale not in ("live", "research"):
+        raise ValueError("scale must be live or research")
+    bt_path = Path(f"data/backtest_{tag}_{scale}.db")
     bt = _seed_backtest_db(src_db, bt_path)
 
     # backtest config: the caller's merged config (so `--mode aggressive
     # backtest` tests that risk profile) with broker forced to paper and the
     # approval queue off (no human in a simulation)
     from .config import Config, _deep_merge
+    starting_cash = 100.0 if scale == "live" else 10_000.0
+    risk_override = {"approval_mode": "auto"}
+    if scale == "research":
+        risk_override["time_step_budget_abs_cap"] = max(
+            float(cfg.get("risk", "time_step_budget_abs_cap", default=50)),
+            starting_cash * float(cfg.get("risk", "time_step_budget_pct", default=.1)))
     bt_cfg = Config(_deep_merge(cfg.data, {
         "db_path": str(bt_path),
         "mode": "paper", "broker": "paper", "live_trading_enabled": False,
-        "risk": {"approval_mode": "auto"},
-        "paper": {"starting_cash": 10000.0},
+        "risk": risk_override,
+        "paper": {"starting_cash": starting_cash},
     }))
     bt_cfg.validate()
 
@@ -86,8 +96,10 @@ def run_backtest(cfg, years: int = 10, tag: str = "default",
     _liquidate(bt, bt_cfg, broker, dates[-1])
 
     report = _report(bt, bt_cfg, dates, years, tag)
+    report.update(scale=scale, starting_cash=starting_cash)
     out_dir = Path("dev/reports"); out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"backtest_{tag}.json").write_text(json.dumps(report, indent=2, default=str))
+    (out_dir / f"backtest_{tag}_{scale}.json").write_text(
+        json.dumps(report, indent=2, default=str))
 
     # push earnings/fundamentals kv caches back to the main DB so the next
     # backtest (bt DB is recreated each run) doesn't refetch from yfinance
@@ -114,7 +126,7 @@ def _liquidate(bt: Store, bt_cfg, broker, last_day: str) -> None:
     from .data import MarketContext
     from .execution import Executor
     from .risk import Governor
-    ctx = MarketContext(bt, bt_cfg, as_of=last_day)
+    ctx = MarketContext(bt, bt_cfg, as_of=last_day, historical=True)
     broker.set_quotes(ctx.prices())
     gov = Governor(bt_cfg, bt, now_iso=f"{last_day}T20:00:00")
     ex = Executor(bt_cfg, bt, broker, gov)
@@ -168,6 +180,15 @@ def _report(bt: Store, bt_cfg, dates: list[str], years: int, tag: str) -> dict:
     friction = (bt_cfg.get("execution", "spread_cost_bps", default=3)
                 + bt_cfg.get("execution", "slippage_bps", default=5)) * 2 / 10000
     spy_return = (spy_in[-1] / spy_in[0]) * (1 - friction) - 1 if len(spy_in) > 1 else None
+    exposure = [max(0.0, min(1.0, 1 - r["cash"] / r["equity"])) if r["equity"] else 0
+                for r in curve]
+    matched = 1.0
+    for i in range(1, min(len(curve), len(dates))):
+        a, b = spy.get(curve[i - 1]["d"]), spy.get(curve[i]["d"])
+        if a and b:
+            matched *= 1 + exposure[i - 1] * (b / a - 1)
+    filled = bt.db.execute("SELECT notional FROM orders WHERE status='filled'").fetchall()
+    avg_equity = sum(r["equity"] for r in curve) / max(1, len(curve))
 
     # OOS: first 70% vs last 30% of sessions
     split = int(len(curve) * 0.7)
@@ -188,6 +209,12 @@ def _report(bt: Store, bt_cfg, dates: list[str], years: int, tag: str) -> dict:
         "in_sample_70pct": _metrics(curve[:split]),
         "out_of_sample_30pct": _metrics(curve[split:]),
         "benchmark_buy_hold_return": round(spy_return, 4) if spy_return is not None else None,
+        "benchmark_exposure_matched_return": round(matched - 1, 4),
+        "average_exposure": round(sum(exposure) / max(1, len(exposure)), 4),
+        "cash_drag": round(1 - sum(exposure) / max(1, len(exposure)), 4),
+        "turnover_multiple": round(sum(r["notional"] for r in filled) / max(1, avg_equity), 3),
+        "average_filled_order_notional": round(
+            sum(r["notional"] for r in filled) / max(1, len(filled)), 2),
         "n_trades": len(trades),
         "win_rate": round(len(wins) / len(trades), 3) if trades else None,
         "avg_win": round(sum(t["ret"] for t in wins) / len(wins), 4) if wins else None,

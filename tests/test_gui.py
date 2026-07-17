@@ -64,3 +64,35 @@ def test_dashboard_renders_all_tabs_without_js_errors(gui_server):
     # transient fetch aborts during teardown are fine; real JS errors are not
     real = [e for e in errors if "Failed to fetch" not in e and "NetworkError" not in e]
     assert not real, f"JS errors: {real}"
+
+
+def test_dashboard_keyboard_tabs_and_narrow_reflow(gui_server):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 400, "height": 900})
+        page.goto(gui_server, wait_until="networkidle", timeout=30000)
+        tabs = page.get_by_role("tab")
+        assert tabs.count() == 8
+        tabs.nth(0).focus()
+        page.keyboard.press("End")
+        assert tabs.nth(7).get_attribute("aria-selected") == "true"
+        page.keyboard.press("Home")
+        assert tabs.nth(0).get_attribute("aria-selected") == "true"
+        width = page.evaluate("document.documentElement.scrollWidth")
+        assert width <= 400
+        browser.close()
+
+
+def test_first_load_feed_failure_remains_visible(gui_server):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.route("**/api/status", lambda route: route.abort())
+        page.goto(gui_server, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(1800)
+        status = page.get_by_role("status").filter(has_text="FEED ERROR")
+        assert status.count() >= 1
+        assert "retrying automatically" in (page.text_content("#feedstatus") or "")
+        browser.close()

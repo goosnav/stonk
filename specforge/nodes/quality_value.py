@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ..data import MarketContext
+from ..models import SignalEvent
 from .base import SignalNode
 
 ETFISH = {"SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP",
@@ -49,6 +50,9 @@ class Node(SignalNode):
             return data
 
     def passes(self, ctx: MarketContext, symbol: str) -> bool:
+        point_in_time = self.graph_score(ctx, symbol)
+        if point_in_time is not None:
+            return point_in_time > -0.5
         if symbol in ETFISH or symbol.startswith("^"):
             return True
         f = self._fundamentals(ctx, symbol)
@@ -60,3 +64,80 @@ class Node(SignalNode):
             f.get("debtToEquity") is None or f["debtToEquity"] < 400,
         ]
         return all(checks)
+
+    def graph_score(self, ctx: MarketContext, symbol: str) -> float | None:
+        """Auditable annual quality composite; no quarter/year mismatches."""
+        inst = ctx.store.db.execute(
+            "SELECT cik FROM instruments WHERE symbol=?", (symbol,)).fetchone()
+        if not inst or not inst["cik"]:
+            return None
+        tags = ("Assets", "AssetsCurrent", "LiabilitiesCurrent", "StockholdersEquity",
+                "EarningsPerShareDiluted", "OperatingIncomeLoss", "Revenues",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "NetCashProvidedByUsedInOperatingActivities",
+                "PaymentsToAcquirePropertyPlantAndEquipment", "LongTermDebt",
+                "LongTermDebtCurrent", "LongTermDebtNoncurrent",
+                "CommonStockSharesOutstanding")
+        marks = ",".join("?" for _ in tags)
+        rows = ctx.store.db.execute(
+            f"SELECT tag,value,period_end,filed FROM filing_facts WHERE cik=? AND filed<=? "
+            "AND form IN ('10-K','10-K/A') "
+            f"AND tag IN ({marks}) ORDER BY period_end DESC,filed DESC",
+            (str(inst["cik"]), ctx.as_of, *tags)).fetchall()
+        by_period = {}
+        for row in rows:
+            by_period.setdefault(row["period_end"], {}).setdefault(
+                row["tag"], float(row["value"]))
+        periods = sorted(by_period, reverse=True)
+        if not periods:
+            return None
+        latest = by_period[periods[0]]
+        prior = by_period[periods[1]] if len(periods) > 1 else {}
+        revenue = latest.get("RevenueFromContractWithCustomerExcludingAssessedTax",
+                             latest.get("Revenues"))
+        prior_revenue = prior.get("RevenueFromContractWithCustomerExcludingAssessedTax",
+                                  prior.get("Revenues"))
+        assets, equity, eps = (latest.get("Assets"), latest.get("StockholdersEquity"),
+                               latest.get("EarningsPerShareDiluted"))
+        evidence = []
+        if assets and equity is not None:
+            evidence.append(max(-1.0, min(1.0, (equity / assets - .2) / .3)))
+        if eps is not None:
+            evidence.append(.5 if eps > 0 else -.5)
+        if revenue not in (None, 0):
+            op = latest.get("OperatingIncomeLoss")
+            cfo = latest.get("NetCashProvidedByUsedInOperatingActivities")
+            capex = latest.get("PaymentsToAcquirePropertyPlantAndEquipment", 0)
+            if op is not None:
+                evidence.append(max(-1.0, min(1.0, op / revenue / .20)))
+            if cfo is not None:
+                evidence.append(max(-1.0, min(1.0, (cfo - capex) / revenue / .15)))
+            if prior_revenue not in (None, 0):
+                evidence.append(max(-1.0, min(1.0, (revenue / prior_revenue - 1) / .25)))
+        if assets:
+            debt = sum(v for v in (latest.get("LongTermDebtCurrent"),
+                                   latest.get("LongTermDebtNoncurrent")) if v is not None)
+            debt = debt or latest.get("LongTermDebt")
+            if debt is not None:
+                evidence.append(max(-1.0, min(1.0, (0.5 - debt / assets) / .5)))
+        if latest.get("AssetsCurrent") is not None and \
+                latest.get("LiabilitiesCurrent") not in (None, 0):
+            evidence.append(max(-1.0, min(1.0,
+                latest["AssetsCurrent"] / latest["LiabilitiesCurrent"] - 1)))
+        shares, prior_shares = (latest.get("CommonStockSharesOutstanding"),
+                                prior.get("CommonStockSharesOutstanding"))
+        if shares is not None and prior_shares not in (None, 0):
+            evidence.append(max(-1.0, min(1.0, -(shares / prior_shares - 1) / .10)))
+        return sum(evidence) / len(evidence) if evidence else None
+
+    def graph_signal(self, ctx: MarketContext, symbol: str) -> SignalEvent | None:
+        score = self.graph_score(ctx, symbol)
+        if score is None:
+            return None
+        as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")
+        return SignalEvent(symbol=symbol, direction="long" if score >= 0 else "avoid",
+                           score=round(abs(score), 4), confidence=.7, horizon_days=40,
+                           expected_return=0, expected_volatility=0,
+                           downside_estimate=0,
+                           evidence=[f"point-in-time SEC quality {score:+.2f}"],
+                           data_as_of=as_of, node_id=self.id, node_version=self.version)

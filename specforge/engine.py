@@ -47,18 +47,33 @@ def run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
               refresh_data: bool = True, registry=None, log=print,
               live_quotes: dict | None = None) -> dict:
     if not _CYCLE_LOCK.acquire(blocking=False):
-        store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode})
+        store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode,
+                                              "scope": "in_process"})
         return {"skipped": "a cycle is already running — this one was not started"}
+    lease_resource = f"trading_cycle:{cfg.mode}"
+    lease_owner = None
     try:
+        # Cross-process authority (Sprint E1): the SQLite lease — not the
+        # thread lock — decides. Daemon, CLI, GUI, and a restarted process can
+        # never run concurrent cycles; a crashed worker's lease expires.
+        lease_owner = store.acquire_lease(
+            lease_resource, float(cfg.get("risk", "cycle_lease_seconds", default=900)))
+        if not lease_owner:
+            store.audit("cycle_skipped_overlap", {"as_of": as_of, "mode": cfg.mode,
+                                                  "scope": "cross_process"})
+            return {"skipped": "another process holds the trading-cycle lease"}
         return _run_cycle(cfg, store, broker, as_of, refresh_data, registry,
-                          log, live_quotes)
+                          log, live_quotes, lease=(lease_resource, lease_owner))
     finally:
+        if lease_owner:
+            store.release_lease(lease_resource, lease_owner)
         _CYCLE_LOCK.release()
 
 
 def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                refresh_data: bool = True, registry=None, log=print,
-               live_quotes: dict | None = None) -> dict:
+               live_quotes: dict | None = None,
+               lease: tuple[str, str] | None = None) -> dict:
     cycle_id = new_id()
     trace: list = []
     source = "live" if cfg.mode == "live" else "paper"
@@ -71,9 +86,17 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
 
     # 1. data
     symbols = list(cfg.get("universe", "symbols", default=[]))
+    if refresh_data:
+        # Closed-market research precomputes the broad-to-active funnel. A
+        # missing/incomplete snapshot preserves the proven configured universe.
+        from .universe import symbols as tier_symbols
+        active = tier_symbols(store, "active")
+        if active:
+            symbols = active
     # hypothesis watchlist merge (V4/D34): the active short-term hypothesis may
-    # add a bounded set of symbols to this cycle's scan universe. In-memory
-    # config mutation only — the file/override universe is untouched.
+    # add a bounded set of symbols to this cycle's scan universe. The cycle
+    # universe is CYCLE-LOCAL (passed into MarketContext below) — shared
+    # config is never mutated during execution (Sprint E1).
     if cfg.get("hypothesis", "enabled", default=False):
         from . import hypothesis as hypo_mod
         extra = [s for s in hypo_mod.watchlist(
@@ -82,13 +105,28 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                  if s not in symbols]
         if extra:
             symbols = symbols + extra
-            cfg.data["universe"]["symbols"] = symbols
             store.audit("hypothesis_watchlist_merged", {"added": extra}, cycle_id)
-    aux = [cfg.get("universe", "vix_symbol", default="^VIX")]
+    volatility_symbols = (cfg.get("universe", "volatility_symbols", default={}) or {}).values()
+    aux = list(dict.fromkeys([cfg.get("universe", "vix_symbol", default="^VIX"),
+                              *volatility_symbols,
+                              *cfg.get("universe", "context_symbols", default=[])]))
     if refresh_data:
-        st("data", f"refreshing daily bars for {len(symbols) + len(aux)} symbols")
-        data_mod.refresh(store, symbols + aux, log=log)
-    ctx = MarketContext(store, cfg, as_of, offline=not refresh_data)
+        # Daily histories are settled-data inputs, not a ten-minute quote
+        # feed. During an open session reuse the last completed snapshot; the
+        # post-close/premarket research plane refreshes it. This removes 175
+        # sequential provider calls (and their politeness sleeps) from every
+        # live cycle. Missing history still gets one bootstrap attempt.
+        from .health import _market_clock
+        latest_benchmark = store.latest_bar_date(
+            cfg.get("universe", "benchmark", default="SPY"))
+        if _market_clock()["open"] and latest_benchmark:
+            st("data", f"using cached settled bars ({latest_benchmark}) for "
+                       f"{len(symbols) + len(aux)} symbols")
+        else:
+            st("data", f"refreshing daily bars for {len(symbols) + len(aux)} symbols")
+            data_mod.refresh(store, symbols + aux, log=log)
+    ctx = MarketContext(store, cfg, as_of, offline=not refresh_data,
+                        symbols=symbols)
 
     # 1.5 live prices (D35). Without these, limit prices come from the LAST
     # DAILY CLOSE — live orders rest unfilled all day (the GE order, D26).
@@ -99,12 +137,16 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         st("quotes", "fetching live quotes (broker → stooq → yfinance)")
         try:
             from .quotes import QuoteService
+            broker = broker or make_broker(cfg, store)
             live_px = {s: q["price"] for s, q in
-                       QuoteService(cfg).get(symbols).items() if q.get("price")}
+                       QuoteService(cfg, broker=broker).get(symbols).items()
+                       if q.get("price")}
         except Exception as e:                 # noqa: BLE001 — quotes are garnish
             store.audit("live_quotes_failed", {"error": str(e)[:200]}, cycle_id)
     if live_px:
         store.audit("live_quotes", {"n": len(live_px)}, cycle_id)
+    ctx.live_px = live_px      # D40: intraday-aware nodes (gap) read these;
+    #                            empty in backtests → those nodes stay silent
 
     # 2. account + broker
     st("account", "reading account state from broker")
@@ -112,6 +154,24 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     if hasattr(broker, "set_quotes"):          # paper broker has no live feed
         broker.set_quotes({**ctx.prices(), **live_px})
     account = broker.get_account()
+    if refresh_data and (cfg.get("intelligence", "enabled", default=False) or
+                         cfg.get("ai", "enabled", default=False)):
+        # Event-driven evidence refresh is asynchronous and deduplicated. It
+        # never stalls the market cycle or touches the broker.
+        last_request = store.kv_get("evidence_refresh_requested_at")
+        due = True
+        if last_request:
+            try:
+                due = (datetime.now().astimezone() -
+                       datetime.fromisoformat(last_request)).total_seconds() >= 6 * 3600
+            except ValueError:
+                pass
+        if due:
+            from .research import enqueue_job
+            enqueue_job(store, "deep_research", {"reason": "six-hour evidence refresh"},
+                        priority=1, requested_by="autonomous")
+            store.kv_set("evidence_refresh_requested_at",
+                         datetime.now().astimezone().isoformat(timespec="seconds"))
 
     # 3. safety rails up front. Logical clock = as_of date + real time-of-day:
     # identical to wall clock for live scans, historical for backtests.
@@ -132,6 +192,10 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         steering_mod.sweep(cfg, store, now_iso=now_iso)
 
     executor = Executor(cfg, store, broker, governor)
+    from .graph import activation_state, default_topology
+    model_state = activation_state(cfg, store)
+    model_state = {**model_state, "production_evidence": True,
+                   "production_evidence_version": "evidence.v2"}
 
     # 4. settle async fills from prior cycles, then exits (free budget before
     #    spending it)
@@ -149,11 +213,18 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
                          mode=source, live_px=live_px)
 
     # 5. human-approved intents from the queue
-    account = broker.get_account()
+    if reconciled or exits:
+        account = broker.get_account()
     cycle = CycleState(governor.cycle_budget(account, reg.deployment_multiplier))
     store.audit("cycle_budget", {"budget": cycle.budget,
                                  "regime_mult": reg.deployment_multiplier}, cycle_id)
-    approvals = executor.process_approval_queue(account, ctx, cycle, cycle_id, reg.regime)
+    # D41: an unproven learned model gates the BLEND (zero weight), never
+    # trading itself — approvals passed the governor and get re-reviewed at
+    # placement; the deterministic ensemble is the proven fallback.
+    approvals = executor.process_approval_queue(
+        account, ctx, cycle, cycle_id, reg.regime)
+    if approvals:
+        account = broker.get_account()
 
     # 6. signals (AI client injected for ai-flagged nodes; they degrade to
     #    silence when it's disabled/over budget)
@@ -162,6 +233,11 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         registry = build_registry(cfg, ai_client=AIClient(cfg, store))
     events = []
     filters = []
+    node_states = {node_id: "unavailable" for node_id, node_cfg in
+                   (cfg.get("nodes", default={}) or {}).items()
+                   if node_cfg.get("enabled")}
+    node_states["macro_regime"] = "running"
+    symbol_states = {}
     for node in registry.values():
         if node.role == "filter":
             filters.append(node)
@@ -171,22 +247,132 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
             node_events = node.compute(ctx)
         except Exception as e:                 # noqa: BLE001 — node isolation
             node.degraded_reason = str(e)
+            node_states[node.id] = "blocked"
             store.audit("node_degraded", {"node": node.id, "error": str(e)}, cycle_id)
             continue
+        node_states[node.id] = ("running" if node_events else
+                                "unavailable" if node.degraded_reason else
+                                "verified_neutral")
+        symbol_states[node.id] = dict(getattr(node, "symbol_states", {}) or {})
         for ev in node_events:
             store.record_signal(ev, cycle_id)
         events.extend(node_events)
 
+    # Filter equations remain outside the deterministic alpha sum, but their
+    # signed point-in-time outputs are real specialist activations for the
+    # outer graph and historical replay.
+    graph_events = list(events)
+    graph_symbols = sorted(set(ctx.universe) | {e.symbol for e in events})
+    for node in filters:
+        filter_states = {}
+        for symbol in graph_symbols:
+            try:
+                event = node.graph_signal(ctx, symbol) if hasattr(node, "graph_signal") else None
+            except Exception as exc:  # one missing issuer must not erase every symbol
+                store.audit("filter_graph_degraded", {"node": node.id, "symbol": symbol,
+                                                       "error": str(exc)[:160]}, cycle_id)
+                filter_states[symbol] = "blocked"
+                continue
+            if event:
+                store.record_signal(event, cycle_id)
+                graph_events.append(event)
+                filter_states[symbol] = "running"
+            else:
+                filter_states[symbol] = "unavailable"
+        symbol_states[node.id] = filter_states
+        node_states[node.id] = ("running" if any(
+            state == "running" for state in filter_states.values()) else "unavailable")
+
     # 7. ensemble → forecast → portfolio
     st("ensemble", f"scoring {len(events)} signals across nodes")
-    candidates = ensemble_mod.score(events, reg.regime, cfg, store, filters, ctx)
+    ensemble_events = ([e for e in events if e.node_id != "neural"]
+                       if model_state["effective_blend"] else events)
+    candidates = ensemble_mod.score(ensemble_events, reg.regime, cfg, store, filters, ctx,
+                                    node_states=node_states,
+                                    symbol_states=symbol_states)
+    # The analog-neural graph is a bounded learned overlay. Specialist
+    # equations remain unchanged and the deterministic ensemble stays the
+    # fallback; an unvalidated graph has a zero live blend.
+    from .graph import blend_candidates
+    blend_candidates(candidates, graph_events, reg.regime, cfg, store, cycle_id,
+                     node_states=node_states, symbol_states=symbol_states,
+                     universe=ctx.universe)
+    required_graph_nodes = {n["id"] for n in default_topology()["nodes"]
+                            if n["role"] in ("alpha", "gate")}
+    failed_nodes = sorted(n for n, state in node_states.items()
+                          if n in required_graph_nodes and state == "blocked")
+    if failed_nodes and model_state["ready"]:
+        model_state = {**model_state, "ready": False, "effective_blend": 0.0,
+                       "block_reason": f"BLOCKED: NODE {failed_nodes[0]}",
+                       "failed_nodes": failed_nodes}
+    # Direct bounded neural blend (Stage C1): graph-independent, audited, zero
+    # with deterministic fallback when the model is unavailable. Reuses the
+    # forecasts the neural node already computed this cycle.
+    from .ml.policy import apply_neural_blend
+    neural_node = registry.get("neural")
+    neural_forecasts = getattr(neural_node, "last_forecasts", None) or {}
+    neural_meta = getattr(neural_node, "last_meta", None) or {}
+    # Cycle binding (C2 audit): a stash stamped for a different as_of is stale
+    # and must be inert — fail closed to the deterministic path.
+    if getattr(neural_node, "last_forecast_as_of", None) != ctx.as_of:
+        neural_forecasts, neural_meta = {}, {}
+    direct = apply_neural_blend(candidates, neural_forecasts, cfg, store, cycle_id,
+                                graph_blend=model_state["effective_blend"],
+                                as_of=ctx.as_of, meta=neural_meta)
+    model_state = {**model_state, "direct_neural_blend": direct["blend"],
+                   "direct_neural_reason": direct["reason"]}
+    candidates.sort(key=lambda c: c.final_score, reverse=True)
     forecast_mod.attach_intervals(candidates, store, ctx.prices())
     for c in candidates:
+        if c.expected_return <= 0:
+            c.risk_flags.append("nonpositive_after_cost_expected_return")
         store.record_candidate(c, cycle_id)
+    rejected_edge = [c.symbol for c in candidates if c.expected_return <= 0]
+    if rejected_edge:
+        store.audit("candidates_rejected_nonpositive_edge", {
+            "symbols": rejected_edge,
+            "reason": "post-forecast expected return must remain positive after costs",
+        }, cycle_id)
+    candidates = [c for c in candidates if c.expected_return > 0]
 
     st("sizing", f"{len(candidates)} candidates → position sizing")
-    account = broker.get_account()             # refresh after exits
-    targets = portfolio_mod.construct(candidates, account, ctx, cfg)
+    rebalance = {"weights": {}, "actual_weights": {}, "target_weights": {},
+                 "sells": [], "buys": [], "deferred_sells": [], "turnover": 0,
+                 "turnover_cap": account.equity * .30}
+    rebalance = portfolio_mod.rebalance_plan(candidates, account, ctx, cfg)
+    for sell in rebalance["sells"]:
+        price = live_px.get(sell["symbol"]) or ctx.close(sell["symbol"])
+        if not price or price <= 0:
+            sell["result"] = "unavailable_price"
+            store.audit("rebalance_sell_skipped", {
+                "symbol": sell["symbol"], "reason": "price unavailable"}, cycle_id)
+            continue
+        reason = (f"evidence rebalance {sell['current_weight']:.1%}→"
+                  f"{sell['target_weight']:.1%}; score {sell['held_score']:.3f} "
+                  f"vs {sell['best_new_score']:.3f}")
+        sell["result"] = executor.execute_exit(
+            sell["position"], price, reason, account, cycle_id, reg.regime,
+            qty=sell["qty"])
+    if rebalance["sells"]:
+        # Only a broker refresh after the sell attempts may expose confirmed
+        # proceeds; a theoretical target is never cash.
+        account = broker.get_account()
+    targets = portfolio_mod.fit_to_capacity(
+        rebalance["buys"], account, cfg, cycle.budget_left)
+    store.audit("rebalance_plan", {
+        "model": model_state, "weights": rebalance["weights"],
+        "actual_weights": rebalance.get("actual_weights", {}),
+        "target_weights": rebalance.get("target_weights", {}),
+        "turnover": rebalance["turnover"], "turnover_cap": rebalance["turnover_cap"],
+        "funding_order": [s["symbol"] for s in rebalance["sells"]],
+        "deferred_sells": rebalance.get("deferred_sells", []),
+        "sells": [{k: v for k, v in s.items() if k != "position"}
+                  for s in rebalance["sells"]],
+        "buys": [{"symbol": c.symbol, "notional": n,
+                  "actual_weight": rebalance.get("actual_weights", {}).get(c.symbol, 0),
+                  "target_weight": rebalance.get("target_weights", {}).get(c.symbol, 0)}
+                 for c, n in rebalance["buys"]],
+    }, cycle_id)
 
     # 7.5 convexity overlay: maybe swap the top equity target for a bounded-
     #     premium long call (no-op unless options_vol enabled AND account
@@ -198,12 +384,30 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # deployment room, and the remaining cycle budget before sending order 1.
     requested = round(sum(n for _, n in targets), 2)
     targets = portfolio_mod.fit_to_capacity(targets, account, cfg, cycle.budget_left)
+    # 8.1 bounded neural exploration probe (Stage C2): at most one dedicated
+    # slot beyond the deterministic batch, sized once via construct() and
+    # capped by the exploration budget fraction and remaining cash headroom.
+    # The governor below remains the final authority on every limit.
+    from .ml.policy import select_exploration_probe
+    probe = select_exploration_probe(
+        candidates, targets, neural_forecasts, neural_meta, cfg, store, cycle_id,
+        account, ctx, as_of=ctx.as_of, allocated=sum(n for _, n in targets))
+    if probe:
+        targets = targets + [probe]
     store.audit("batch_allocation", {
         "requested": requested, "allocated": round(sum(n for _, n in targets), 2),
         "cash": account.cash, "buying_power": account.buying_power,
         "cycle_budget_left": cycle.budget_left,
         "orders": [{"symbol": c.symbol, "notional": n} for c, n in targets],
     }, cycle_id)
+    # Fence (Sprint E1): a worker that lost the cross-process lease between
+    # planning and placement must not commit orders — another process may
+    # already be trading. Protective exits above are deliberately NOT fenced.
+    if lease and targets and not store.holds_lease(*lease):
+        store.audit("cycle_fenced_lost_lease", {
+            "resource": lease[0], "dropped_orders": len(targets)}, cycle_id)
+        st("fenced", "trading lease lost before order placement — no orders sent")
+        targets = []
     entry_results = {}
     broker_blocked = "broker_rejected" in approvals
     for i, (cand, notional) in enumerate(targets):
@@ -237,7 +441,8 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # so the P&L chart populates even when no dashboard is open; realized from
     # closed trades + unrealized at current marks — deposit-independent)
     st("mark", "stamping equity + net P&L")
-    account = broker.get_account()
+    if entry_results and not any(status == "filled" for status in entry_results.values()):
+        account = broker.get_account()
     store.record_equity(account.equity, account.cash, source, d=ctx.as_of)
     if refresh_data:                        # live/paper scans only, not backtests
         realized = store.db.execute(
@@ -259,6 +464,7 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
         "exits": exits, "reconciled": reconciled,
         "approvals_processed": len(approvals),
         "budget": round(cycle.budget, 2), "budget_used": round(cycle.budget_used, 2),
+        "model_state": model_state, "rebalance_turnover": round(rebalance["turnover"], 2),
         "equity": round(account.equity, 2), "cash": round(account.cash, 2),
     }
     store.audit("cycle_end", summary, cycle_id)

@@ -42,7 +42,11 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
                      prices: dict[str, float]) -> None:
     from .execution import score_bucket   # local import avoids cycle
     for c in candidates:
-        analogs = store.analog_returns(score_bucket(c.final_score), c.regime)
+        analogs = store.analog_returns(
+            score_bucket(c.final_score), c.regime,
+            evidence_version=c.evidence_version,
+            horizon_days=c.horizon_days,
+            asset_type=c.asset_type)
         if len(analogs) >= MIN_ANALOGS:
             mean, lo, hi = _bootstrap_ci(analogs)
             # shrink ensemble estimate toward the measured analog mean
@@ -76,7 +80,8 @@ def attach_intervals(candidates: list[TradeCandidate], store: Store,
 def portfolio_projection(store: Store, source: str) -> dict:
     """Strategy-level projected APR ± bars from closed trades (GUI headline).
     Basis counts by source are reported so the user sees what the number rests on."""
-    trades = store.trades()
+    source = "live" if source == "live" else "paper"
+    trades = store.trades(source=source)
     if not trades:
         return {"apr": None, "note": "no closed trades yet — run a backtest"}
     rets = [t["ret"] for t in trades]

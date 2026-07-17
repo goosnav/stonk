@@ -1,0 +1,42 @@
+M1a ACTIVE SPRINT — RELIABLE LOCAL OPERATION
+Updated: 2026-07-12
+
+Objective
+Make operator research actions truthful, durable, observable, and recoverable
+without weakening the live trading governor.
+
+In scope
+- Durable discover, deep-research, and holding-training jobs.
+- Trading-loop and research-worker process visibility.
+- Browser retry/progress/error behavior.
+- Loopback startup, bounded port fallback, health endpoints, and shutdown.
+- Release evidence and remaining M1a gap accounting.
+- Immutable TCN compatibility and objective 10/25/50 activation gates.
+- Historical graph sample recovery and embargoed graph tournaments.
+- Target-weight partial trims with confirmed-cash buy sequencing.
+- Account snapshot single-flight caching and durable audit redaction.
+
+Non-goals
+- M1b frozen runtime or public installer.
+- Automatic promotion of unvalidated models.
+- Moving live persistence immediately before a market open.
+
+Verification
+- Offline unit/integration/browser suite cannot contact the broker.
+- Exercise a real occupied preferred port and fallback listener.
+- Exercise Ctrl-C during a running scheduler.
+- Inspect live health, broker state, jobs, logs, and UI.
+
+Rollback
+Stop the server, revert this reviewable change set, and relaunch on port 8420.
+SQLite job and report records are additive and remain readable.
+
+Model rollout truth
+The versioned production evidence ensemble may trade while learned components
+remain shadowed. Until both a schema-4 global TCN and an embargo-validated graph
+pass Stage 1, learned influence is exactly zero. Training activity is research,
+not proof; objective gates decide the 10%→25%→50% overlay.
+
+Exit gate
+All items in dev/RELEASE_CHECKLIST.txt must have evidence, then the milestone
+may move to CANDIDATE_FOR_ACCEPTANCE. Only the user may mark USER_ACCEPTED.

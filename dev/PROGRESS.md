@@ -47,7 +47,7 @@
 - [x] broker/bridge.py + scripts/bridge_prompt.md — VERIFIED round-trip in tests
 - [x] Executor.reconcile() for async live fills (D13)
 - [x] attribution.py — scorecards, bounded Bayesian weight multipliers,
-      auto-disable, promotion proposals (human-gated)
+      nonzero-floor deemphasis, human-only disable, promotion proposals (human-gated)
 - [x] ai.py — OpenRouter client, reserve-then-commit, parse-failure → AI-off-
       for-day (D14); news_sentiment, congress_trades (pub-date keyed),
       insider (cluster buys), options_vol convexity overlay (§22-gated)
@@ -295,3 +295,35 @@ GUI was left running at http://127.0.0.1:8420 (paper mode, scheduler active).
   Regression test added. 59 offline + GUI smoke green.
 - [x] Stonk.app (~/Applications) — double-click launcher (attach-or-boot live,
   custom green-uptrend icon). Rebuild: scripts/build_stonk_app.sh.
+
+## 2026-07-15 — Evidence/worker integrity repair (current handoff)
+
+- Operator research now uses three independent durable lanes (discovery,
+  intelligence, training), cross-process SQLite leases, row ownership
+  fencing, cooperative cancellation, dependency/backoff states, and a unique
+  active-job invariant. Market-hours training cannot be forced.
+- Discovery uses current membership liquidity and four acquisition sleeves
+  (combined, quality, catalyst, exploration), so fundamental candidates are
+  not selected only after they already win a momentum ranking.
+- Production evidence uses fixed family budgets. Missing business/news
+  evidence does not transfer its allocation to momentum. Post-forecast
+  non-positive expected returns are unconditionally ineligible for buys.
+- Automated learning can only deemphasize enabled nodes to nonzero floors.
+  Graph pruning preserves a nonzero base scale and active forecast path. Only
+  the human switchboard toggle can eliminate an analysis type.
+- Signed candidate-linked attribution rewards correct negative evidence on
+  losing longs rather than assigning every node the same raw trade return.
+- Learned models remain truthfully at 0% live influence until a schema-current
+  TCN and its exactly matched graph pass embargoed folds, baseline, utility,
+  calibration, checkpoint, and forward-shadow gates. Legacy unversioned
+  signal rows are excluded from graph training.
+- Current live-data snapshot at audit time: research breadth 236/1500; no
+  compatible global TCN champion; no graph champion. These are research
+  milestones, not hidden fallbacks. The production evidence ensemble remains
+  the trading path while challengers are built.
+- Verification on the combined tree: 163 offline tests, an isolated Chromium
+  operator-control smoke, and an order-disabled governed-cycle smoke pass.
+  Deployed through Stonk Terminal.app on 2026-07-15 at a completed-cycle
+  boundary: broker read probe connected, scheduler healthy, discovery scanned
+  236 current names, and its dependent deep-research job advanced with durable
+  progress. Learned influence remains truthfully 0% pending its gates.

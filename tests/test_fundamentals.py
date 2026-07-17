@@ -53,7 +53,7 @@ def test_avoid_and_neutral_and_garbage(cfg, store):
     ctx.offline = False
     node = _node(cfg, StubAI({**GOOD, "direction": "avoid", "conviction": 0.5}))
     ev = node.compute(ctx)
-    assert ev and ev[0].score == -0.5 and ev[0].direction == "avoid"
+    assert ev and ev[0].score == 0.5 and ev[0].direction == "avoid"
 
     for sym in ["AAA", "BBB", "CCC"]:                 # clear analysis cache
         store.kv_set(f"fund_view_{sym}", None)

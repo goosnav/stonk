@@ -42,6 +42,9 @@ def cfg(tmp_path):
         # only deterministic offline nodes in tests
         "nodes": {"momentum": {"enabled": True, "weight": 0.5, "horizon_days": 20,
                                "status": "production"}},
+        # Unit tests opt into the legacy fake HTTP adapter explicitly; no test
+        # may invoke a signed-in local Codex/Claude subscription.
+        "intelligence": {"enabled": False},
     })
 
 
@@ -53,4 +56,5 @@ def store(cfg):
     s.upsert_bars("SPY", synth_bars(daily_drift=0.0008), "test")
     vix = [{**r, "close": 15.0, "open": 15, "high": 16, "low": 14} for r in synth_bars()]
     s.upsert_bars("^VIX", vix, "test")
-    return s
+    yield s
+    s.close()

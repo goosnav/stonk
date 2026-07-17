@@ -11,6 +11,9 @@ data/*.db-*
 .claude/*.local.md
 data/backups/
 data/*.log
+data/models/*.pt
+data/models/holdings/*.pt
+dev/reports/*.json
 logs/*
 !logs/README.md
 

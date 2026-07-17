@@ -439,3 +439,162 @@ Launcher is idempotent: attaches to a running server (opens browser, no double-
 bind) else boots `--mode live serve` and opens the dashboard when healthy.
 Icon: assets/stonk.svg → QuickLook render → iconutil .icns (no image deps).
 Rebuild anytime with scripts/build_stonk_app.sh [dest].
+
+## D41. Dual networks, immutable champions, official universe (2026-07-11)
+
+The first MLP overfit unchanged rows in production research (rank-IC 0.043 →
+0.0076 by epoch 22,315), proving that nonstop champion training is unsafe.
+Specialist modules now form a separate analog-neural DAG whose edge weights are
+differentiable while their equations remain explicit. A causal quantile TCN is
+one specialist, not the ensemble itself. All training writes challengers;
+champion replacement is atomic and validation/shadow-gated.
+
+Stock discovery uses Nasdaq Trader listing files plus SEC CIK enrichment, not
+web search. The free-data universe is labeled survivorship-limited and requires
+forward shadow evidence before learned live influence. Research work is bounded,
+non-AI, closed-market-only, and yields before trading.
+## D42 (2026-07-11): truthful autonomy status and durable research actions
+
+Trading heartbeat age is only a failure signal while the market is open.
+Closed-market UI reports the scheduler/research worker separately. Manual
+discovery, deep research, and holding training enqueue durable jobs; they use
+the autonomous worker, never contact execution, and never bypass budgets or
+champion gates. Research history breadth reaches 500 names before additional
+global TCN trials, preventing repeated optimization of the original 30-name
+sample.
+
+## D43 (2026-07-12): learned-model integrity gate and target-weight rotation
+
+The global TCN checkpoint contract is now schema 2: 18 ordered features,
+context fusion, quantile heads, and a separately trained probability-positive
+head. Every challenger has an immutable run-specific path, feature and
+architecture hashes, a file SHA-256, normalization state, snapshot, and parent.
+The old shared 13-feature artifacts remain auditable but are marked
+`incompatible` and cannot be inferred or promoted.
+
+Stage 1 is automatic only after five chronological folds with a 21-session
+embargo, the specified IC and after-cost fold gates, sealed-test integrity, and
+75–85% interval coverage. Validated graph plus global TCN influence ramps
+10%→25%→50%; corruption, staleness, or a required-node exception blocks buys
+but not reconciliations, stops, time exits, or risk-reduction sells. The TCN is
+one graph activation and is removed from the deterministic score whenever the
+graph has live influence, preventing double counting.
+
+Live construction is target-weight based. Up to two weak/overweight holdings
+may be trimmed per cycle, after one completed exchange session and with score
+hysteresis/two-cycle displacement. Gross discretionary turnover is capped at
+30%, adjustments below $5 are ignored, sells execute first, and buys are
+rescaled only after a fresh broker account confirms settled cash. Margin buying
+power never substitutes for cash.
+
+Historical graph training was repaired at its source: signal timestamps now
+use `data_as_of`. Legacy replay dates are recovered from the immutable
+`cycle_start.as_of` audit payload, exposing over 100,000 resolved specialist
+snapshots that had previously appeared as zero.
+
+## D44 (2026-07-12): schema-3 feature/tournament repair and truthful graph v2
+
+The schema-2 global trial exposed two silent model defects: SEC valuation and
+event inputs were constant because filing facts had never been ingested, and
+the TCN's context path arbitrarily consumed only the final eight columns. The
+research plane now reaches at least 80% point-in-time SEC coverage before TCN
+work (live snapshot: 187/195 issuers), retries provider failures on a later
+day, and fuses all 18 current features through a learned projection. Targets
+are scaled from train-only horizon volatility and inverted at inference.
+
+Global forecast quality is daily cross-sectional rank-IC, not a misleading
+flat correlation across symbols and dates. Five validation challengers are
+immutable and cannot inspect the sealed block; validation selects one winner,
+and only its cloned final run receives the sealed test and five embargoed
+walk-forward folds. The symbol universe and data fingerprint are frozen for
+the tournament. Walk-forward computation shares the bounded task budget.
+Analog-graph folds likewise split on unique trading dates, embargo 21 actual
+sessions (never 21 cross-sectional rows), and report mean daily rank-IC.
+
+Graph v2 includes only specialist equations with a defensible point-in-time
+historical plane: momentum, volatility contraction, quality/value, sector
+rotation, opening gap, macro regime, and the TCN. Experimental reversal,
+earnings/news/fundamentals-AI/Congress/insider nodes remain visible in the
+deterministic switchboard but are excluded from learned topology rather than
+pretending that absent training data is a learned activation. The latest
+two-year research replay was +8.96% after costs over 427 closed trades (profit
+factor 1.24, recent 30% OOS +13.41%), but trailed exposure-matched SPY and had
+20.9% max drawdown, so it is evidence—not a promotion waiver.
+
+The first schema-3 validation challenger produced rank-IC +0.0407/+0.0578 at
+5/21 days with 77.4%/75.9% quantile coverage and all 18 features active. It
+remains shadow until the sealed and walk-forward gates decide. Trial 2 improved
+the 21-day rank-IC to +0.0904 with +0.0401 at five days and became the current
+validation leader; the autonomous worker is continuing the frozen tournament.
+
+## D45 (2026-07-14): single-flight broker auth and sealed-evidence repair
+
+The overnight Robinhood outage was amplified by Stonk itself: automatic
+health probes were allowed to enter interactive OAuth, every Connect click
+started another thread, all flows competed for callback port 8425, and stale
+tabs could deliver state to a newer flow. The observed result was nineteen
+browser launches, callback `Address already in use`, and OAuth state mismatch.
+Background broker calls are now non-interactive; one explicit Connect flow is
+single-flight; MCP calls serialize shared OAuth/token state; callbacks reject
+stale state without completing the active flow; and the token document uses an
+owner-only atomic replace with corrupt-file preservation. Duplicate MCP OAuth
+tracebacks are suppressed while the actionable broker error remains audited.
+
+The model audit invalidated the July 13 schema-3 champion. Historical
+walk-forward rows were counted as forward shadow sessions, so a checkpoint
+with sealed 21-day rank-IC -0.0209, 72.4% coverage, and only two profitable
+folds could promote. SEC fact ingestion also changed the trial-key fingerprint,
+resetting the six-trial budget many times against the same sealed block.
+Forward metrics now exclude `historical_oos`; existing champions must pass the
+same offline gate used for promotion; trial identity is one settled market
+snapshot plus schema/feature/architecture; and tournament selection maximizes
+validation rank-IC plus after-cost daily top-decile alpha with calibration and
+pinball penalties. The validation-selected model's untouched sealed predictions
+are persisted as graph research inputs, closing the zero-neural-sample gap.
+
+Nightly source-control mutation (D26) is retired: the live scheduler no longer
+runs `git add`/`git commit`. It had crashed with SIGSEGV and is unrelated to
+runtime durability; SQLite online backup remains the post-close persistence
+mechanism. Required learned-model failure again blocks new entries while fill
+reconciliation and protective exits continue.
+
+## D46 (2026-07-15): evidence-first production path
+
+The July 15 trade audit found a decision-integrity defect, not merely a weak
+model: legacy AI nodes stored an `avoid` as a negative score and the ensemble
+multiplied by direction again. CAT's strong fundamental avoid therefore became
+positive buy evidence. Signal score is now an unsigned magnitude everywhere;
+one shared `signed_alpha()` function applies direction exactly once. The CAT
+entry is a permanent regression fixture.
+
+Company research is no longer a disconnected report. Deep Research writes a
+versioned, source-hashed dossier with section-aware SEC evidence, point-in-time
+facts, company-specific news, strict AI memo schemas, verified source IDs,
+contrary evidence, and thesis breakers. Production nodes consume those exact
+dossiers. Company scores reserve fixed family weights: business 30%, catalyst
+20%, deterministic quality 15%, context 15%, and price behavior 20%. Missing
+AI evidence contributes zero and reduces coverage/size; it never donates its
+weight to momentum. ETFs use a separate context/price score.
+
+The production evidence ensemble continues trading when learned challengers
+are absent or invalid. The learned TCN/graph overlay remains zero until its
+objective gates pass; failure rolls the overlay back without disabling the
+audited production path or protective exits. This supersedes D45's temporary
+fail-closed entry policy. Backtests are legacy/unqualified unless explicitly
+validated and can no longer calibrate live forecasts. The TCN checkpoint
+contract is schema 4 with 28 features, VIX term structure/stress context, and
+zero/momentum/ridge baseline gates.
+
+The live rollout exposed two portfolio defects before handoff. The rebalancer
+calculated a 50% trim amount but forwarded the uncapped target delta, producing
+full NFLX/UNH exits; it now carries the capped amount and has a strict regression
+test. Hysteresis counters are versioned, and unavailable company dossiers defer
+discretionary trims instead of masquerading as negative evidence. Stops and
+time exits remain independent. When confirmed buying power can afford only one
+minimum order, the capacity allocator now retains the strongest candidate
+instead of discarding the whole proportionally scaled batch.
+
+Market-hours cycles no longer redownload every daily history. They consume the
+cached settled snapshot, request broker quotes in batches of 50, and batch the
+Yahoo fallback. The observed 175-symbol live cycle fell from 182 seconds to
+21–41 seconds without reducing its evaluated universe.

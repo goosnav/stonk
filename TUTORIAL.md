@@ -33,7 +33,7 @@ Troubleshooting:
 - **Candidates**: each shows horizon return + interval + P(>0). The APR column
   is deliberately secondary.
 - **Switchboard**: toggle nodes, edit base weights; "learned ×" is the
-  self-improvement multiplier (bounded 0.3–2.0).
+  self-improvement multiplier (bounded by a visible nonzero floor and ceiling).
 - **Risk controls**: editable within guardrails — dangerous values are rejected
   unless you set `advanced_override: true` in the config file yourself.
 - **Approvals**: orders above the approval threshold (default 10% of equity)
@@ -146,10 +146,10 @@ Everything above is read-only and safe to run against the live server.
 ## 7. Watch the self-improvement loop
 
 Nightly post-close job: marks equity, updates node scorecards, moves weight
-multipliers (shrunk toward zero edge until ≥20 trades), auto-disables nodes
-with clearly negative live expectancy (n≥30), and records promotion
-*proposals* — promotions themselves are yours to approve by editing the node's
-`status` in config after reviewing the scorecard.
+multipliers (shrunk toward lower influence only after enough trades), and
+records promotion *proposals*. It never disables an analysis; complete removal
+and promotions are yours to approve in the switchboard after reviewing the
+scorecard.
 
 CLI equivalents: `stonk status` (JSON overview), `stonk approve|reject
 <intent_id>`, `stonk reset-kill <name>`, `stonk bridge-dump|bridge-report`.

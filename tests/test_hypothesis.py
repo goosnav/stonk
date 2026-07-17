@@ -72,7 +72,7 @@ def test_node_emits_stances_and_degrades_silently(cfg, store):
     by = {e.symbol: e for e in events}
     assert set(by) == {"AAA", "BBB"}                     # ZZZZ has no bars
     assert by["AAA"].score == 0.8 and by["AAA"].direction == "long"
-    assert by["BBB"].score == -0.5 and by["BBB"].direction == "avoid"
+    assert by["BBB"].score == 0.5 and by["BBB"].direction == "avoid"
 
     cfg.data["hypothesis"]["enabled"] = False            # master switch off
     assert node.compute(ctx) == []
@@ -123,8 +123,12 @@ def test_engine_merges_watchlist(cfg, store):
     cfg.data["hypothesis"]["enabled"] = True
     h = _mk(store, wl=["DDD"])
     hypo.activate(cfg, store, h["id"], now_iso="2026-01-01T00:00:00-07:00")
+    before = list(cfg.get("universe", "symbols"))
     run_cycle(cfg, store, refresh_data=False)
-    assert "DDD" in cfg.get("universe", "symbols")
+    # The watchlist merges into the CYCLE-LOCAL universe (proven by the audit
+    # below); shared config is immutable during execution (Sprint E1), so the
+    # merge can never leak into later cycles or other services.
+    assert cfg.get("universe", "symbols") == before
     merged = [a for a in store.audit_rows()
               if a["event_type"] == "hypothesis_watchlist_merged"]
     assert merged and "DDD" in json.loads(merged[0]["payload"])["added"]

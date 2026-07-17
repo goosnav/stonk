@@ -66,6 +66,10 @@ class Node(SignalNode):
     def compute(self, ctx: MarketContext) -> list[SignalEvent]:
         rows = self._disclosures(ctx)
         if not rows:
+            for symbol in ctx.universe:
+                if not symbol.startswith("^"):
+                    self.symbol_states[symbol] = ("unavailable" if self.degraded_reason
+                                                  else "verified_neutral")
             return []
         as_of = datetime.strptime(ctx.as_of, "%Y-%m-%d")
         cutoff = (as_of - timedelta(days=FRESH_DAYS)).date().isoformat()
@@ -77,6 +81,9 @@ class Node(SignalNode):
                 by_ticker.setdefault(r["ticker"], []).append(r)
 
         events = []
+        for symbol in ctx.universe:
+            if not symbol.startswith("^"):
+                self.symbol_states[symbol] = "verified_neutral"
         for sym, ds in by_ticker.items():
             size_w = max(SIZE_SCORE.get(str(d["size"]), 0.3) for d in ds)
             cluster = len({d["politician"] for d in ds})
@@ -92,4 +99,5 @@ class Node(SignalNode):
                 evidence=[f"{cluster} politician buy disclosure(s) ≤{FRESH_DAYS}d, "
                           f"latest {max(d['pub_date'] for d in ds)}"],
                 data_as_of=as_of, node_id=self.id, node_version=self.version))
+            self.symbol_states[sym] = "running"
         return events

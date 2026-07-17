@@ -38,6 +38,10 @@ from pathlib import Path
 # Harmless (session is stateless per call here) — silence to keep server.log
 # readable. Real transport failures still raise from the call itself.
 logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
+# The MCP library logs the same OAuth exception traceback internally before we
+# classify and audit it. Suppress that duplicate terminal slurry; our raised
+# BrokerAuthError remains visible through health and the broker status panel.
+logging.getLogger("mcp.client.auth.oauth2").setLevel(logging.CRITICAL)
 
 from ..models import AccountState, Fill, OrderIntent, OrderReview, Position
 
@@ -50,21 +54,51 @@ CALLBACK_PORT = 8425
 # round-trips at Robinhood. Orders are NEVER cached; reads only.
 _READ_CACHE: dict[str, tuple[float, object]] = {}
 READ_TTL = 30.0
+_READ_LOCK = threading.RLock()
+_CALL_LOCK = threading.RLock()
+
+
+def _token_document() -> dict:
+    if not TOKEN_PATH.exists():
+        return {}
+    try:
+        return json.loads(TOKEN_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        # Preserve the bad artifact for diagnosis, then let explicit Connect
+        # establish a fresh session. Never keep retrying an unreadable file.
+        backup = TOKEN_PATH.with_name(
+            f"{TOKEN_PATH.name}.corrupt-{datetime.now().strftime('%Y%m%dT%H%M%S')}")
+        try:
+            os.replace(TOKEN_PATH, backup)
+        except OSError:
+            pass
+        return {}
+
+
+def _save_token_document(document: dict) -> None:
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN_PATH.with_suffix(TOKEN_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(document))
+    tmp.chmod(0o600)
+    os.replace(tmp, TOKEN_PATH)
+    TOKEN_PATH.chmod(0o600)
 
 
 def _cached(key: str, fn):
     import time
-    hit = _READ_CACHE.get(key)
-    if hit and time.time() - hit[0] < READ_TTL:
-        return hit[1]
-    val = fn()
-    _READ_CACHE[key] = (time.time(), val)
-    return val
+    with _READ_LOCK:
+        hit = _READ_CACHE.get(key)
+        if hit and time.time() - hit[0] < READ_TTL:
+            return hit[1]
+        val = fn()
+        _READ_CACHE[key] = (time.time(), val)
+        return val
 
 
 def invalidate_read_cache() -> None:
     """Called after any order placement so positions/cash refresh promptly."""
-    _READ_CACHE.clear()
+    with _READ_LOCK:
+        _READ_CACHE.clear()
 
 
 class BrokerAuthError(RuntimeError):
@@ -96,9 +130,10 @@ def _first(d: dict, *keys, default=None):
 class RobinhoodMCPBroker:
     name = "robinhood_mcp"
 
-    def __init__(self, cfg, store):
+    def __init__(self, cfg, store, interactive_auth: bool = False):
         self.cfg = cfg
         self.store = store
+        self.interactive_auth = interactive_auth
         self.account_number = None      # resolved on first use
         ok, why = cfg.live_trading_allowed()
         self._live_ok, self._live_why = ok, why
@@ -113,36 +148,43 @@ class RobinhoodMCPBroker:
 
         class FileTokenStorage(TokenStorage):
             async def get_tokens(self):
-                if TOKEN_PATH.exists():
-                    d = json.loads(TOKEN_PATH.read_text()).get("tokens")
-                    return OAuthToken(**d) if d else None
-                return None
+                tokens = _token_document().get("tokens")
+                return OAuthToken(**tokens) if tokens else None
 
             async def set_tokens(self, tokens):
-                TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-                d = json.loads(TOKEN_PATH.read_text()) if TOKEN_PATH.exists() else {}
+                d = _token_document()
                 d["tokens"] = tokens.model_dump(mode="json")
-                TOKEN_PATH.write_text(json.dumps(d))
-                TOKEN_PATH.chmod(0o600)
+                _save_token_document(d)
 
             async def get_client_info(self):
-                if TOKEN_PATH.exists():
-                    d = json.loads(TOKEN_PATH.read_text()).get("client")
-                    return OAuthClientInformationFull(**d) if d else None
-                return None
+                client = _token_document().get("client")
+                return OAuthClientInformationFull(**client) if client else None
 
             async def set_client_info(self, info):
-                TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-                d = json.loads(TOKEN_PATH.read_text()) if TOKEN_PATH.exists() else {}
+                d = _token_document()
                 d["client"] = info.model_dump(mode="json")
-                TOKEN_PATH.write_text(json.dumps(d))
-                TOKEN_PATH.chmod(0o600)
+                _save_token_document(d)
 
         code_holder: dict = {}
+        expected_state: dict = {}
+        browser_opened = False
+        reauth_required = False
 
         async def redirect_handler(auth_url: str):
-            print(f"\nRobinhood OAuth: opening browser →\n  {auth_url}\n")
-            webbrowser.open(auth_url)
+            nonlocal browser_opened, reauth_required
+            from urllib.parse import parse_qs, urlparse
+            expected_state["value"] = (parse_qs(urlparse(auth_url).query).get("state")
+                                       or [None])[0]
+            if not self.interactive_auth:
+                reauth_required = True
+                raise BrokerAuthError(
+                    "Robinhood session needs login; use Connect Robinhood once")
+            if browser_opened:
+                return
+            browser_opened = True
+            print("Robinhood OAuth: opening one browser login window")
+            if not webbrowser.open(auth_url):
+                raise BrokerAuthError("could not open the Robinhood login browser")
 
         async def callback_handler():
             # one-shot localhost HTTP server catches the OAuth redirect
@@ -153,8 +195,23 @@ class RobinhoodMCPBroker:
             class H(BaseHTTPRequestHandler):
                 def do_GET(self):          # noqa: N802
                     q = parse_qs(urlparse(self.path).query)
+                    returned_state = (q.get("state") or [None])[0]
+                    if returned_state != expected_state.get("value"):
+                        self.send_response(409)
+                        self.end_headers()
+                        self.wfile.write(
+                            b"Stonk Terminal: stale login tab; use the newest Robinhood tab.")
+                        return
+                    if q.get("error"):
+                        code_holder["error"] = (q.get("error_description") or
+                                                q.get("error") or ["OAuth denied"])[0]
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"Stonk Terminal: Robinhood login was not completed.")
+                        done.set()
+                        return
                     code_holder["code"] = (q.get("code") or [None])[0]
-                    code_holder["state"] = (q.get("state") or [None])[0]
+                    code_holder["state"] = returned_state
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b"Stonk Terminal: auth complete, close this tab.")
@@ -163,12 +220,22 @@ class RobinhoodMCPBroker:
                 def log_message(self, *a):  # silence
                     pass
 
-            srv = HTTPServer(("127.0.0.1", CALLBACK_PORT), H)
+            class CallbackServer(HTTPServer):
+                allow_reuse_address = True
+
+            try:
+                srv = CallbackServer(("127.0.0.1", CALLBACK_PORT), H)
+            except OSError as exc:
+                raise BrokerAuthError(
+                    "Robinhood login is already running; finish or retry the existing login") from exc
             t = threading.Thread(target=srv.serve_forever, daemon=True)
             t.start()
             ok = await asyncio.get_event_loop().run_in_executor(
                 None, done.wait, 300)     # 5 min for the human to log in
             srv.shutdown()
+            srv.server_close()
+            if code_holder.get("error"):
+                raise BrokerAuthError(f"Robinhood login failed: {code_holder['error']}")
             if not ok or not code_holder.get("code"):
                 raise BrokerAuthError("OAuth callback never arrived")
             return code_holder["code"], code_holder["state"]
@@ -193,6 +260,9 @@ class RobinhoodMCPBroker:
         except BrokerAuthError:
             raise
         except Exception as e:            # noqa: BLE001 — surface as auth/transport
+            if reauth_required:
+                raise BrokerAuthError(
+                    "Robinhood session needs login; use Connect Robinhood once") from e
             raise BrokerAuthError(
                 f"RH MCP call failed ({type(e).__name__}: {e}). If this is an "
                 f"OAuth/registration rejection, switch config broker to "
@@ -210,19 +280,19 @@ class RobinhoodMCPBroker:
     def _call(self, tool: str, args: dict) -> dict:
         import re
         import time
-        out = asyncio.run(self._call_async(tool, args))
-        # D39: RH throttles bursts — a 429 arrives as PROSE ("API error 429:
-        # ... available in N seconds"), which killed all 12 placements on
-        # 2026-07-10. Honor the hint and retry; place is idempotent (ref_id).
-        for _ in range(3):
-            txt = out.get("text", "") if isinstance(out, dict) else ""
-            if "API error 429" not in txt:
-                break
-            m = re.search(r"available in (\d+) seconds", txt)
-            wait = min(int(m.group(1)) if m else 15, 60) + 1
-            self.store.audit("rh_mcp_throttled", {"tool": tool, "wait_s": wait})
-            time.sleep(wait)
+        with _CALL_LOCK:
             out = asyncio.run(self._call_async(tool, args))
+            # D39: RH throttles bursts — a 429 arrives as prose. Honor its
+            # bounded wait hint; placement remains idempotent via ref_id.
+            for _ in range(3):
+                txt = out.get("text", "") if isinstance(out, dict) else ""
+                if "API error 429" not in txt:
+                    break
+                m = re.search(r"available in (\d+) seconds", txt)
+                wait = min(int(m.group(1)) if m else 15, 60) + 1
+                self.store.audit("rh_mcp_throttled", {"tool": tool, "wait_s": wait})
+                time.sleep(wait)
+                out = asyncio.run(self._call_async(tool, args))
         self.store.audit("rh_mcp_call", {"tool": tool, "args": args,
                                          "response_keys": list(out)[:20]})
         # RH wraps payloads as {"data": {...}, "guide": "..."} (observed live
@@ -305,14 +375,18 @@ class RobinhoodMCPBroker:
                        lambda: self._get_quotes_uncached(symbols))
 
     def _get_quotes_uncached(self, symbols: list[str]) -> dict[str, float]:
-        res = self._call("get_equity_quotes", {"symbols": symbols})
         out = {}
-        for row in _first(res, "results", "quotes", default=[]) or []:
-            q = row.get("quote", row) if isinstance(row, dict) else {}
-            sym = _first(q, "symbol", "ticker")
-            px = _f(_first(q, "last_trade_price", "last", "price", "mark_price"))
-            if sym and px:
-                out[sym] = px
+        # MCP providers commonly cap quote arrays. Bounded chunks keep one
+        # 1,500-name discovery universe from turning into one rejected call,
+        # while the adapter-level call lock prevents OAuth/token races.
+        for start in range(0, len(symbols), 50):
+            res = self._call("get_equity_quotes", {"symbols": symbols[start:start + 50]})
+            for row in _first(res, "results", "quotes", default=[]) or []:
+                q = row.get("quote", row) if isinstance(row, dict) else {}
+                sym = _first(q, "symbol", "ticker")
+                px = _f(_first(q, "last_trade_price", "last", "price", "mark_price"))
+                if sym and px:
+                    out[sym] = px
         return out
 
     def _order_args(self, intent: OrderIntent) -> dict:

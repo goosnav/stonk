@@ -105,15 +105,15 @@ class Node(SignalNode):
                     continue
             except (KeyError, TypeError, ValueError):
                 continue            # schema drift → discard (§34.15)
-            score = sentiment * confidence
-            if abs(score) < MIN_ABS_SCORE:
+            score = abs(sentiment)
+            if score * confidence < MIN_ABS_SCORE:
                 continue
             vol = (ctx.atr_pct(sym) or 0.02) * (max(1, horizon) ** 0.5)
             events.append(SignalEvent(
-                symbol=sym, direction="long" if score > 0 else "avoid",
+                symbol=sym, direction="long" if sentiment > 0 else "avoid",
                 score=round(score, 4), confidence=round(confidence, 3),
                 horizon_days=min(horizon, 30),
-                expected_return=round(score * vol * 0.4, 5),
+                expected_return=round(sentiment * confidence * vol * 0.4, 5),
                 expected_volatility=round(vol, 5),
                 downside_estimate=round(-2 * vol, 5),
                 evidence=[f"{result.get('catalyst','?')}: "

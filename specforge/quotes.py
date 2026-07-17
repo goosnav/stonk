@@ -90,8 +90,41 @@ class QuoteService:
 
     def _yfinance(self, symbols: list[str]) -> dict[str, dict]:
         import yfinance as yf
+        import pandas as pd
         out = {}
-        for sym in symbols:
+        if not symbols:
+            return out
+        yahoo = {sym: (sym if sym.startswith("^") else sym.replace(".", "-"))
+                 for sym in symbols}
+        try:
+            frame = yf.download(list(yahoo.values()), period="5d", interval="1d",
+                                auto_adjust=False, group_by="ticker", threads=True,
+                                progress=False)
+            for sym, ticker in yahoo.items():
+                try:
+                    if isinstance(frame.columns, pd.MultiIndex):
+                        block = frame[ticker]
+                    else:                       # yfinance flattens one symbol
+                        block = frame
+                    close = block["Close"].dropna()
+                    if close.empty:
+                        continue
+                    px = float(close.iloc[-1])
+                    prev = float(close.iloc[-2]) if len(close) > 1 else None
+                    out[sym] = {"price": round(px, 4),
+                                "change_pct": round(px / prev - 1, 4) if prev else None,
+                                "as_of": _now(), "source": "yfinance(batch)"}
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if out:
+                return out
+        except Exception:
+            pass
+        # Some Yahoo responses omit individual tickers from a batch. Retain a
+        # bounded per-symbol fallback only for those misses.
+        for sym in symbols[:20]:
+            if sym in out:
+                continue
             try:
                 fi = yf.Ticker(sym).fast_info
                 px = fi.get("lastPrice") or fi.get("last_price")

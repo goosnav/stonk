@@ -42,6 +42,23 @@
   button.primary:hover { background:var(--green); color:#000; }
   button.ok { color:var(--green); } button.no { color:var(--red); }
   button.no:hover { background:var(--red); color:#000; }
+  button:disabled { color:var(--dim); border-color:var(--line); cursor:not-allowed;
+                    background:transparent; }
+  #actionrail { width:100%; display:flex; gap:6px; align-items:center;
+                border-top:1px solid var(--line); padding-top:5px; }
+  #actionstate { margin-left:auto; color:var(--dim); font-size:10.5px; }
+  .spinner { display:inline-block; width:10px; height:10px; border:1px solid var(--dim);
+             border-top-color:var(--cyan); border-radius:50% !important;
+             animation:spin .8s linear infinite; vertical-align:-1px; margin-right:5px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion:reduce) { .spinner { animation:none; border-color:var(--cyan); } }
+  .progress { width:180px; height:5px; display:inline-block; background:#20242a;
+              border:1px solid var(--line); vertical-align:1px; margin:0 6px; }
+  .progress > i { display:block; height:100%; background:var(--cyan); }
+  .process-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:6px; margin-top:9px; }
+  .process-lane { border:1px solid var(--line); padding:7px 9px; min-height:62px; }
+  .process-lane.running { border-color:var(--cyan); }
+  .feed-stale { opacity:.72; }
   /* alerts */
   #alerts { padding:0 12px; }
   .alert { margin:6px 0; padding:5px 10px; border:1px solid var(--red);
@@ -50,11 +67,12 @@
   .alert.warn { border-color:var(--amber); color:var(--amber); }
   /* tabs */
   #tabs { display:flex; gap:0; padding:8px 12px 0; }
-  #tabs div { padding:5px 14px; cursor:pointer; border:1px solid transparent;
+  #tabs [role=tab] { padding:5px 14px; cursor:pointer; border:1px solid transparent;
               border-bottom:none; color:var(--dim); font-size:11px;
-              text-transform:uppercase; letter-spacing:.08em; }
-  #tabs div.on { background:var(--panel); border-color:var(--line);
+              text-transform:uppercase; letter-spacing:.08em; background:transparent; }
+  #tabs [role=tab].on { background:var(--panel); border-color:var(--line);
                  color:var(--amber); font-weight:700; }
+  #tabs [role=tab]:focus-visible { outline:2px solid var(--amber); outline-offset:-2px; }
   /* grid of panels with hairline gaps */
   main { padding:8px 12px 40px; display:grid; grid-template-columns:1fr 1fr;
          gap:8px; }
@@ -73,6 +91,9 @@
   tr:hover td { background:#16181c; }
   .pos { color:var(--green); } .neg { color:var(--red); } .dim { color:var(--dim); }
   .feed-error { color:var(--red); font-size:11.5px; }
+  #feedstatus { margin:5px 12px 0; padding:4px 8px; border-left:2px solid var(--line);
+                color:var(--dim); font-size:11px; }
+  #feedstatus.feed-error { border-color:var(--red); color:var(--red); }
   .badge { padding:0 6px; border:1px solid var(--line); font-size:10px;
            text-transform:uppercase; letter-spacing:.05em; }
   .badge.risk_on { color:var(--green); border-color:var(--green); }
@@ -91,6 +112,9 @@
     background:#0a0a0a; color:var(--text); border:1px solid var(--line);
     padding:2px 6px; width:90px; font:inherit; font-size:11.5px; }
   input[type=text] { width:230px; }
+  textarea { width:100%; min-height:110px; box-sizing:border-box; resize:vertical;
+    background:#0a0a0a; color:var(--text); border:1px solid var(--line);
+    padding:8px; font:inherit; font-size:12px; }
   input:focus-visible, select:focus-visible { outline:2px solid var(--amber); }
   canvas { width:100%; height:120px; }
   .proj .apr { font-size:24px; font-weight:700; }
@@ -101,6 +125,24 @@
   .kv td:first-child { color:var(--dim); width:56%; }
   pre.ops { background:#0a0a0a; border:1px solid var(--line); padding:8px;
             font-size:11px; overflow-x:auto; margin:4px 0; color:var(--cyan); }
+  @media (max-width:700px) {
+    #top { position:static; padding:6px; }
+    #strip { width:100%; }
+    #countdown { margin-left:0; }
+    #actionrail { align-items:stretch; flex-wrap:wrap; }
+    #actionrail button { flex:1 1 150px; min-height:34px; }
+    #actionstate { flex:1 0 100%; margin-left:0; overflow-wrap:anywhere; }
+    #tabs { overflow-x:auto; padding-left:6px; padding-right:6px; }
+    #tabs [role=tab] { flex:0 0 auto; min-height:36px; }
+    main { grid-template-columns:minmax(0,1fr); padding:6px 6px 32px; }
+    section, section.wide { grid-column:1; padding:9px; }
+    table { display:block; max-width:100%; overflow-x:auto; }
+    input[type=text], input[type=number], input[type=password], select, textarea {
+      max-width:100%; font-size:16px; }
+    .progress { width:min(135px,45vw); }
+    .process-grid { grid-template-columns:minmax(0,1fr); }
+    #toast { left:6px; right:6px; bottom:6px; max-width:none; }
+  }
 </style>
 </head>
 <body>
@@ -112,22 +154,30 @@
   <span id="enginetag" class="tag">…</span>
   <span id="strip" style="display:flex;gap:12px;flex-wrap:wrap"></span>
   <span id="countdown">—</span>
-  <button class="primary" onclick="scanNow()" title="Run one full evaluate→trade cycle immediately. Optional — the engine loops on its own; safe to press anytime (skips if a cycle is already running).">Scan now</button>
-  <div id="readiness">…</div>
+  <div id="readiness" role="status" aria-live="polite">Loading readiness…</div>
+  <div id="actionrail" aria-label="Operator actions">
+    <button id="tradecycle" class="primary" onclick="scanNow()" title="Run the ordinary governed trade cycle. Available only while the market is open.">Run trade cycle</button>
+    <button data-job-kind="discover" onclick="queueResearch('discover',this)" title="Rank the broad research universe using deterministic cached-data signals. Never places orders.">Discover opportunities</button>
+    <button id="deepresearch" data-job-kind="deep_research" onclick="queueResearch('deep_research',this)" title="Use the configured, budget-limited AI to evaluate the top five discoveries and refresh current holdings.">Deep-research top 5 + holdings</button>
+    <button data-job-kind="train_holdings" onclick="queueResearch('train_holdings',this)" title="Queue one bounded full-network challenger for each current holding. Never mutates a champion.">Train holdings</button>
+    <span id="actionstate" role="status" aria-live="polite">Loading operator jobs… automatic retry is enabled.</span>
+  </div>
 </div>
 <div id="alerts"></div>
-<div id="tabs">
-  <div data-p="overview" class="on">Overview</div>
-  <div data-p="engine">Engine</div>
-  <div data-p="trading">Trading</div>
-  <div data-p="switchboard">Switchboard</div>
-  <div data-p="risk">Config</div>
-  <div data-p="model">Model</div>
-  <div data-p="activity">Activity</div>
+<div id="feedstatus" role="status" aria-live="polite">Loading live feeds… failed requests will retry automatically.</div>
+<div id="tabs" role="tablist" aria-label="Terminal views">
+  <div role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0" data-p="overview" class="on">Overview</div>
+  <div role="tab" id="tab-strategy" aria-controls="panel-strategy" aria-selected="false" tabindex="-1" data-p="strategy">Strategy</div>
+  <div role="tab" id="tab-engine" aria-controls="panel-engine" aria-selected="false" tabindex="-1" data-p="engine">Engine</div>
+  <div role="tab" id="tab-trading" aria-controls="panel-trading" aria-selected="false" tabindex="-1" data-p="trading">Trading</div>
+  <div role="tab" id="tab-switchboard" aria-controls="panel-switchboard" aria-selected="false" tabindex="-1" data-p="switchboard">Switchboard</div>
+  <div role="tab" id="tab-risk" aria-controls="panel-risk" aria-selected="false" tabindex="-1" data-p="risk">Config</div>
+  <div role="tab" id="tab-model" aria-controls="panel-model" aria-selected="false" tabindex="-1" data-p="model">Model</div>
+  <div role="tab" id="tab-activity" aria-controls="panel-activity" aria-selected="false" tabindex="-1" data-p="activity">Activity</div>
 </div>
 <main>
 <!-- ============ OVERVIEW ============ -->
-<div class="page" data-page="overview">
+<div class="page" role="tabpanel" id="panel-overview" aria-labelledby="tab-overview" data-page="overview">
   <section class="wide">
     <h2>Account</h2>
     <p class="explain">Live snapshot of the account this engine controls. Cycle budget = the most it may deploy in the next scan (worst-case loss cap per time step).</p>
@@ -177,20 +227,21 @@
   <section>
     <h2>Broker connection</h2>
     <p class="explain">Paper needs nothing. Live trading = connect Robinhood, whitelist the agentic account, and pass the triple gate.</p>
-    <div id="brokerbox">—</div>
+    <div id="brokerbox" role="status" aria-live="polite">Loading broker status…</div>
   </section>
 </div>
 <!-- ============ ENGINE ============ -->
-<div class="page" data-page="engine" style="display:none">
+<div class="page" role="tabpanel" id="panel-engine" aria-labelledby="tab-engine" data-page="engine" style="display:none">
   <section class="wide">
     <h2>State machine — <span id="eng_phase_label">…</span></h2>
     <p class="explain">Live position of the autonomous loop, stamped at every phase transition (updates every 3s). SLEEPING = market closed but the engine is alive; IDLE = between cycles, waiting for the next tick.</p>
     <div id="eng_strip" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">—</div>
     <div id="eng_detail" class="dim" style="margin-top:8px;font-size:11.5px">—</div>
+    <div id="eng_processes" class="process-grid" role="status" aria-live="polite">Loading process state…</div>
   </section>
   <section>
     <h2>Cadence — is it actually running?</h2>
-    <p class="explain">The loop runs a full cycle on this interval during market hours. The cycle lock guarantees one cycle at a time, so Scan Now during a running cycle is a safe no-op.</p>
+    <p class="explain">The loop runs a full cycle on this interval during market hours. The cycle lock guarantees one cycle at a time, so Run trade cycle during a running cycle is a safe no-op.</p>
     <table class="kv"><tbody id="eng_cadence"></tbody></table>
   </section>
   <section>
@@ -206,7 +257,7 @@
   </section>
 </div>
 <!-- ============ TRADING ============ -->
-<div class="page" data-page="trading" style="display:none">
+<div class="page" role="tabpanel" id="panel-trading" aria-labelledby="tab-trading" data-page="trading" style="display:none">
   <section class="wide">
     <h2>Decisions — what the engine is doing</h2>
     <p class="explain">Every move the last scan considered, the governor's verdict on each, and every order currently working at the broker. This is the raw decision trail, not a summary.</p>
@@ -232,15 +283,40 @@
   </section>
   <section>
     <h2>Recent closed trades</h2>
-    <p class="explain">Round-trips with exit reasons — the raw material of the learning loop.</p>
-    <table id="trades"><thead><tr><th>sym</th><th>exit</th><th>ret</th><th>reason</th><th>nodes</th></tr></thead><tbody></tbody></table>
+    <p class="explain">Live, paper, and backtest outcomes are separate evidence sources. Legacy backtests remain visible but never calibrate live forecasts.</p>
+    <label>source <select id="trade_source" onchange="refreshTrades()"><option value="live">LIVE</option><option value="paper">PAPER</option><option value="backtest">BACKTEST</option></select></label>
+    <table id="trades"><thead><tr><th>src</th><th>sym</th><th>exit</th><th>ret</th><th>reason</th><th>nodes</th></tr></thead><tbody></tbody></table>
+  </section>
+</div>
+<!-- ============ STRATEGY ============ -->
+<div class="page" role="tabpanel" id="panel-strategy" aria-labelledby="tab-strategy" data-page="strategy" style="display:none">
+  <section class="wide">
+    <h2>Operator direction → Strategy AI</h2>
+    <p class="explain">Your message is advisory context, never an order. GPT evaluates it against the portfolio, evidence, regime, volatility, and measured performance. Only a reviewed and activated AI mandate can influence discovery and scores.</p>
+    <textarea id="strategy_input" placeholder="Example: Look for profitable infrastructure and power companies positioned to benefit from data-center expansion, but avoid businesses whose valuations require unrealistic growth."></textarea>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:7px">
+      <button class="primary" id="strategy_analyze" onclick="analyzeStrategy()">Analyze direction</button>
+      <span id="strategy_job" class="dim" role="status" aria-live="polite">idle</span>
+    </div>
+  </section>
+  <section class="wide">
+    <h2>Active strategic mandate</h2>
+    <div id="strategy_active" class="dim">no active mandate</div>
+  </section>
+  <section class="wide">
+    <h2>Proposed strategy — preview before activation</h2>
+    <div id="strategy_proposed" class="dim">submit direction to create a proposal</div>
+  </section>
+  <section class="wide">
+    <h2>Direction history</h2>
+    <div id="strategy_history" class="dim">none</div>
   </section>
 </div>
 <!-- ============ SWITCHBOARD ============ -->
-<div class="page" data-page="switchboard" style="display:none">
+<div class="page" role="tabpanel" id="panel-switchboard" aria-labelledby="tab-switchboard" data-page="switchboard" style="display:none">
   <section class="wide">
     <h2>Signal switchboard</h2>
-    <p class="explain">Each node is one strategy. Base weight × learned multiplier = its ensemble voice. Expectancy/win-rate come from closed trades it contributed to. The engine can only nudge multipliers within 0.3–2.0× and auto-disable clear losers — promotions are yours.</p>
+    <p class="explain">Each node is one strategy. Base weight × learned multiplier = its ensemble voice. Expectancy/win-rate come from closed trades it contributed to. Automation may deemphasize an enabled analysis only to its visible nonzero floor; this human toggle is the sole way to remove one completely.</p>
     <table id="nodes"><thead><tr><th>on</th><th>node</th><th>what it does</th><th>status</th><th>base w</th><th>learned ×</th><th>trades</th><th>expectancy</th><th>win</th></tr></thead><tbody></tbody></table>
   </section>
   <section class="wide">
@@ -250,7 +326,7 @@
   </section>
 </div>
 <!-- ============ RISK ============ -->
-<div class="page" data-page="risk" style="display:none">
+<div class="page" role="tabpanel" id="panel-risk" aria-labelledby="tab-risk" data-page="risk" style="display:none">
   <section>
     <h2>Risk controls</h2>
     <p class="explain">These bind the engine — the governor enforces them on every order. $ column shows each limit at current equity. Dangerous values are rejected.</p>
@@ -259,7 +335,7 @@
   </section>
   <section>
     <h2>AI provider &amp; key</h2>
-    <p class="explain">The key is stored in <code>.env</code> (gitignored, never committed) and applied to the running server immediately — the next scan uses it. It is never sent back to this page; only a masked hint is shown. All providers use the OpenAI-compatible chat API.</p>
+    <p class="explain">The key is stored in <code>.env</code> (gitignored, never committed) and applies to the next intelligence job. It is never sent back to this page; only a masked hint is shown. Anthropic uses its native Messages API; custom providers use the OpenAI-compatible chat API.</p>
     <table class="kv"><tbody>
       <tr><td>provider</td><td>
         <select id="ai_provider" onchange="onProviderChange()">
@@ -281,7 +357,7 @@
       <tr><td>AI enabled</td><td><input type="checkbox" id="ai_enabled"></td></tr>
       <tr><td>default model</td><td><input type="text" id="ai_model"></td></tr>
       <tr><td>news / bulk model (cheap, high volume)</td><td><input type="text" id="ai_model_news" placeholder="deepseek/deepseek-chat-v3-0324"></td></tr>
-      <tr><td>strategy model (flagship reasoner; try x-ai/grok-4 for the X angle)</td><td><input type="text" id="ai_model_hypo" placeholder="anthropic/claude-sonnet-4.5"></td></tr>
+      <tr><td>deep research / strategy model</td><td><input type="text" id="ai_model_hypo" placeholder="anthropic/claude-sonnet-4.5"></td></tr>
       <tr><td>daily budget $</td><td><input type="number" step="0.25" id="ai_budget"></td></tr>
       <tr><td>monthly ceiling $ (all AI)</td><td><input type="number" step="1" id="ai_month_budget"></td></tr>
       <tr><td>spend today / this month</td><td id="ai_today">—</td></tr>
@@ -290,13 +366,41 @@
     </tbody></table>
     <button onclick="saveAI()">Save AI settings</button>
   </section>
+  <section class="wide">
+    <h2>Intelligence routing — one-shot CLI first</h2>
+    <p class="explain">Prompts go to the selected local client through stdin in an empty read-only workspace. Provider/model changes apply to the next job. API is the final fallback and remains budget-limited.</p>
+    <table class="kv"><tbody>
+      <tr><td>intelligence enabled</td><td><input type="checkbox" id="intel_enabled"></td></tr>
+      <tr><td>default provider</td><td><select id="intel_provider"><option value="codex">Codex CLI</option><option value="claude">Claude CLI</option><option value="api">API</option></select></td></tr>
+      <tr><td>default cheap model</td><td><input type="text" id="intel_cheap"></td></tr>
+      <tr><td>default advanced model</td><td><input type="text" id="intel_advanced"></td></tr>
+      <tr><td>local fallback</td><td><select id="intel_fallback"><option value="claude">Claude CLI</option><option value="codex">Codex CLI</option></select></td></tr>
+      <tr><td>fallback cheap / advanced</td><td><input type="text" id="intel_fb_cheap" style="width:150px"> <input type="text" id="intel_fb_advanced" style="width:150px"></td></tr>
+      <tr><td>API fallback</td><td><input type="checkbox" id="intel_api_enabled"> <select id="intel_api_provider"><option>openrouter</option><option>openai</option><option>anthropic</option><option>custom</option></select></td></tr>
+      <tr><td>API cheap / advanced models</td><td><input type="text" id="intel_api_cheap" style="width:220px"> <input type="text" id="intel_api_advanced" style="width:220px"></td></tr>
+      <tr><td>daily local calls cheap / advanced</td><td><input type="number" id="intel_limit_cheap" style="width:70px"> <input type="number" id="intel_limit_advanced" style="width:70px"></td></tr>
+      <tr><td>timeout seconds / cache hours</td><td><input type="number" id="intel_timeout" style="width:70px"> <input type="number" id="intel_cache" style="width:70px"></td></tr>
+      <tr><td>purpose overrides JSON</td><td><textarea id="intel_routes" style="min-height:70px" placeholder='{"strategic_synthesis":{"provider":"codex","model":"gpt-5.6"}}'></textarea></td></tr>
+      <tr><td>route health</td><td id="intel_health">—</td></tr>
+    </tbody></table>
+    <button onclick="saveRouting()">Save routing</button>
+    <button onclick="doctorRouting()">Check clients &amp; auth</button>
+    <button onclick="testProvider()">Test selected provider</button>
+    <button onclick="testRouting()">Test complete route</button>
+  </section>
 </div>
 <!-- ============ MODEL ============ -->
-<div class="page" data-page="model" style="display:none">
+<div class="page" role="tabpanel" id="panel-model" aria-labelledby="tab-model" data-page="model" style="display:none">
   <section class="wide">
     <h2>Model shape — <span id="model_regime">…</span></h2>
-    <p class="explain">The live signal network as it has self-improved. Box height tracks effective weight (base × learned multiplier, regime-conditioned); green/red edge = measured per-trade expectancy; dashed = disabled. The governor gates everything — no node ever places an order.</p>
+    <p class="explain">The selected analog-neural DAG. Every box is an auditable specialist equation or interaction. Initial-prior edges are gray; validated learned edges use green/red for positive/negative contribution. Dashed learned edges are redundant/pruned or protected low-weight paths; every enabled specialist retains a nonzero route. The governor remains outside the graph.</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <label>symbol <input id="graph_symbol" value="SPY" maxlength="10" style="width:80px" onchange="refreshModel()"></label>
+      <label>horizon <select id="graph_horizon" onchange="refreshModel()"><option value="5">5 days</option><option value="21" selected>21 days</option></select></label>
+      <span id="graph_version" class="badge">—</span>
+    </div>
     <div id="modelsvg" style="overflow-x:auto">—</div>
+    <div id="graph_detail" class="mono dim" style="font-size:11px;margin-top:8px">click a node for its equation flow</div>
   </section>
   <section class="wide">
     <h2>Node ledger</h2>
@@ -305,9 +409,14 @@
       <th>effective</th><th>signals 7d</th><th>trades</th><th>expectancy</th>
       <th>hit</th><th>IR</th></tr></thead><tbody id="model_table"></tbody></table>
   </section>
+  <section class="wide">
+    <h2>Learning loops</h2>
+    <p class="explain">The global causal TCN and full per-holding networks are nodes inside the outer graph. Closed-market research creates immutable challengers; it never trains a live champion in place.</p>
+    <div id="learnbox" class="mono" style="font-size:11.5px">—</div>
+  </section>
 </div>
 <!-- ============ ACTIVITY ============ -->
-<div class="page" data-page="activity" style="display:none">
+<div class="page" role="tabpanel" id="panel-activity" aria-labelledby="tab-activity" data-page="activity" style="display:none">
   <section class="wide">
     <h2>Data freshness</h2>
     <p class="explain">Daily bars refresh at each scan. The risk governor hard-refuses any trade whose data is stale — this panel shows what it sees.</p>
@@ -333,18 +442,58 @@ const $ = id => document.getElementById(id);
 const fmt$ = v => v==null ? '—' : (v<0?'-':'')+'$'+Math.abs(Number(v)).toLocaleString(undefined,{maximumFractionDigits:2});
 const pct = (v,d=1) => v==null ? '—' : (v*100).toFixed(d)+'%';
 const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
+const esc = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cssToken = v => String(v??'').replace(/[^a-zA-Z0-9_-]/g,'');
+const safeNumber = (v,fallback=0) => Number.isFinite(Number(v))?Number(v):fallback;
+const jsonList = v => { try { const x=JSON.parse(v||'[]'); return Array.isArray(x)?x:[]; } catch (_) { return []; } };
+const progressHtml = (fraction,label) => {
+  const value=Math.round(Math.max(0,Math.min(1,safeNumber(fraction)))*100);
+  return `<span class="progress" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></span>`;
+};
 function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';
   setTimeout(()=>t.style.display='none',4500);}
-async function api(p,o){const r=await fetch(p,o);
-  if(!r.ok){toast('error: '+(await r.text()).slice(0,300));throw new Error(p);}return r.json();}
+async function api(p,o={}){
+  const method=(o.method||'GET').toUpperCase(), attempts=method==='GET'?2:1;
+  let last;
+  for(let i=0;i<attempts;i++){
+    const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),20000);
+    try{
+      const r=await fetch(p,{...o,signal:controller.signal}); clearTimeout(timer);
+      if(!r.ok){const detail=(await r.text()).slice(0,300);throw new Error(`${p}: ${r.status} ${detail}`);}
+      return await r.json();
+    }catch(e){clearTimeout(timer);last=e;if(i+1<attempts)await new Promise(r=>setTimeout(r,500));}
+  }
+  const err=new Error(`connection interrupted while loading ${p}: ${last?.message||last}`);
+  err.network=true; throw err;
+}
 async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
+async function put(p,b){return api(p,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
+async function researchPost(kind,force=false){
+  try{return await post('/api/research/jobs',{kind,force});}
+  catch(first){await new Promise(r=>setTimeout(r,700));return post('/api/research/jobs',{kind,force});}
+}
 
-/* tabs */
-document.querySelectorAll('#tabs div').forEach(t=>t.onclick=()=>{
-  document.querySelectorAll('#tabs div').forEach(x=>x.classList.remove('on'));
-  t.classList.add('on');
-  document.querySelectorAll('.page').forEach(p=>
-    p.style.display = p.dataset.page===t.dataset.p ? 'contents' : 'none');});
+/* tabs: roving tabindex keeps every terminal view keyboard reachable */
+const terminalTabs=[...document.querySelectorAll('#tabs [role=tab]')];
+function selectTab(t,focus=false){
+  terminalTabs.forEach(x=>{const selected=x===t;x.classList.toggle('on',selected);
+    x.setAttribute('aria-selected',String(selected));x.tabIndex=selected?0:-1;});
+  document.querySelectorAll('.page').forEach(p=>{
+    const selected=p.dataset.page===t.dataset.p;p.style.display=selected?'contents':'none';
+    p.hidden=!selected;});
+  if(focus)t.focus();
+}
+terminalTabs.forEach((t,index)=>{
+  t.addEventListener('click',()=>selectTab(t));
+  t.addEventListener('keydown',event=>{
+    let next=null;
+    if(event.key==='ArrowRight'||event.key==='ArrowDown')next=(index+1)%terminalTabs.length;
+    if(event.key==='ArrowLeft'||event.key==='ArrowUp')next=(index-1+terminalTabs.length)%terminalTabs.length;
+    if(event.key==='Home')next=0;if(event.key==='End')next=terminalTabs.length-1;
+    if(next!=null){event.preventDefault();selectTab(terminalTabs[next],true);}
+    else if(event.key==='Enter'||event.key===' '){event.preventDefault();selectTab(t,true);}
+  });
+});
 
 const NODE_DESC = {
   momentum:'12-1 momentum + trend + relative strength; the workhorse (+0.95%/trade over 10y backtest)',
@@ -356,6 +505,14 @@ const NODE_DESC = {
   congress_trades:'politician disclosure clusters, filing-date keyed, slow thematic tilt',
   insider:'insider cluster BUYS (selling is noise, buying is signal)',
   options_vol:'converts the top conviction into a bounded-premium long call (unlocks ~$5k)',
+  fundamentals:'AI valuation read of company-published financials, cached 3d/symbol',
+  business_fundamentals:'Citation-checked AI read of SEC filings and point-in-time business fundamentals',
+  company_catalyst:'Citation-checked company filing, earnings and news catalyst analysis',
+  hypothesis:'deterministic reader of the active AI market hypothesis',
+  gap:'opening gap up 1.5-6% in an uptrend rides continuation (live quotes; silent in backtests)',
+  vol_contraction:'VCP-lite: vol squeeze near 60d high in an uptrend → breakout entry',
+  neural:'Causal multivariate TCN predicting 5d/21d excess-return quantiles; challengers train off-hours and remain silent until every gate passes',
+  strategy_context:'Operator-informed Strategy AI mandate; bounded context, never a raw user command',
 };
 
 function line(canvas, series){
@@ -389,14 +546,14 @@ async function refreshMarket(){
   scanTimes = m.scan_times||[]; tzName = m.timezone||tzName;
   $('countdown').textContent = nextScanText();
   $('strip').innerHTML = Object.entries(m.strip||{}).map(([s,q])=>
-    `<span class="tick" title="source: ${q.source} · as of ${q.as_of}">
-       <span class="dim">${s.replace('^','')}</span><b>${q.price}</b>
+    `<span class="tick" title="source: ${esc(q.source)} · as of ${esc(q.as_of)}">
+       <span class="dim">${esc(s.replace('^',''))}</span><b>${esc(q.price)}</b>
        <span class="${cls(q.change_pct)}">${q.change_pct==null?'':pct(q.change_pct)}</span></span>`).join('');
   const t=m.trend||{}, vix=m.vix, br=m.breadth_above_50sma;
   const tile=(label,val,ok,sub)=>`<div style="border:1px solid var(--line);padding:6px 8px;min-width:104px">
-    <div class="dim" style="font-size:10px">${label}</div>
-    <div style="color:${ok==null?'var(--text)':ok?'var(--green)':'var(--red)'};font-size:15px"><b>${val}</b></div>
-    <div class="dim" style="font-size:10px">${sub||''}</div></div>`;
+    <div class="dim" style="font-size:10px">${esc(label)}</div>
+    <div style="color:${ok==null?'var(--text)':ok?'var(--green)':'var(--red)'};font-size:15px"><b>${esc(val)}</b></div>
+    <div class="dim" style="font-size:10px">${esc(sub||'')}</div></div>`;
   const tiles = [
     t.px ? tile(`${t.bench} vs 50sma`, t.px>t.sma50?'ABOVE':'BELOW', t.px>t.sma50, `${t.px} / ${t.sma50}`) : '',
     t.px ? tile(`${t.bench} vs 200sma`, t.px>t.sma200?'ABOVE':'BELOW', t.px>t.sma200, `${t.px} / ${t.sma200}`) : '',
@@ -404,36 +561,43 @@ async function refreshMarket(){
     br!=null ? tile('breadth >50sma', pct(br,0), br>0.5, 'of universe') : '',
     tile('deployment', '×'+m.deployment_multiplier, m.deployment_multiplier>0, m.regime),
   ].join('');
-  $('regimebox').innerHTML = `<span class="badge ${m.regime}">${m.regime}</span>
-    <b> ×${m.deployment_multiplier}</b> deployment
+  $('regimebox').innerHTML = `<span class="badge ${cssToken(m.regime)}">${esc(m.regime)}</span>
+    <b> ×${esc(m.deployment_multiplier)}</b> deployment
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${tiles}</div>
-    <div class="dim" style="font-size:10.5px;margin-top:6px">${(m.regime_evidence||[]).join(' · ')}</div>`;
+    <div class="dim" style="font-size:10.5px;margin-top:6px">${(m.regime_evidence||[]).map(esc).join(' · ')}</div>`;
 }
 async function refreshToday(){
   const t=await api('/api/today');
   const o=t.orders||{};
   const ord=Object.keys(o).length?Object.entries(o).map(([k,v])=>
-    `<span class="${k==='filled'?'pos':k==='vetoed'||k==='rejected'?'neg':''}">${v} ${k}</span>`).join(' · '):'no orders yet';
-  const vetoes=(t.top_vetoes||[]).map(([r,n])=>`${r} ×${n}`).join(' · ');
+    `<span class="${k==='filled'?'pos':k==='vetoed'||k==='rejected'?'neg':''}">${esc(v)} ${esc(k)}</span>`).join(' · '):'no orders yet';
+  const vetoes=(t.top_vetoes||[]).map(([r,n])=>`${esc(r)} ×${esc(n)}`).join(' · ');
   let ai='';
-  if(t.hypothesis) ai+=`<div style="margin-top:6px"><span class="badge">HYPOTHESIS</span> ${t.hypothesis}</div>`;
+  if(t.hypothesis) ai+=`<div style="margin-top:6px"><span class="badge">HYPOTHESIS</span> ${esc(t.hypothesis)}</div>`;
   if(t.news&&t.news.items){
     const age=Math.round((Date.now()-+new Date(t.news.ts))/36e5);
     ai+=`<div style="margin-top:6px"><span class="badge">AI READ</span> <span class="dim">${age}h ago</span> `+
       t.news.items.slice(0,5).map(i=>`<div style="margin:2px 0 0 6px">
-        <b class="${i.sentiment>0?'pos':i.sentiment<0?'neg':''}">${i.symbol} ${i.sentiment>0?'+':''}${i.sentiment}</b>
-        <span class="dim">[${i.catalyst}${i.already_priced?' · priced in':''}]</span> ${i.summary}</div>`).join('')+`</div>`;
+        <b class="${i.sentiment>0?'pos':i.sentiment<0?'neg':''}">${esc(i.symbol)} ${i.sentiment>0?'+':''}${esc(i.sentiment)}</b>
+        <span class="dim">[${esc(i.catalyst)}${i.already_priced?' · priced in':''}]</span> ${esc(i.summary)}</div>`).join('')+`</div>`;
   }
   if(t.fundamentals&&t.fundamentals.items){
     const age=Math.round((Date.now()-+new Date(t.fundamentals.ts))/36e5);
     const V={undervalued:'pos',overvalued:'neg'};
     ai+=`<div style="margin-top:6px"><span class="badge">FUNDAMENTALS</span> <span class="dim">${age}h ago</span> `+
       t.fundamentals.items.slice(0,5).map(i=>`<div style="margin:2px 0 0 6px">
-        <b>${i.symbol}</b> <span class="${V[i.valuation]||''}">${i.valuation}</span>
-        <span class="dim">[${i.direction} ${i.conviction}]</span> ${i.summary}</div>`).join('')+`</div>`;
+        <b>${esc(i.symbol)}</b> <span class="${V[i.valuation]||''}">${esc(i.valuation)}</span>
+        <span class="dim">[${esc(i.direction)} ${esc(i.conviction)}]</span> ${esc(i.summary)}</div>`).join('')+`</div>`;
+  }
+  if(t.company_evidence&&t.company_evidence.length){
+    ai+=`<div style="margin-top:6px"><span class="badge">PRODUCTION EVIDENCE</span> verified company dossiers`+
+      t.company_evidence.map(d=>{const f=d.fundamental_memo||{},c=d.catalyst_memo||{};
+        const stance=x=>`<span class="${x==='attractive'?'pos':x==='avoid'?'neg':''}">${esc(x||'unavailable')}</span>`;
+        const thesis=esc((f.thesis||c.thesis||'no directional memo').slice(0,180));
+        return `<div style="margin:3px 0 0 6px"><b>${esc(d.symbol)}</b> business ${stance(f.stance)} · catalyst ${stance(c.stance)} · quality ${pct(d.quality||0,0)} — ${thesis}</div>`;}).join('')+`</div>`;
   }
   if(!ai) ai=`<div class="dim" style="margin-top:6px">no AI reads yet — enable AI + a key in Config, sentiment/hypothesis appear here after their next run</div>`;
-  $('todaybox').innerHTML=`<b>${t.scans}</b> scans · <b>${t.candidates}</b> candidates → ${ord}`+
+  $('todaybox').innerHTML=`<b>${esc(t.scans)}</b> scans · <b>${esc(t.candidates)}</b> candidates → ${ord}`+
     (vetoes?`<div class="dim" style="font-size:11px;margin-top:4px">top vetoes: ${vetoes}</div>`:'')+ai;
 }
 
@@ -442,6 +606,11 @@ let SIM = true;   // set from /api/health; prefixes every $ value in paper mode
 async function refreshHealth(){
   const h = await api('/api/health');
   SIM = h.mode !== 'live';
+  const tradeSource=$('trade_source');
+  if(tradeSource&&!tradeSource.dataset.initialized){
+    tradeSource.value=SIM?'paper':'live';
+    tradeSource.dataset.initialized='1';
+  }
   const mt = $('modetag');
   mt.textContent = SIM ? 'SIMULATION' : 'LIVE $';
   mt.className = 'tag ' + (SIM ? 'sim' : 'live');
@@ -453,9 +622,13 @@ async function refreshHealth(){
   $('markettag').textContent = 'MKT '+(m.session||'?').toUpperCase()+' '+(m.et||'');
   $('markettag').className = 'tag ' + (m.open ? 'ok' : 'warn');
   const age = h.engine && h.engine.heartbeat_age_s, et = $('enginetag');
-  if(age==null){ et.textContent='ENGINE NEVER RAN'; et.className='tag err'; }
-  else if(age > 6*3600){ et.textContent='ENGINE DEAD '+Math.round(age/3600)+'H'; et.className='tag down'; }
-  else { et.textContent='ENGINE '+(age<120?age+'S':Math.round(age/60)+'M')+' AGO ('+(h.engine.heartbeat_source||'?')+')'; et.className='tag ok'; }
+  const op=(h.engine&&h.engine.operational_state)||'offline';
+  const labels={trading:'AUTONOMY ON · TRADING',researching:'AUTONOMY ON · RESEARCH',
+    closed_idle:'AUTONOMY ON · CLOSED IDLE',stale:'ENGINE STALE',offline:'ENGINE OFFLINE'};
+  et.textContent=labels[op]||op.toUpperCase();
+  et.title=(h.engine&&h.engine.operational_detail)||'';
+  et.className='tag '+(op==='offline'||op==='stale'?'down':op==='closed_idle'?'warn':'ok');
+  $('tradecycle').disabled=!(h.market&&h.market.open);
   const rd = h.readiness||{}, r = $('readiness');
   r.className = rd.trading ? 'trading' : '';
   r.id = 'readiness';
@@ -467,7 +640,7 @@ async function refreshHealth(){
   $('opsbox').innerHTML = `<table class="kv"><tbody>
     <tr><td>active run model</td><td>${src ? (src==='serve'?'DAEMON (resident server + scheduler)':'CRON (launchd pings, no resident process)') : '<span class="neg">none detected — nothing has scanned yet</span>'}</td></tr>
     <tr><td>scheduler in this server</td><td>${h.engine&&h.engine.scheduler_alive?'alive':'not running'}</td></tr>
-    <tr><td>next scheduled runs</td><td class="dim">${Object.values(runs).join('<br>')||'—'}</td></tr>
+    <tr><td>next scheduled runs</td><td class="dim">${Object.values(runs).map(esc).join('<br>')||'—'}</td></tr>
     </tbody></table>
     <div class="explain">OPTION A — daemon (default): survives via launchd, GUI always on.</div>
     <pre class="ops">./scripts/install_service.sh live      # login start + crash restart</pre>
@@ -491,15 +664,15 @@ async function refreshStatus(){
   /* alerts */
   const alerts=[];
   for(const [k,v] of Object.entries(s.kill_switches||{}))
-    alerts.push(`<div class="alert">[KILL] kill switch <b>${k}</b>: ${v.reason}
-      <button onclick="post('/api/kill/${k}/reset',{}).then(refreshAll)">reset</button></div>`);
+    alerts.push(`<div class="alert">[KILL] kill switch <b>${esc(k)}</b>: ${esc(v.reason)}
+      <button data-kill-key="${esc(k)}" onclick="resetKill(this.dataset.killKey)">reset</button></div>`);
   const pend = window._pendApprovals||0;
   if(pend) alerts.push(`<div class="alert warn">[HOLD] ${pend} order(s) waiting for approval — Trading tab</div>`);
   $('alerts').innerHTML = alerts.join('');
   /* positions (Trading tab) */
   $('positions').tBodies[0].innerHTML = (s.positions||[]).map(p=>`<tr>
-    <td><b>${p.symbol}</b></td><td>${p.qty}</td><td>${p.avg_cost}</td>
-    <td>${p.last}</td><td class="dim" title="${p.quote_as_of||''}">${p.quote_source}</td>
+    <td><b>${esc(p.symbol)}</b></td><td>${esc(p.qty)}</td><td>${esc(p.avg_cost)}</td>
+    <td>${esc(p.last)}</td><td class="dim" title="${esc(p.quote_as_of||'')}">${esc(p.quote_source)}</td>
     <td class="${cls(p.pnl_pct)}">${pct(p.pnl_pct)}</td>
     <td class="${cls(p.pnl_usd)}">${fmt$(p.pnl_usd)}</td><td>${fmt$(p.value)}</td></tr>`).join('')
     || '<tr><td colspan=8 class="dim">no open positions — the engine says "no trade" when it lacks conviction</td></tr>';
@@ -508,63 +681,71 @@ async function refreshStatus(){
     $('projection').innerHTML = `<span class="apr ${cls(pr.apr)}">${pct(pr.apr)}</span> APR
       &nbsp;<span class="dim">80% interval</span> ${pct(pr.apr_ci_low)} … ${pct(pr.apr_ci_high)}
       &nbsp;·&nbsp;P(win) ${pct(pr.prob_positive_trade,0)}
-      &nbsp;<span class="badge">${pr.confidence} confidence</span>`;
+      &nbsp;<span class="badge">${esc(pr.confidence)} confidence</span>`;
     $('projnote').textContent = `basis: ${Object.entries(pr.basis||{}).map(([k,v])=>`${v} ${k}`).join(', ')} trades`;
   } else { $('projection').textContent='—'; $('projnote').textContent=pr.note||''; }
 }
+async function resetKill(key){await post('/api/kill/'+encodeURIComponent(key)+'/reset',{});refreshAll();}
 async function refreshBroker(){
   const b = await api('/api/broker/status');
   const p = b.probe||{};
   let html = `<table class="kv"><tbody>
-    <tr><td>configured broker</td><td>${b.configured_broker}</td></tr>
-    <tr><td>live gate</td><td class="${b.live_gate_ok?'pos':'neg'}">${b.live_gate_ok?'OPEN':'closed'} — ${b.live_gate_reason}</td></tr>
-    <tr><td>Robinhood connection</td><td>${p.state||'never attempted'}</td></tr>`;
-  if(p.error) html += `<tr><td>detail</td><td class="neg" style="font-size:11px">${p.error}</td></tr>`;
+    <tr><td>configured broker</td><td>${esc(b.configured_broker)}</td></tr>
+    <tr><td>live gate</td><td class="${b.live_gate_ok?'pos':'neg'}">${b.live_gate_ok?'OPEN':'closed'} — ${esc(b.live_gate_reason)}</td></tr>
+    <tr><td>Robinhood connection</td><td>${esc(p.state||'never attempted')}</td></tr>`;
+  if(p.error) html += `<tr><td>detail</td><td class="neg" style="font-size:11px">${esc(p.error)}</td></tr>`;
   if(p.accounts) html += `<tr><td>accounts</td><td class="mono" style="font-size:11px">${
-    p.accounts.map(a=>`${a.account_number} ${a.agentic_allowed?'✓ agentic':'✗ not agentic'}`).join('<br>')}</td></tr>
-    <tr><td>whitelisted</td><td class="mono">${p.whitelist||'<span class="neg">EMPTY — set RH_ACCOUNT_WHITELIST in .env</span>'}</td></tr>`;
-  html += `</tbody></table>
-    <button class="primary" onclick="connectRH()">Connect Robinhood</button>
-    <span class="explain"> opens Robinhood's OAuth login in your browser; if it errors with a registration/allowlist message, use the bridge (scripts/bridge_prompt.md).</span>`;
+    p.accounts.map(a=>`${esc(a.account_number)} ${a.agentic_allowed?'✓ agentic':'✗ not agentic'}`).join('<br>')}</td></tr>
+    <tr><td>whitelisted</td><td class="mono">${p.whitelist?esc(p.whitelist):'<span class="neg">EMPTY — set RH_ACCOUNT_WHITELIST in .env</span>'}</td></tr>`;
+  const robinhoodConfigured=/robinhood/i.test(String(b.configured_broker||''));
+  const connectApplicable=b.live_applicable===true||(!SIM&&robinhoodConfigured);
+  html += `</tbody></table>`+(connectApplicable
+    ? `<button class="primary" onclick="connectRH()">Connect Robinhood</button>
+       <span class="explain"> opens one Robinhood OAuth flow; this card then refreshes automatically.</span>`
+    : `<span class="explain">Connect is unavailable because this process is not configured for a live Robinhood broker.</span>`);
   $('brokerbox').innerHTML = html;
 }
 async function connectRH(){
   await post('/api/broker/connect',{});
   toast('OAuth starting — watch for a browser window. This card refreshes automatically.');
-  let n=0; const iv=setInterval(async()=>{ await refreshBroker(); if(++n>20) clearInterval(iv); },3000);
+  let n=0;
+  const poll=async()=>{if(n++>20)return;if(!document.hidden)await guard(refreshBroker,'brokerbox');setTimeout(poll,document.hidden?15000:3000);};
+  setTimeout(poll,3000);
 }
 
 /* ---------- trading ---------- */
 async function refreshCandidates(){
   const cands = await api('/api/candidates');
-  $('candidates').tBodies[0].innerHTML = cands.map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
-    <td><b>${c.symbol}</b></td><td>${c.final_score}</td>
+  $('candidates').tBodies[0].innerHTML = cands.map(c=>`<tr title="${esc(c.thesis||'')}">
+    <td><b>${esc(c.symbol)}</b></td><td>${esc(c.final_score)}</td>
     <td class="${cls(c.expected_return)}">${pct(c.expected_return)}</td>
     <td class="dim">${pct(c.ci_low)} … ${pct(c.ci_high)}</td>
-    <td>${pct(c.probability_positive,0)}</td><td>${c.horizon_days}</td>
-    <td>${c.confidence_label}</td>
-    <td class="dim">${(c.contributing_nodes||[]).join(', ')}</td></tr>`).join('')
+    <td>${pct(c.probability_positive,0)}</td><td>${esc(c.horizon_days)}</td>
+    <td>${esc(c.confidence_label)}</td>
+    <td class="dim">${(c.contributing_nodes||[]).map(esc).join(', ')}</td></tr>`).join('')
     || '<tr><td colspan=8 class="dim">no candidates in latest scan</td></tr>';
 }
 async function refreshApprovals(){
   const rows = await api('/api/approvals');
   window._pendApprovals = rows.length;
   $('approvals').tBodies[0].innerHTML = rows.map(a=>`<tr>
-    <td>${a.symbol}</td><td>${a.side}</td><td>${a.qty}</td><td>${a.limit_price}</td>
+    <td>${esc(a.symbol)}</td><td>${esc(a.side)}</td><td>${esc(a.qty)}</td><td>${esc(a.limit_price)}</td>
     <td>${fmt$(a.notional)}</td>
-    <td><button class="ok" onclick="decide('${a.intent_id}','approved')">approve</button>
-        <button class="no" onclick="decide('${a.intent_id}','rejected')">reject</button></td></tr>`).join('')
+    <td><button class="ok" data-intent-id="${esc(a.intent_id)}" onclick="decide(this.dataset.intentId,'approved')">approve</button>
+        <button class="no" data-intent-id="${esc(a.intent_id)}" onclick="decide(this.dataset.intentId,'rejected')">reject</button></td></tr>`).join('')
     || '<tr><td colspan=6 class="dim">queue empty</td></tr>';
 }
 async function decide(id,d){await post('/api/approvals/'+id,{decision:d});refreshApprovals();}
 async function refreshTrades(){
-  const rows = await api('/api/trades?limit=15');
+  const source=$('trade_source').value||(SIM?'paper':'live');
+  const rows = await api('/api/trades?source='+encodeURIComponent(source)+'&limit=15');
   $('trades').tBodies[0].innerHTML = rows.map(t=>`<tr>
-    <td><b>${t.symbol}</b></td><td class="dim">${t.exit_date}</td>
+    <td><span class="badge">${esc(t.source)}</span>${t.qualified?'':' <span class="neg">legacy</span>'}</td>
+    <td><b>${esc(t.symbol)}</b></td><td class="dim">${esc(t.exit_date)}</td>
     <td class="${cls(t.ret)}">${pct(t.ret)}</td>
-    <td class="dim">${(t.exit_reason||'').split(' ')[0]}</td>
-    <td class="dim" style="font-size:11px">${JSON.parse(t.nodes||'[]').join(', ')}</td></tr>`).join('')
-    || '<tr><td colspan=5 class="dim">no closed trades yet</td></tr>';
+    <td class="dim">${esc((t.exit_reason||'').split(' ')[0])}</td>
+    <td class="dim" style="font-size:11px">${jsonList(t.nodes).map(esc).join(', ')}</td></tr>`).join('')
+    || '<tr><td colspan=6 class="dim">no closed trades for this source</td></tr>';
 }
 
 /* ---------- switchboard ---------- */
@@ -572,22 +753,24 @@ async function refreshNodes(){
   const nodes = await api('/api/nodes');
   $('nodes').tBodies[0].innerHTML = nodes.map(n=>`<tr>
     <td><input type="checkbox" ${n.enabled?'checked':''}
-         onchange="post('/api/nodes/${n.id}',{enabled:this.checked}).then(refreshNodes)"></td>
-    <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
-    <td class="dim" style="font-size:11.5px;max-width:340px">${NODE_DESC[n.id]||''}</td>
-    <td><span class="badge ${n.status}">${n.status||''}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+n.role+'</span>':''}${n.degraded?` <span class="neg" title="${String(n.degraded).replace(/"/g,'&quot;')}">⚠ degraded</span>`:''}</td>
-    <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${n.weight??0}"
-         onchange="post('/api/nodes/${n.id}',{weight:parseFloat(this.value)})">`}</td>
-    <td>${(n.weight_multiplier??1).toFixed(2)}</td><td>${n.n_trades}</td>
+         data-node-id="${esc(n.id)}" onchange="setNodeEnabled(this.dataset.nodeId,this.checked)"></td>
+    <td><b>${esc(n.id)}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
+    <td class="dim" style="font-size:11.5px;max-width:340px">${esc(NODE_DESC[n.id]||'')}</td>
+    <td><span class="badge ${cssToken(n.status)}">${esc(n.status||'')}</span> <span class="dim">${esc(n.learning_state||'full')}</span>${n.role&&n.role!=='alpha'?' <span class="dim">'+esc(n.role)+'</span>':''}${n.degraded?` <span class="neg" title="${esc(n.degraded)}">⚠ degraded</span>`:''}</td>
+    <td>${n.role==='filter'||n.role==='overlay'?'—':`<input type="number" step="0.05" value="${esc(n.weight??0)}"
+         data-node-id="${esc(n.id)}" onchange="setNodeWeight(this.dataset.nodeId,this.value)">`}</td>
+    <td title="Automation floor ${safeNumber(n.automated_floor).toFixed(2)}; only this checkbox can set zero">${n.enabled?safeNumber(n.weight_multiplier,1).toFixed(2):'0.00 HUMAN OFF'}</td><td>${esc(n.n_trades)}</td>
     <td class="${cls(n.expectancy)}">${n.expectancy==null?'—':pct(n.expectancy)}</td>
     <td>${n.win_rate==null?'—':pct(n.win_rate,0)}</td></tr>`).join('');
   const props = await api('/api/proposals');
   $('proposals').innerHTML = (props&&props.length) ? props.map(p=>
-    `<div style="margin:4px 0">⬆ <b>${p.node_id}</b>: ${p.from} → ${p.to}
-      (n=${p.basis.n}, expectancy ${pct(p.basis.expectancy)})
-      <button class="ok" onclick="approvePromotion('${p.node_id}','${p.to}')">apply</button></div>`).join('')
+    `<div style="margin:4px 0">⬆ <b>${esc(p.node_id)}</b>: ${esc(p.from)} → ${esc(p.to)}
+      (n=${esc(p.basis.n)}, expectancy ${pct(p.basis.expectancy)})
+      <button class="ok" data-node-id="${esc(p.node_id)}" data-status="${esc(p.to)}" onclick="approvePromotion(this.dataset.nodeId,this.dataset.status)">apply</button></div>`).join('')
     : '<span class="dim">none yet — proposals appear after nodes accumulate enough closed trades</span>';
 }
+async function setNodeEnabled(id,enabled){await post('/api/nodes/'+encodeURIComponent(id),{enabled});refreshNodes();}
+async function setNodeWeight(id,value){await post('/api/nodes/'+encodeURIComponent(id),{weight:parseFloat(value)});refreshNodes();}
 
 /* ---------- risk & budget ---------- */
 const RISK_META = [
@@ -618,7 +801,7 @@ async function refreshRisk(){
       <option${v==='auto'?' selected':''}>auto</option>
       <option${v===true?' selected':''}>true</option>
       <option${v===false?' selected':''}>false</option></select>`;
-    else input=`<input type="number" step="any" id="rk_${k}" value="${v}">`;
+    else input=`<input type="number" step="any" id="rk_${k}" value="${esc(v)}">`;
     const usd = (isPct && typeof v==='number' && _equityNow) ?
       `<span class="dim"> ≈ ${fmt$(v*_equityNow)}</span>` : '';
     return `<tr><td>${label}</td><td>${input}${usd}</td></tr>`;}).join('');
@@ -634,14 +817,19 @@ async function saveRisk(){
 }
 async function refreshCosts(){
   const c = await api('/api/costs');
+  $('deepresearch').disabled=!c.ai_available;
+  $('deepresearch').title=c.ai_available
+    ?'Use the configured, budget-limited AI to evaluate the top five discoveries and refresh holdings.'
+    :'Enable a Codex, Claude, or API intelligence route with remaining limits before Deep Research.';
   $('ai_enabled').checked=c.ai_enabled;$('ai_model').value=c.ai_model||'';
   $('ai_model_news').value=(c.ai_models||{}).headline_classification||'';
-  $('ai_model_hypo').value=(c.ai_models||{}).hypothesis||'';
+  $('ai_model_hypo').value=(c.ai_models||{}).investment_memo||
+    (c.ai_models||{}).hypothesis||'';
   $('ai_budget').value=c.ai_daily_budget_usd??1;
-  $('ai_month_budget').value=c.ai_monthly_budget_usd??30;
+  $('ai_month_budget').value=c.ai_monthly_budget_usd??40;
   const hypCap=(c.ai_purpose_monthly_caps||{}).hypothesis;
   $('ai_today').innerHTML=`${fmt$(c.ai_spend_today)} / <b>${fmt$(c.ai_spend_month)}</b>`+
-    `<span class="dim"> (strategy ${fmt$(c.ai_spend_month_hypothesis)}${hypCap?' of $'+hypCap+' cap':''})</span>`;
+    `<span class="dim"> (strategy ${fmt$(c.ai_spend_month_hypothesis)}${hypCap?' of $'+esc(hypCap)+' cap':''})</span>`;
   $('ai_est').textContent=fmt$(c.estimated_daily_total)+
     (Object.keys(c.estimated_daily_by_node||{}).length?
      ' ('+Object.entries(c.estimated_daily_by_node).map(([k,v])=>`${k} ${fmt$(v)}`).join(', ')+')':'');
@@ -650,7 +838,10 @@ async function refreshCosts(){
 async function saveAI(){
   const models={};
   if($('ai_model_news').value.trim()) models.headline_classification=$('ai_model_news').value.trim();
-  if($('ai_model_hypo').value.trim()) models.hypothesis=$('ai_model_hypo').value.trim();
+  if($('ai_model_hypo').value.trim()){
+    models.hypothesis=$('ai_model_hypo').value.trim();
+    models.investment_memo=$('ai_model_hypo').value.trim();
+  }
   await post('/api/ai',{enabled:$('ai_enabled').checked,model:$('ai_model').value,
     daily_budget_usd:parseFloat($('ai_budget').value),
     monthly_budget_usd:parseFloat($('ai_month_budget').value), models});
@@ -677,6 +868,85 @@ async function saveProvider(){
   $('ai_key').value='';
   toast('provider & key saved (next scan uses it)'); refreshProvider();
 }
+
+function mandateHtml(m, active=false){
+  if(!m)return '<span class="dim">no active mandate</span>';
+  const p=m.payload||{}, list=(label,v,klass='')=>v&&v.length?
+    `<div style="margin-top:6px"><b>${esc(label)}</b> <span class="${cssToken(klass)}">${v.map(esc).join(' · ')}</span></div>`:'';
+  return `<div class="card"><div><span class="badge ${active?'production':'experimental'}">${active?'ACTIVE':'PROPOSED'}</span> `+
+    `<b>${esc(p.summary||'AI strategy')}</b><span class="dim" style="float:right">confidence ${pct(p.confidence||0,0)} · expires ${esc(m.expires_at||p.expiry||'—')}</span></div>`+
+    `<div style="white-space:pre-wrap;margin-top:8px">${esc(p.thesis||'')}</div>`+
+    list('accepted',p.accepted_user_points,'pos')+list('modified',p.modified_user_points)+
+    list('rejected',p.rejected_user_points,'neg')+list('favored symbols',p.favored_symbols,'pos')+
+    list('avoided symbols',p.avoided_symbols,'neg')+list('contrary evidence',p.contrary_evidence,'dim')+
+    list('invalidation',p.invalidation_conditions,'dim')+
+    (!active?`<div style="margin-top:9px"><button class="primary" data-mandate-id="${esc(m.id)}" onclick="activateStrategy(this.dataset.mandateId)">Activate this mandate</button></div>`:
+      `<div style="margin-top:9px"><button data-mandate-id="${esc(m.id)}" onclick="deactivateStrategy(this.dataset.mandateId)">Deactivate</button></div>`)+`</div>`;
+}
+async function refreshStrategy(){
+  const [s,j]=await Promise.all([api('/api/strategy/directives'),api('/api/intelligence/jobs')]);
+  $('strategy_active').innerHTML=mandateHtml(s.active,true);
+  const proposed=(s.mandates||[]).find(x=>x.status==='proposed');
+  $('strategy_proposed').innerHTML=proposed?mandateHtml(proposed,false):'<span class="dim">no proposal awaiting activation</span>';
+  $('strategy_history').innerHTML=(s.messages||[]).length?(s.messages||[]).map(m=>
+    `<div style="border-bottom:1px solid var(--line);padding:5px 0"><span class="badge">${esc(m.status)}</span> ${esc(m.text)} <span class="dim" style="float:right">${esc(m.created_at)}</span>${m.error?`<div class="neg">${esc(m.error)}</div>`:''}</div>`).join(''):'<span class="dim">none</span>';
+  const job=(j.jobs||[]).find(x=>x.kind==='strategic_synthesis'&&['queued','running'].includes(x.status));
+  $('strategy_analyze').disabled=!!job;
+  $('strategy_job').textContent=job?`${job.status} · ${(job.progress||{}).phase||'waiting for Strategy AI'}`:'idle';
+}
+async function analyzeStrategy(){
+  const text=$('strategy_input').value.trim();if(!text){toast('Enter strategic direction first');return;}
+  $('strategy_analyze').disabled=true;$('strategy_job').textContent='queueing Strategy AI…';
+  try{const r=await post('/api/strategy/directives/analyze',{text});
+    toast(`Strategy AI job queued: ${r.job.id}`);refreshStrategy();}
+  catch(e){$('strategy_analyze').disabled=false;$('strategy_job').textContent='failed';throw e;}
+}
+async function activateStrategy(id){await post(`/api/strategy/directives/${id}/activate`,{});toast('AI strategy activated and now influences research/model context');refreshStrategy();refreshDecisions();}
+async function deactivateStrategy(id){await post(`/api/strategy/directives/${id}/deactivate`,{});toast('AI strategy deactivated');refreshStrategy();}
+
+async function refreshRouting(){
+  const r=await api('/api/ai/routing'),c=r.config||{},s=r.status||{};
+  $('intel_enabled').checked=!!c.enabled;$('intel_provider').value=c.default_provider||c.default_local_provider||'codex';
+  $('intel_cheap').value=(c.default_models||{}).cheap||'';$('intel_advanced').value=(c.default_models||{}).advanced||'';
+  $('intel_fallback').value=(c.local_fallback||{}).provider||'claude';
+  $('intel_fb_cheap').value=((c.local_fallback||{}).models||{}).cheap||'';
+  $('intel_fb_advanced').value=((c.local_fallback||{}).models||{}).advanced||'';
+  $('intel_api_enabled').checked=!!(c.api_fallback||{}).enabled;
+  $('intel_api_provider').value=(c.api_fallback||{}).provider||'openrouter';
+  $('intel_api_cheap').value=((c.api_fallback||{}).models||{}).cheap||'';
+  $('intel_api_advanced').value=((c.api_fallback||{}).models||{}).advanced||'';
+  $('intel_limit_cheap').value=(c.daily_local_limits||{}).cheap??24;
+  $('intel_limit_advanced').value=(c.daily_local_limits||{}).advanced??4;
+  $('intel_timeout').value=c.request_timeout_seconds??120;$('intel_cache').value=c.cache_ttl_hours??24;
+  $('intel_routes').value=JSON.stringify(c.purpose_routes||{},null,2);
+  const bs=s.binaries||{},u=s.usage_today||{},last=s.last_call||{};
+  $('intel_health').innerHTML=`Codex ${bs.codex?.installed?'installed':'missing'} · Claude ${bs.claude?.installed?'installed':'missing'} · `+
+    `local calls ${u.cheap||0}/${(s.limits||{}).cheap||0} cheap, ${u.advanced||0}/${(s.limits||{}).advanced||0} advanced`+
+    (last.at?`<br>last ${esc(last.purpose||'')} → ${esc(last.provider||'')} / ${esc(last.model||'')} ${last.ok?'✓':'FAILED'}`:'');
+}
+async function saveRouting(){
+  let routes;try{routes=JSON.parse($('intel_routes').value||'{}');}catch(e){toast('Purpose overrides must be valid JSON');return;}
+  const provider=$('intel_api_provider').value;
+  const bases={openrouter:'https://openrouter.ai/api/v1',openai:'https://api.openai.com/v1',anthropic:'https://api.anthropic.com/v1'};
+  await put('/api/ai/routing',{enabled:$('intel_enabled').checked,default_provider:$('intel_provider').value,
+    default_models:{cheap:$('intel_cheap').value.trim(),advanced:$('intel_advanced').value.trim()},
+    local_fallback:{provider:$('intel_fallback').value,models:{cheap:$('intel_fb_cheap').value.trim(),advanced:$('intel_fb_advanced').value.trim()}},
+    api_fallback:{enabled:$('intel_api_enabled').checked,provider,base_url:bases[provider]||$('ai_base_url').value,
+      models:{cheap:$('intel_api_cheap').value.trim(),advanced:$('intel_api_advanced').value.trim()}},
+    purpose_routes:routes,daily_local_limits:{cheap:parseInt($('intel_limit_cheap').value),advanced:parseInt($('intel_limit_advanced').value)},
+    request_timeout_seconds:parseInt($('intel_timeout').value),cache_ttl_hours:parseFloat($('intel_cache').value)});
+  toast('intelligence routing saved; next queued call uses it');refreshRouting();refreshCosts();
+}
+async function doctorRouting(){const s=await post('/api/ai/doctor',{});toast(`Codex auth ${s.binaries?.codex?.authenticated?'OK':'unavailable'} · Claude auth ${s.binaries?.claude?.authenticated?'OK':'unavailable'}`);refreshRouting();}
+async function testProvider(){
+  const selected=$('intel_provider').value;
+  const provider=selected==='api'?$('intel_api_provider').value:selected;
+  const model=selected==='api'?$('intel_api_cheap').value.trim():$('intel_cheap').value.trim();
+  toast(`testing ${provider}/${model}…`);
+  const r=await post('/api/ai/test',{provider,model});
+  toast(`${provider}/${model} operational in ${r.last_call?.latency_ms??'—'}ms`);refreshRouting();
+}
+async function testRouting(){toast('testing complete route…');const r=await post('/api/ai/test',{});toast(`route operational via ${r.last_call?.provider} / ${r.last_call?.model}`);refreshRouting();}
 
 /* ---------- charts / activity ---------- */
 let PV_RANGE='1M';
@@ -729,14 +999,14 @@ async function refreshDecisions(){
   const d=await api('/api/decisions');
   $('working').innerHTML=(d.working||[]).length
     ? '<b>WORKING NOW:</b> '+d.working.map(w=>`<span class="badge" style="margin-right:6px">
-        ${w.side.toUpperCase()} ${w.symbol} ${w.qty}@${w.limit_price} · ${w.status}</span>`).join('')
+        ${esc(String(w.side||'').toUpperCase())} ${esc(w.symbol)} ${esc(w.qty)}@${esc(w.limit_price)} · ${esc(w.status)}</span>`).join('')
     : '<span class="dim">no orders working at the broker right now</span>';
   const V={APPROVED:'pos',APPROVED_WITH_SIZE_REDUCTION:'pos',REJECTED:'neg',REQUIRES_HUMAN_APPROVAL:''};
-  const rows=(d.considered||[]).map(c=>`<tr title="${(c.thesis||'').replace(/"/g,'&quot;')}">
-    <td><b>${c.symbol}</b></td><td>${c.score}</td><td>${c.notional?fmt$(c.notional):'—'}</td>
-    <td class="${V[c.verdict]??''}">${c.verdict||'not sized'}</td>
-    <td>${c.result||'—'}</td>
-    <td class="dim" style="max-width:420px">${(c.reasons||[]).join('; ')||(c.thesis||'').slice(0,90)}</td></tr>`).join('')
+  const rows=(d.considered||[]).map(c=>{const signed=(c.evidence||[]).filter(x=>x.state==='running'&&!String(x.node).startsWith('family:')).map(x=>`${x.node} ${Number(x.signed_alpha||0)>=0?'+':''}${Number(x.signed_alpha||0).toFixed(2)}`).join(' · ');return `<tr title="${esc(c.thesis||'')}">
+    <td><b>${esc(c.symbol)}</b></td><td>${esc(c.score)}</td><td>${c.notional?fmt$(c.notional):'—'}</td>
+    <td class="${V[c.verdict]??''}">${esc(c.verdict||'not sized')}</td>
+    <td>${esc(c.result||'—')}</td>
+    <td class="dim" style="max-width:420px"><span class="badge">evidence ${pct(c.evidence_coverage||0,0)}</span> ${esc((c.reasons||[]).join('; ')||signed||(c.thesis||'').slice(0,90))}</td></tr>`}).join('')
     ||'<tr><td colspan=6 class="dim">no candidates in the last scan</td></tr>';
   $('decisions').tBodies[0].innerHTML=rows;
   $('eng_decisions').tBodies[0].innerHTML=rows;   // Engine tab mirrors the trail
@@ -770,16 +1040,16 @@ async function refreshSteering(){
   if(!s.pending.length){sec.style.display='none';return;}
   sec.style.display='';
   $('steering').innerHTML=s.pending.map(r=>{
-    const opts=JSON.parse(r.options||'[]').map(o=>
+    const opts=jsonList(r.options).map(o=>
       `<button class="${o.key===r.recommended?'primary':''}"
-        onclick="steer('${r.id}','${o.key}')"
-        title="${(o.detail||'').replace(/"/g,'&quot;')}">${o.label}</button>`).join(' ');
+        data-request-id="${esc(r.id)}" data-choice="${esc(o.key)}" onclick="steer(this.dataset.requestId,this.dataset.choice)"
+        title="${esc(o.detail||'')}">${esc(o.label)}</button>`).join(' ');
     const dflt=r.default_on_expiry==='adopt'
       ?'adopts the recommendation':'keeps the status quo';
     return `<div class="card" style="margin-bottom:8px">
-      <b>${r.title}</b>
+      <b>${esc(r.title)}</b>
       <span class="dim" style="float:right">expires in ${steerCountdown(r.expires_at)} → ${dflt}</span>
-      <div class="explain" style="white-space:pre-wrap;margin:6px 0">${(r.context||'').slice(0,600)}</div>
+      <div class="explain" style="white-space:pre-wrap;margin:6px 0">${esc((r.context||'').slice(0,600))}</div>
       ${opts}</div>`;}).join('');
 }
 async function steer(id, key){
@@ -808,19 +1078,19 @@ async function refreshFreshness(){
   const today = new Date().toISOString().slice(0,10);
   const stale = f.symbols.filter(s=>!s.latest_bar);
   const dates = f.symbols.map(s=>s.latest_bar).filter(Boolean).sort();
-  $('freshness').innerHTML = `newest bar <b>${dates[dates.length-1]||'—'}</b> ·
-    oldest <b>${dates[0]||'—'}</b> · ${f.symbols.length} symbols tracked ·
-    governor refuses trades on data older than ${f.stale_data_max_age_days} days` +
-    (stale.length?`<br><span class="neg">no data at all: ${stale.map(s=>s.symbol).join(', ')}</span>`:'');
+  $('freshness').innerHTML = `newest bar <b>${esc(dates[dates.length-1]||'—')}</b> ·
+    oldest <b>${esc(dates[0]||'—')}</b> · ${f.symbols.length} symbols tracked ·
+    governor refuses trades on data older than ${esc(f.stale_data_max_age_days)} days` +
+    (stale.length?`<br><span class="neg">no data at all: ${stale.map(s=>esc(s.symbol)).join(', ')}</span>`:'');
 }
 async function refreshAudit(){
   const f=$('auditfilter').value;
   const rows=await api('/api/audit?limit=120');
   $('audit').tBodies[0].innerHTML=rows
     .filter(r=>!f||r.event_type===f).slice(0,40).map(r=>`<tr>
-    <td class="dim mono" style="font-size:11px">${(r.ts||'').slice(5,19)}</td>
-    <td>${r.event_type}</td>
-    <td class="dim mono" style="font-size:11px">${(r.payload||'').slice(0,170)}</td></tr>`).join('');
+    <td class="dim mono" style="font-size:11px">${esc((r.ts||'').slice(5,19))}</td>
+    <td>${esc(r.event_type)}</td>
+    <td class="dim mono" style="font-size:11px">${esc((r.payload||'').slice(0,170))}</td></tr>`).join('');
 }
 async function scanNow(){
   toast('scanning… watch the Engine tab for live phase-by-phase progress');
@@ -830,6 +1100,43 @@ async function scanNow(){
     `entries ${JSON.stringify(s.entries)}\nexits ${JSON.stringify(s.exits)}`);
   refreshAll();
 }
+async function queueResearch(kind,button,force=false){
+  const names={discover:'opportunity discovery',deep_research:'deep research',
+               train_holdings:'holding training'};
+  button.disabled=true;button.dataset.original=button.textContent;
+  button.innerHTML='<span class="spinner" aria-hidden="true"></span>QUEUING';
+  try{
+    if(force&&!confirm('Run bounded training now? Trading cycles retain priority and model promotion gates remain enforced.'))return;
+    const job=await researchPost(kind,force);
+    toast(`${names[kind]} ${job.state||job.status}: ${job.id}${job.wait_reason?' · '+job.wait_reason:''}`);
+    await refreshJobs();
+  }catch(e){toast(`Could not queue ${names[kind]}. ${e.message}`);}
+  finally{button.disabled=false;button.textContent=button.dataset.original;}
+}
+const progressFraction=p=>Math.max(0,Math.min(1,
+  Number.isFinite(Number(p?.fraction))?Number(p.fraction):(p?.total?(p.index-1)/p.total:0)));
+async function refreshJobs(){
+  const jobs=await api('/api/research/jobs?limit=8');
+  const active=jobs.filter(j=>j.status==='running'||j.status==='queued');
+  window._hasActiveWork=active.length>0;
+  if(!active.length){
+    const last=jobs[0], detail=last&&(last.error||(last.result||{}).reason);
+    $('actionstate').innerHTML=last
+      ? `last ${esc(last.kind)}: <span class="${last.status==='failed'?'neg':''}">${esc(last.status)}</span>${detail?' · '+esc(String(detail).slice(0,140)):''}`
+      :'no operator jobs'; return;
+  }
+  $('actionstate').innerHTML=active.map(job=>{
+    const p=job.progress||{}, fraction=progressFraction(p), running=job.status==='running';
+    const wait=job.wait_reason||({waiting_window:'market close',waiting_dependency:'dependency',retry_wait:'retry backoff'}[job.state])||'';
+    const detail=p.symbol?`${p.symbol} ${p.index||0}/${p.total||0}`:(p.phase||wait||`queue #${job.queue_position||'?'}`);
+    const cancel=!running?` <button class="no" data-job-id="${esc(job.id)}" onclick="cancelResearchJob(this.dataset.jobId)">Cancel</button>`:'';
+    return `<span style="display:block;min-width:150px;margin:2px 0">${running?'<span class="spinner" aria-hidden="true"></span>':''}<span class="${running?'pos':'dim'}">${esc(job.kind)} · ${esc(job.state||job.status)}</span> ${progressHtml(fraction,`${job.kind} progress`)} <span class="dim">${esc(detail)}</span>${cancel}</span>`;
+  }).join('');
+}
+async function cancelResearchJob(id){
+  await post('/api/research/jobs/'+encodeURIComponent(id)+'/cancel',{});
+  toast('Queued research job cancelled.');await refreshJobs();
+}
 /* ---------- engine state machine (D39) ---------- */
 const ENG_PHASES=['sleeping','data','quotes','account','risk_gate','settle',
                   'signals','ensemble','sizing','execute','mark','idle'];
@@ -838,16 +1145,39 @@ async function refreshEngine(){
   const s=e.state||{};
   const ageS=s.at?Math.max(0,Math.round((Date.now()-+new Date(s.at))/1000)):null;
   const running=!['idle','sleeping','never_ran'].includes(s.phase);
-  $('eng_phase_label').innerHTML=`<span class="${running?'pos':'dim'}">${(s.phase||'?').toUpperCase().replace('_',' ')}</span>`+
+  $('eng_phase_label').innerHTML=`<span class="${running?'pos':'dim'}">${esc((s.phase||'?').toUpperCase().replace('_',' '))}</span>`+
     (ageS!=null?` <span class="dim" style="text-transform:none">· updated ${ageS<90?ageS+'s':Math.round(ageS/60)+'m'} ago</span>`:'');
   const arrow='<span style="color:var(--line)">→</span>';
   $('eng_strip').innerHTML=ENG_PHASES.map(p=>{
     const on=p===s.phase;
     return `<div style="padding:5px 9px;border:1px solid ${on?'var(--amber)':'var(--line)'};
       color:${on?'var(--amber)':'var(--dim)'};font-size:10px;text-transform:uppercase;
-      letter-spacing:.06em;${on?'font-weight:700;background:#1f1408':''}">${p.replace('_',' ')}</div>`;
+      letter-spacing:.06em;${on?'font-weight:700;background:#1f1408':''}">${esc(p.replace('_',' '))}</div>`;
   }).join(arrow);
   $('eng_detail').textContent=s.detail||'—';
+  const processes=e.processes||{}, research=processes.research||{}, rstate=research.state||{};
+  const intelligence=processes.intelligence||{}, istate=intelligence.state||{};
+  const rp=rstate.progress||{}, rf=rp.target?Math.max(0,Math.min(1,Number(rp.ready||0)/rp.target)):0;
+  const autonomousRunning=!['idle','waiting','caught_up','never_ran','error'].includes(rstate.phase);
+  const activeIntel=(intelligence.jobs||[]).find(j=>j.status==='running'), queuedIntel=(intelligence.jobs||[]).filter(j=>j.status==='queued');
+  const ip=activeIntel?.progress||{}, inf=progressFraction(ip), intelRunning=!!activeIntel;
+  window._engineActive=running||autonomousRunning||intelRunning;
+  const operatorJobs=research.jobs||[];
+  const operatorLane=(resource,label)=>{
+    const job=operatorJobs.find(j=>j.resource_class===resource&&j.status==='running')||
+              operatorJobs.find(j=>j.resource_class===resource&&j.status==='queued');
+    if(!job)return `<div class="process-lane"><b>${label}</b><br><span class="dim">idle · no queued work</span></div>`;
+    const p=job.progress||{}, f=progressFraction(p), running=job.status==='running';
+    const wait=job.wait_reason||({waiting_window:'market close',waiting_dependency:'dependency',retry_wait:'retry backoff'}[job.state])||'queued';
+    return `<div class="process-lane ${running?'running':''}"><b>${label}</b><br>${running?'<span class="spinner" aria-hidden="true"></span>':''}<span class="${running?'pos':'dim'}">${esc(job.kind)} · ${esc(job.state||job.status)}</span><br>${progressHtml(f,`${label} progress`)}<span class="dim">${esc(p.phase||wait)} ${esc(p.symbol||'')} ${esc(p.index||'')}${p.total?'/'+esc(p.total):''}${p.epoch?' · epoch '+esc(p.epoch)+'/'+esc(p.max_epochs):''}</span></div>`;
+  };
+  $('eng_processes').innerHTML=`<div class="process-lane ${running?'running':''}"><b>TRADING LOOP</b><br><span class="${running?'pos':'dim'}">${esc((s.phase||'unknown').replace('_',' '))}</span><br><span class="dim">${esc(s.detail||'—')}</span></div>`+
+    operatorLane('discovery','DISCOVERY LANE')+
+    operatorLane('intelligence','DEEP-RESEARCH LANE')+
+    operatorLane('training','PYTORCH TRAINING LANE')+
+    `<div class="process-lane ${autonomousRunning?'running':''}"><b>AUTONOMOUS RESEARCH</b><br>${autonomousRunning?'<span class="spinner" aria-hidden="true"></span>':''}<span class="${autonomousRunning?'pos':'dim'}">${esc(rstate.phase||'idle')} · ${esc(rstate.detail||'waiting')}</span>${rp.target?`<br>${progressHtml(rf,'Autonomous research progress')}${esc(rp.ready||0)}/${esc(rp.target)}`:''}</div>`+
+    `<div class="process-lane ${intelRunning?'running':''}"><b>INTELLIGENCE WORKER</b><br>${intelRunning?`<span class="spinner" aria-hidden="true"></span><span class="pos">${esc(activeIntel.kind)}</span> · ${esc(ip.phase||'working')} ${esc(ip.completed??'')}/${esc(ip.total??'')}<br>${progressHtml(inf,'Intelligence worker progress')}`:`<span class="dim">${esc(istate.phase||'idle')} · ${esc(istate.detail||'waiting')}</span>`}<br><span class="dim">${queuedIntel.length} queued · one sandboxed provider call at a time</span></div>`;
+  window._hasActiveWork=window._hasActiveWork||running||autonomousRunning||intelRunning;
   const m=e.market||{}, runs=Object.entries(e.next_runs||{});
   $('eng_cadence').innerHTML=[
     ['loop interval', e.interval_minutes?`every ${e.interval_minutes} min during market hours`
@@ -856,73 +1186,95 @@ async function refreshEngine(){
     ['cron scan times (ET)', (e.scan_times||[]).join(', ')||'—'],
     ...runs.map(([id,t])=>['next '+id, (t||'').slice(0,19).replace('T',' ')]),
     ['last completed cycle', e.heartbeat?`${(e.heartbeat.at||'').slice(0,19).replace('T',' ')} via ${e.heartbeat.source}`:'never'],
-  ].map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  ].map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('');
   const tr=s.trace||[];
   $('eng_trace').tBodies[0].innerHTML=tr.map((t,i)=>{
     const next=tr[i+1];
     const dur=next?((+new Date(next.at)-+new Date(t.at))/1000).toFixed(0)+'s':'…';
-    return `<tr><td><b>${t.phase}</b></td>
-      <td class="dim" style="font-size:11px">${t.detail||''}</td><td>${dur}</td></tr>`;
+    return `<tr><td><b>${esc(t.phase)}</b></td>
+      <td class="dim" style="font-size:11px">${esc(t.detail||'')}</td><td>${esc(dur)}</td></tr>`;
   }).join('')||'<tr><td colspan=3 class="dim">no cycle trace yet — appears after the first scan on the new engine</td></tr>';
 }
 // fail gracefully: a dead feed renders an explicit error in its panel,
 // never a stale silent value
+const failedFeeds=new Map();
+function renderFeedStatus(){
+  const fs=$('feedstatus');
+  if(failedFeeds.size){
+    const [panel,message]=failedFeeds.entries().next().value;
+    fs.classList.add('feed-error');
+    fs.textContent=`FEED ERROR (${panel}): ${message} · retrying automatically`;
+  }else{
+    fs.classList.remove('feed-error');fs.textContent='Feeds online · background refresh active.';
+  }
+}
 async function guard(fn, panelId){
-  try { await fn(); }
+  try { await fn(); const el=document.getElementById(panelId);if(el){el.classList.remove('feed-stale');el.classList.remove('feed-error');}
+    failedFeeds.delete(panelId);renderFeedStatus(); }
   catch(e){ const el=document.getElementById(panelId);
-    if(el) el.innerHTML = '<span class="feed-error">-- FEED ERROR: '
-      + String(e.message||e).slice(0,120) + ' --</span>'; }
+    const message=String(e.message||e).slice(0,180);failedFeeds.set(panelId,message);renderFeedStatus();
+    if(e.network){if(el)el.classList.add('feed-stale');toast(message+' · retrying automatically');return;}
+    if(el){el.textContent='FEED ERROR: '+message;el.classList.add('feed-error');} }
+}
+let lastGraph=null;
+function showGraphNode(id){
+  if(!lastGraph)return;
+  const n=lastGraph.topology.nodes.find(x=>x.id===id)||{};
+  const a=(lastGraph.snapshot?.activations||{})[id]||{};
+  $('graph_detail').innerHTML=`<b>${esc(id)}</b> · layer ${esc(n.layer)} · ${esc(n.role)} · activation ${esc(n.activation)}<br>`+
+    `specialist raw ${esc(a.raw??'—')} × base scale ${esc(n.base_scale??1)} + bias ${esc(n.bias??0)} → preactivation ${esc(a.preactivation??'—')} → <b>${esc(a.value??'—')}</b><br>`+
+    `incoming: ${(a.incoming||[]).map(x=>`${esc(x.source)} ${x.value>=0?'+':''}${Number(x.value).toFixed(4)}`).join(' · ')||'none'}`;
 }
 async function refreshModel(){
   const m=await api('/api/model');
+  const sym=($('graph_symbol').value||'SPY').toUpperCase();
+  const horizon=+$('graph_horizon').value;
+  const g=await api(`/api/model/graph?symbol=${encodeURIComponent(sym)}&horizon=${horizon}`);
+  const research=await api('/api/research');
+  lastGraph=g;
   $('model_regime').textContent=`regime ${m.regime} · deploy ×${m.deployment_multiplier}`+
     (m.kill_switches.length?` · KILL: ${m.kill_switches.join(',')}`:'');
+  $('graph_version').textContent=`${g.entry_block_reason||(`${g.topology_provenance==='initial_prior'?'INITIAL TOPOLOGY':g.version} · ${g.status}`)} · stage ${g.ramp_stage||0} · live ${Math.round((g.effective_live_blend||0)*100)}%`;
   const nodes=m.nodes;
-  const rowH=n=>Math.max(34, Math.min(64, 24+n.effective_weight*90));
-  let y=14; const pos={};
-  nodes.forEach(n=>{pos[n.id]={y, h:rowH(n)}; y+=rowH(n)+10;});
-  const H=Math.max(y+8, 240), NX=170, NW=178, EX=430, GX=560, BX=676;
-  const mid=t=>pos[t].y+pos[t].h/2;
-  const col=n=>n.status==='production'?'var(--green)':n.status==='probation'
-    ?'var(--amber)':'#7d8799';
-  const edge=n=>{
-    const w=Math.max(1, n.effective_weight*8);
-    const c=n.trades_n<3?'#3a3f4c':(n.expectancy>0?'var(--green)':'var(--red)');
-    return `<path d="M ${NX+NW} ${mid(n.id)} C ${EX-40} ${mid(n.id)}, ${EX-40} ${H/2}, ${EX} ${H/2}"
-      stroke="${c}" stroke-width="${n.enabled?w:0.6}" fill="none"
-      ${n.enabled?'':'stroke-dasharray="3,3"'} opacity="${n.enabled?0.9:0.35}"/>`;};
-  const box=n=>{
-    const p=pos[n.id], c=col(n);
-    return `<rect x="${NX}" y="${p.y}" width="${NW}" height="${p.h}" fill="var(--panel)"
-      stroke="${c}" ${n.enabled?'':'stroke-dasharray="4,3"'} opacity="${n.enabled?1:0.45}"/>
-    <text x="${NX+8}" y="${p.y+15}" fill="${c}" font-size="11" font-family="monospace">${n.id}${n.ai?' ⚡AI':''}${n.role==='filter'?' [veto]':''}</text>
-    <text x="${NX+8}" y="${p.y+p.h-6}" fill="#7d8799" font-size="9" font-family="monospace">
-      eff ${n.effective_weight.toFixed(2)} (${n.base_weight}×${n.multiplier})${n.trades_n?` · ${n.trades_n} trades ${(n.expectancy*100).toFixed(1)}%`:''}</text>`;};
-  const hypoOn=m.hypothesis.enabled && pos['hypothesis'];
-  const hypoBox=hypoOn?`<rect x="8" y="${pos['hypothesis'].y}" width="130" height="${pos['hypothesis'].h}"
-      fill="none" stroke="var(--cyan)"/>
-    <text x="14" y="${pos['hypothesis'].y+15}" fill="var(--cyan)" font-size="10" font-family="monospace">AI hypothesis</text>
-    <text x="14" y="${pos['hypothesis'].y+pos['hypothesis'].h-6}" fill="#7d8799" font-size="9" font-family="monospace">${m.hypothesis.short_term?`${m.hypothesis.short_term.stances} stances`: 'none active'}</text>
-    <line x1="138" y1="${mid('hypothesis')}" x2="${NX}" y2="${mid('hypothesis')}" stroke="var(--cyan)"/>`:'';
-  const chain=(x,label,sub)=>`<rect x="${x}" y="${H/2-26}" width="104" height="52" fill="var(--panel)" stroke="var(--line)"/>
-    <text x="${x+8}" y="${H/2-8}" fill="var(--text)" font-size="11" font-family="monospace">${label}</text>
-    <text x="${x+8}" y="${H/2+10}" fill="#7d8799" font-size="9" font-family="monospace">${sub}</text>`;
-  $('modelsvg').innerHTML=`<svg viewBox="0 0 800 ${H}" width="100%" style="min-width:760px">
-    <text x="8" y="10" fill="#7d8799" font-size="9" font-family="monospace">market data → signal nodes → ensemble → governor → broker</text>
-    ${hypoBox}${nodes.map(edge).join('')}${nodes.map(box).join('')}
-    ${chain(EX,'ENSEMBLE',`min score ${m.ensemble.min_final_score}`)}
-    ${chain(GX,'GOVERNOR',m.kill_switches.length?'KILL ACTIVE':'budget-gated')}
-    ${chain(BX,'BROKER','orders')}
-    <line x1="${EX+104}" y1="${H/2}" x2="${GX}" y2="${H/2}" stroke="var(--line)"/>
-    <line x1="${GX+104}" y1="${H/2}" x2="${BX}" y2="${H/2}" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/>
-  </svg>`;
+  const topo=g.topology, snap=g.snapshot?.activations||{}, layers=[1,2,3,4], W=1080, H=620, BW=180, BH=42;
+  const pos={};
+  layers.forEach((layer,li)=>{const ns=topo.nodes.filter(n=>n.layer===layer);ns.forEach((n,i)=>{
+    pos[n.id]={x:25+li*260,y:45+i*Math.min(70,520/Math.max(1,ns.length))};});});
+  const edge=e=>{const a=pos[e.source],b=pos[e.target],w=safeNumber(e.weight),c=g.topology_provenance==='initial_prior'?'#606873':w>=0?'var(--green)':'var(--red)';
+    if(!a||!b)return'';return `<path d="M ${a.x+BW} ${a.y+BH/2} C ${a.x+BW+45} ${a.y+BH/2}, ${b.x-45} ${b.y+BH/2}, ${b.x} ${b.y+BH/2}" fill="none" stroke="${c}" stroke-width="${Math.max(.6,Math.min(6,Math.abs(w)*8))}" opacity="${e.pruned ? .20 : e.deemphasized ? .45 : .8}" ${(e.pruned||e.deemphasized)?'stroke-dasharray="4,4"':''}><title>${esc(e.source)} → ${esc(e.target)}: ${w.toFixed(4)}${e.pruned?' pruned redundant edge':e.deemphasized?' deemphasized; protected nonzero path':''}</title></path>`};
+  const box=n=>{const p=pos[n.id],a=snap[n.id]||{},v=Math.min(1,Math.abs(Number(a.value||0))),stroke=n.role==='output'?'var(--cyan)':n.role==='gate'?'var(--amber)':'#7d8799';
+    const state=g.node_state?.[n.id]||'unavailable';
+    return `<g data-graph-node="${esc(n.id)}" tabindex="0" role="button" aria-label="Inspect ${esc(n.id)}" style="cursor:pointer"><rect x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" fill="rgba(27,209,154,${.03+v*.22})" stroke="${stroke}"/><text x="${p.x+7}" y="${p.y+15}" fill="${stroke}" font-size="10" font-family="monospace">${esc(n.id)}</text><text x="${p.x+7}" y="${p.y+32}" fill="#8b95a7" font-size="9" font-family="monospace">${esc(state)} · ${a.value==null?'neutral':Number(a.value).toFixed(3)}</text></g>`};
+  const layerNames=['STOCK-LOCAL','MARKET CONTEXT','INTERACTIONS','FORECASTS'];
+  $('modelsvg').innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:900px">${layers.map((l,i)=>`<text x="${30+i*260}" y="20" fill="#7d8799" font-size="10" font-family="monospace">${layerNames[i]} · L${l}</text>`).join('')}${topo.edges.map(edge).join('')}${topo.nodes.map(box).join('')}<rect x="1000" y="270" width="75" height="55" fill="var(--panel)" stroke="${m.kill_switches.length?'var(--red)':'var(--line)'}"/><text x="1008" y="292" fill="var(--text)" font-size="9">GOVERNOR</text><text x="1008" y="309" fill="#7d8799" font-size="8">outside graph</text></svg>`;
+  $('modelsvg').querySelectorAll('[data-graph-node]').forEach(el=>{
+    const open=()=>showGraphNode(el.dataset.graphNode);el.addEventListener('click',open);
+    el.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}});
+  });
+  if(!g.snapshot) $('graph_detail').innerHTML=`<span class="dim">No activation snapshot for ${esc(sym)}. A completed scan that evaluates this symbol will populate raw values and edge contributions.</span>`;
+  const nu=research.neural, rr=research.weekly, rs=research.state||{}, us=research.universe?.tiers||{};
+  const temporal=g.temporal||{}, arch=temporal.architecture||{}, held=temporal.holdings||[];
+  const fc=research.fundamental_coverage||{};
+  const ce=research.company_evidence||{}, ceb=ce.budget||{}, cec=ce.counts||{};
+  const nm=(nu&&nu.metrics)||{}, baselines=nm.baselines||{};
+  $('learnbox').innerHTML=
+    `<div><span class="badge">RESEARCH</span> ${esc(rs.phase||'never_ran')} · ${esc(rs.detail||'—')} · research ${safeNumber(us.research).toLocaleString()} / active ${safeNumber(us.active).toLocaleString()}</div>`+
+    `<div style="margin-top:4px"><span class="badge">SEC FEATURES</span> point-in-time coverage ${esc(fc.covered||0)}/${esc(fc.total||0)}</div>`+
+    `<div style="margin-top:4px"><span class="badge">COMPANY DOSSIERS</span> ready ${esc(cec.ready||0)} · unsupported ${esc(cec.unsupported||0)} · AI month ${fmt$(ceb.spent_month_usd||0)} / ${fmt$(ceb.monthly_budget_usd||0)} · remaining ${fmt$(ceb.remaining_month_usd||0)}</div>`+
+    `<div style="margin-top:4px"><span class="badge">GLOBAL TCN</span> ${nu ? `${esc(nu.status||'—')} · ${esc(nu.data_as_of||'—')} · ${esc(JSON.stringify(nu.metrics||{}).slice(0,180))}`:'no challenger yet'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">BASELINE GATE</span> ${Object.keys(baselines).length?`${nm.beats_baselines?'PASS':'NOT PASSED'} · ${esc(JSON.stringify(baselines).slice(0,220))}`:`awaiting compatible ${(temporal.features||[]).length||'current-schema'}-feature challenger`}</div>`+
+    `<div style="margin-top:4px"><span class="badge">TCN SHAPE</span> ${esc(arch.window||60)} sessions → ${(arch.blocks||[]).map(b=>`Conv1d 32 k3 d${esc(b.dilation)}`).join(' → ')} + all-feature context fusion → 5d/21d quantiles + P(+)</div>`+
+    `<div style="margin-top:4px"><span class="badge">HOLDING NETS</span> ${held.length?held.map(h=>`${esc(h.symbol)}: ${esc(h.run?h.run.status:'none')} · ${esc(h.bars)}/1250 bars · blend ${Math.round(safeNumber(h.effective_blend)*100)}%`).join('<br>'):'no live holdings'}</div>`+
+    `<div style="margin-top:4px"><span class="badge">WALK-FORWARD</span> ${rr
+      ? `${(rr.window||[]).map(esc).join(' → ')} · ${esc(rr.n_trades)} trades · win ${rr.win_rate==null?'—':(rr.win_rate*100).toFixed(0)+'%'} · OOS ${esc(JSON.stringify(rr.out_of_sample_30pct||{}).slice(0,120))} · ran ${esc((rr.ran_at||'').slice(5,16).replace('T',' '))}`
+      : '<span class="dim">no weekly report yet</span>'}</div>`;
   $('model_table').innerHTML=nodes.map(n=>`<tr style="opacity:${n.enabled?1:0.45}">
-    <td><b>${n.id}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
-    <td>${n.status||'—'}</td><td>${n.base_weight??'—'}</td><td>×${n.multiplier}</td>
-    <td><b>${n.effective_weight}</b></td><td>${n.signals_7d}</td><td>${n.trades_n}</td>
+    <td><b>${esc(n.id)}</b>${n.ai?' <span class="badge">AI</span>':''}</td>
+    <td>${esc(n.status||'—')}</td><td>${esc(n.base_weight??'—')}</td><td>×${esc(n.multiplier)}</td>
+    <td><b>${esc(n.effective_weight)}</b></td><td>${esc(n.signals_7d)}</td><td>${esc(n.trades_n)}</td>
     <td>${n.expectancy!=null?(n.expectancy*100).toFixed(2)+'%':'—'}</td>
     <td>${n.hit_rate!=null?(n.hit_rate*100).toFixed(0)+'%':'—'}</td>
-    <td>${n.per_trade_ir??'—'}</td></tr>`).join('');
+    <td>${esc(n.per_trade_ir??'—')}</td></tr>`).join('');
 }
 function refreshAll(){
   guard(refreshHealth,'readiness'); guard(refreshMarket,'strip');
@@ -930,18 +1282,34 @@ function refreshAll(){
   guard(refreshCandidates,'candidates'); guard(refreshApprovals,'approvals');
   guard(refreshTrades,'trades'); guard(refreshNodes,'nodes');
   guard(refreshRisk,'risk'); guard(refreshCosts,'ai'); guard(refreshProvider,'ai');
+  guard(refreshRouting,'intel_health'); guard(refreshStrategy,'strategy_active');
   guard(refreshCurve,'curve'); guard(refreshMC,'mcnote');
   guard(refreshAudit,'audit'); guard(refreshFreshness,'freshness');
   guard(refreshSteering,'steering'); guard(refreshModel,'model_table');
   guard(refreshToday,'todaybox'); guard(refreshDecisions,'decisions');
   guard(refreshEngine,'eng_strip');
+  guard(refreshJobs,'actionstate');
 }
 refreshAll();
-setInterval(()=>{guard(refreshEngine,'eng_strip');},3000);
-setInterval(()=>{guard(refreshHealth,'readiness');guard(refreshStatus,'acct');guard(refreshApprovals,'approvals');},10000);
-setInterval(()=>{refreshMarket();},30000);
-setInterval(()=>{refreshCandidates();refreshTrades();refreshCurve();refreshMC();
-  refreshCosts();refreshAudit();refreshSteering();refreshToday();refreshDecisions();},60000);
+function adaptivePoll(work,activeMs,idleMs){
+  const tick=async()=>{
+    if(!document.hidden)await work();
+    setTimeout(tick,(window._hasActiveWork||window._engineActive)?activeMs:idleMs);
+  };
+  setTimeout(tick,activeMs);
+}
+adaptivePoll(()=>guard(refreshEngine,'eng_strip'),3000,30000);
+adaptivePoll(async()=>{await Promise.all([guard(refreshHealth,'readiness'),guard(refreshStatus,'acct'),guard(refreshApprovals,'approvals')]);},10000,60000);
+adaptivePoll(()=>guard(refreshJobs,'actionstate'),5000,30000);
+adaptivePoll(async()=>{await Promise.all([guard(refreshStrategy,'strategy_active'),guard(refreshRouting,'intel_health')]);},5000,60000);
+adaptivePoll(()=>guard(refreshMarket,'strip'),30000,60000);
+adaptivePoll(async()=>{await Promise.all([guard(refreshCandidates,'candidates'),guard(refreshTrades,'trades'),
+  guard(refreshCurve,'curve'),guard(refreshMC,'mcnote'),guard(refreshCosts,'ai'),
+  guard(refreshAudit,'audit'),guard(refreshSteering,'steering'),guard(refreshToday,'todaybox'),
+  guard(refreshDecisions,'decisions')]);},60000,180000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){
+  guard(refreshHealth,'readiness');guard(refreshEngine,'eng_strip');guard(refreshJobs,'actionstate');
+}});
 </script>
 </body>
 </html>

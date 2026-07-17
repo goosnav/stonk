@@ -20,6 +20,45 @@ import pandas as pd
 from .store import Store
 
 STOOQ_URL = "https://stooq.com/q/d/l/?s={sym}&i=d"
+CBOE_HISTORY = {
+    "^VIX9D": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv",
+    "^VIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+    "^VIX3M": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+    "^VIX6M": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX6M_History.csv",
+    "^VVIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv",
+}
+
+
+def fetch_cboe_history(symbol: str) -> list[dict]:
+    """Official Cboe daily history for volatility indices."""
+    url = CBOE_HISTORY.get(symbol)
+    if not url:
+        return []
+    response = httpx.get(url, timeout=30, headers={"User-Agent": "stonk-terminal/0.1"})
+    response.raise_for_status()
+    df = pd.read_csv(io.StringIO(response.text))
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    date_col = "DATE" if "DATE" in df else df.columns[0]
+    close_col = "CLOSE" if "CLOSE" in df else symbol.lstrip("^")
+    if close_col not in df:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        close = pd.to_numeric(row.get(close_col), errors="coerce")
+        if pd.isna(close):
+            continue
+        d = pd.to_datetime(row[date_col], errors="coerce")
+        if pd.isna(d):
+            continue
+        out.append({"d": d.strftime("%Y-%m-%d"),
+                    "open": float(pd.to_numeric(row.get("OPEN"), errors="coerce"))
+                    if pd.notna(pd.to_numeric(row.get("OPEN"), errors="coerce")) else float(close),
+                    "high": float(pd.to_numeric(row.get("HIGH"), errors="coerce"))
+                    if pd.notna(pd.to_numeric(row.get("HIGH"), errors="coerce")) else float(close),
+                    "low": float(pd.to_numeric(row.get("LOW"), errors="coerce"))
+                    if pd.notna(pd.to_numeric(row.get("LOW"), errors="coerce")) else float(close),
+                    "close": float(close), "volume": 0.0})
+    return out
 
 
 def _stooq_symbol(symbol: str) -> str | None:
@@ -46,7 +85,10 @@ def fetch_stooq(symbol: str) -> list[dict]:
 
 def fetch_yfinance(symbol: str, period: str = "max") -> list[dict]:
     import yfinance as yf
-    df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
+    # Yahoo spells listed share classes BRK-B/AGM-A while official catalogs
+    # and brokers use BRK.B/AGM.A.
+    yahoo_symbol = symbol if symbol.startswith("^") else symbol.replace(".", "-")
+    df = yf.Ticker(yahoo_symbol).history(period=period, interval="1d", auto_adjust=True)
     if df.empty:
         return []
     out = []
@@ -69,7 +111,11 @@ def refresh(store: Store, symbols: list[str], full: bool = False,
     for sym in symbols:
         try:
             latest = store.latest_bar_date(sym)
-            if latest and not full and latest >= (date.today() - timedelta(days=30)).isoformat():
+            if sym in CBOE_HISTORY:
+                rows, source = fetch_cboe_history(sym), "cboe"
+                if not rows:
+                    rows, source = fetch_yfinance(sym, period="1mo"), "yfinance"
+            elif latest and not full and latest >= (date.today() - timedelta(days=30)).isoformat():
                 rows = fetch_yfinance(sym, period="1mo")
                 source = "yfinance"
             else:
@@ -90,17 +136,27 @@ class MarketContext:
     """As-of view over stored bars. All pipeline reads go through here."""
 
     def __init__(self, store: Store, cfg, as_of: str | None = None,
-                 offline: bool = False):
+                 offline: bool = False, historical: bool = False,
+                 symbols: list[str] | None = None):
         self.store = store
         self.cfg = cfg
         self.as_of = as_of or date.today().isoformat()
         # offline=True (backtests): nodes must serve external data (earnings,
         # fundamentals) from kv caches only — never fetch mid-simulation
         self.offline = offline
+        # Historical replay additionally enforces source-availability time.
+        # Cache-only live discovery is offline but is not a replay.
+        self.historical = historical
+        # Explicit cycle-local universe (Sprint E1): callers pass the symbols
+        # they mean instead of mutating cfg.data — shared config stays
+        # immutable during execution, so state cannot leak between cycles.
+        self._symbols = list(symbols) if symbols is not None else None
         self._cache: dict[str, pd.DataFrame] = {}
 
     @property
     def universe(self) -> list[str]:
+        if self._symbols is not None:
+            return list(self._symbols)
         return list(self.cfg.get("universe", "symbols", default=[]))
 
     def df(self, symbol: str, lookback: int = 400) -> pd.DataFrame:
@@ -154,6 +210,25 @@ class MarketContext:
 
     def vix(self) -> float | None:
         return self.close(self.cfg.get("universe", "vix_symbol", default="^VIX"))
+
+    def volatility_context(self) -> dict:
+        symbols = self.cfg.get("universe", "volatility_symbols", default={}) or {}
+        values = {name: self.close(symbol) for name, symbol in symbols.items()}
+        spot, short, m3, m6 = (values.get("vix"), values.get("vix9d"),
+                               values.get("vix3m"), values.get("vix6m"))
+        values["slope_9d_3m"] = ((short / m3 - 1) if short and m3 else None)
+        values["slope_1m_3m"] = ((spot / m3 - 1) if spot and m3 else None)
+        values["slope_3m_6m"] = ((m3 / m6 - 1) if m3 and m6 else None)
+        vix_closes = self.closes(symbols.get("vix", "^VIX"), 10)
+        values["vix_change_5d"] = (float(vix_closes.iloc[-1] / vix_closes.iloc[-6] - 1)
+                                    if len(vix_closes) >= 6 else None)
+        bench = self.closes(self.cfg.get("universe", "benchmark", default="SPY"), 30)
+        realized = float(bench.pct_change().dropna().tail(21).std() * (252 ** .5) * 100) \
+            if len(bench) >= 22 else None
+        values["realized_vol_21d"] = realized
+        values["implied_realized_spread"] = spot - realized \
+            if spot is not None and realized is not None else None
+        return values
 
     def breadth_above_sma(self, n: int = 50) -> float | None:
         """Fraction of universe trading above its n-day SMA (regime input)."""

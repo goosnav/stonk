@@ -9,6 +9,8 @@ degrades to connected=false + the error string (fail loudly, not silently).
 from __future__ import annotations
 
 import re
+import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,8 @@ ET = ZoneInfo("America/New_York")
 # and dotted/slashed hostnames+paths (segments stay short) survive.
 # Applied to broker detail, last_error, and rollup alerts.
 _SECRETISH = [
+    re.compile(r"(?i)\bauthorization\s*[:=]\s*bearer\s+[^\s\"']+"),
+    re.compile(r"(?i)\bbearer\s+[^\s\"']+"),
     re.compile(r"(?i)(?:token|key|secret|bearer|authorization|password)"
                r"[\"'=:\s]+[^\s\"']{6,}"),
     re.compile(r"\d{7,}"),
@@ -95,14 +99,14 @@ def write_heartbeat(store: Store, cycle_id: str, mode: str, source: str) -> None
                                "cycle_id": cycle_id, "mode": mode, "source": source})
 
 
-def _broker_health(cfg, store: Store) -> dict:
+def _broker_health(cfg, store: Store, force: bool = False) -> dict:
     """Cheap cached connectivity probe. Paper = honest 'simulation' label."""
     adapter = cfg.get("broker", default="paper")
     if adapter == "paper":
         return {"adapter": "paper", "connected": True,
                 "detail": "SIMULATION — not real money", "as_of": _now_iso()}
     cached = store.kv_get("broker_health")
-    if cached and cached.get("adapter") == adapter and \
+    if not force and cached and cached.get("adapter") == adapter and \
             _age_s(cached.get("as_of")) < BROKER_PROBE_TTL_S:
         return cached
     out = {"adapter": adapter, "as_of": _now_iso()}
@@ -123,14 +127,16 @@ def _broker_health(cfg, store: Store) -> dict:
     return out
 
 
-def _market_clock() -> dict:
-    now = datetime.now(ET)
-    if now.weekday() >= 5:
-        return {"open": False, "session": "weekend", "et": now.strftime("%H:%M ET")}
-    hm = now.strftime("%H:%M")
-    open_ = "09:30" <= hm < "16:00"
-    # ponytail: US market holidays not modeled; worst case = one no-fill scan day
-    return {"open": open_, "session": "regular" if open_ else "closed",
+def _market_clock(now: datetime | None = None) -> dict:
+    now = (now or datetime.now(ET)).astimezone(ET)
+    import pandas as pd
+    import exchange_calendars as xcals
+    cal = xcals.get_calendar("XNYS")
+    minute = pd.Timestamp(now).tz_convert("UTC").floor("min")
+    open_ = bool(cal.is_open_on_minute(minute, ignore_breaks=True))
+    session = ("weekend" if now.weekday() >= 5 else
+               "closed" if cal.is_session(pd.Timestamp(now.date())) else "holiday")
+    return {"open": open_, "session": "regular" if open_ else session,
             "et": now.strftime("%H:%M ET")}
 
 
@@ -154,6 +160,65 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
               "heartbeat_stale_s": heartbeat_stale_s,
               "scheduler_alive": scheduler_alive,
               "next_runs": next_runs or {}}
+    research = store.kv_get("research_state") or {"phase": "never_ran"}
+    active_research_job = store.db.execute(
+        "SELECT id,kind,status,state,progress,requested_at,started_at,updated_at,"
+        "heartbeat_at,lease_expires_at,wait_reason FROM research_jobs "
+        "WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,"
+        "priority DESC,requested_at LIMIT 1").fetchone()
+    if active_research_job:
+        import json as _job_json
+        active_research_job = dict(active_research_job)
+        active_research_job["progress"] = _job_json.loads(
+            active_research_job["progress"] or "{}")
+    research_phase = research.get("phase")
+    research_age = _age_s(research.get("at"))
+    training_lease = store.kv_get("research_worker_lease:training") or {}
+    training_lease_valid = float(training_lease.get("expires_at", 0) or 0) > time.time()
+    if training_lease_valid:
+        try:
+            os.kill(int(str(training_lease.get("owner", "0")).split(":", 1)[0]), 0)
+        except (ValueError, ProcessLookupError, PermissionError):
+            training_lease_valid = False
+    if scheduler_alive is False:
+        operational_state = "offline"
+        operational_detail = "scheduler is not running"
+    elif market["open"] and (hb_age is None or hb_age > heartbeat_stale_s):
+        operational_state = "stale"
+        operational_detail = "market is open but the trading loop is stale"
+    elif market["open"]:
+        operational_state = "trading"
+        operational_detail = "autonomous trading loop is active"
+    elif active_research_job and active_research_job.get("status") == "running":
+        operational_state = "researching"
+        operational_detail = f"{active_research_job['kind']} is running"
+    elif research_phase not in ("idle", "waiting", "caught_up", "never_ran", "error") \
+            and research_age < 20 * 60 and training_lease_valid:
+        operational_state = "researching"
+        operational_detail = research.get("detail") or "closed-market research is running"
+    else:
+        operational_state = "closed_idle"
+        operational_detail = "scheduler is armed; market is closed"
+    engine.update(operational_state=operational_state,
+                  operational_detail=operational_detail,
+                  research_state=research,
+                  active_research_job=active_research_job)
+    autonomous_active = (research_phase not in
+                         (None, "idle", "waiting", "caught_up", "never_ran", "error")
+                         and research_age < 20 * 60 and training_lease_valid)
+    if active_research_job and active_research_job.get("status") == "running":
+        research_worker_state = "running"
+    elif autonomous_active:
+        research_worker_state = "running"
+    elif active_research_job:
+        research_worker_state = ("waiting" if active_research_job.get("wait_reason")
+                                 else "queued")
+    elif research_phase == "error":
+        research_worker_state = "failed"
+    elif research_age >= 20 * 60 and research_phase not in (None, "caught_up", "never_ran"):
+        research_worker_state = "stale"
+    else:
+        research_worker_state = "idle"
 
     bench = cfg.get("universe", "benchmark", default="SPY")
     newest = store.latest_bar_date(bench)
@@ -164,6 +229,11 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
 
     from .risk import Governor
     switches = Governor(cfg, store).active_switches()
+    # Research and the trading engine perform checkpoint hash/schema checks.
+    # Health consumes the resulting persistence state without reloading every
+    # Torch artifact on each dashboard poll.
+    from .graph import activation_state
+    model_state = activation_state(cfg, store, refresh_checkpoints=False)
 
     # --- the contract: reasons is NEVER empty when trading=false ---
     reasons: list[str] = []
@@ -177,6 +247,8 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
             reasons.append(f"live gate closed: {why}")
     if switches:
         reasons.append(f"kill switch active: {', '.join(sorted(switches))}")
+    model_state = {**model_state, "production_evidence": True,
+                   "production_evidence_version": "evidence.v2"}
     if not market["open"]:
         reasons.append(f"market {market['session']} ({market['et']}) — orders queue for open")
     if hb_age is None:
@@ -219,6 +291,12 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
         "SELECT ts, event_type, payload FROM audit WHERE event_type IN "
         "('scheduler_error','broker_probe_failed') "
         "ORDER BY id DESC LIMIT 1").fetchone()
+    # A newer successful live probe resolves a prior broker incident. Keeping
+    # the old failure red after connectivity is restored makes operators retry
+    # Connect and was one trigger for the OAuth-tab storm.
+    if err and err["event_type"] == "broker_probe_failed" and broker.get("connected") and \
+            broker.get("as_of") and _age_s(broker["as_of"]) <= _age_s(err["ts"]):
+        err = None
     last_error = None
     if err:
         p = _json.loads(err["payload"] or "{}")
@@ -229,6 +307,24 @@ def system_health(cfg, store: Store, next_runs: dict | None = None,
                       "detail": _redact(str(detail)[:200])}
 
     out = {"mode": mode, "broker": broker, "engine": engine, "market": market,
+           "operational_state": operational_state,
+           "trading_loop": {
+               "state": operational_state if market["open"] else "closed",
+               "detail": operational_detail,
+               "last_scan_at": engine["last_scan_at"],
+               "scheduler_alive": scheduler_alive,
+           },
+           "research_worker": {
+               # Trading and research are intentionally independent lanes.  A
+               # market-safe operator job can be running while the trading
+               # loop remains the top-level operational state, so do not
+               # derive this label from operational_state.
+               "state": research_worker_state,
+               "detail": research.get("detail") or operational_detail,
+               "phase": research.get("phase"),
+               "active_job": active_research_job,
+           },
+           "model": model_state,
            "data": data, "kill_switches": sorted(switches),
            "broker_block": block_detail, "last_error": last_error,
            "pending_approvals": len(store.pending_approvals()),

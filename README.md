@@ -28,8 +28,10 @@ Data → Signal nodes → Regime gate → Ensemble (+error bars) → Portfolio
   everything opened in one scan cycle is capped (default 10% of equity, hard $
   ceiling, scaled down by regime stress to zero).
 - **Self-improvement is statistics, not vibes**: closed trades update per-node
-  scorecards; weight multipliers move within [0.3×, 2×] with Bayesian shrinkage;
-  chronically negative nodes auto-disable; promotions need a human.
+  scorecards; weight multipliers move within visible status-specific floors
+  and a configured ceiling with Bayesian shrinkage;
+  chronically weak nodes are automatically deemphasized to a nonzero floor;
+  only the human toggle can disable an analysis, and promotions need a human.
 - **Every projection ships with error bars** bootstrapped from measured trades
   (backtest → paper → live), labeled with a confidence basis.
 - **Bounded instruments only**: long equities/ETFs and long calls/puts (max
@@ -84,14 +86,54 @@ Use the TUI when the terminal itself is the control room:
 
 It shows trading readiness, broker and heartbeat health, account value and
 buying power, P&L, positions, working orders, the active engine phase, recent
-candidate verdicts, kill-switch recovery times, and current AI commentary.
+candidate verdicts, kill-switch recovery times, active Strategy AI mandate,
+intelligence provider/job progress, learned-model gate, and current commentary.
 `Ctrl-C` stops a daemon started by that TUI; attaching to an existing server
 leaves it running.
+
+Useful headless intelligence controls:
+
+```bash
+.venv/bin/stonk --mode live ai doctor --json
+.venv/bin/stonk --mode live ai test --json
+.venv/bin/stonk --mode live strategy analyze "favor durable cash generation"
+.venv/bin/stonk --mode live strategy status
+.venv/bin/stonk --mode live intelligence --status
+```
+
+Operator direction is inert until Strategy AI synthesizes a mandate and the
+operator activates that mandate. It is never interpreted as an order.
 
 `stonk serve` is quiet by default. Use `serve --verbose` only when HTTP request
 diagnostics are useful. The complete structured audit remains available in
 `logs/audit-live.jsonl` or `logs/audit-paper.jsonl`; process diagnostics go to
 `logs/runtime-live.log` when launched by the macOS app or restart script.
+
+### Runtime isolation and recovery
+
+The web service does not execute research or PyTorch training in its request
+process. Autonomous research, discovery, deep research, news intelligence, and
+holding training run as one-shot child workers with durable SQLite leases. The
+parent publishes their phase and progress to the GUI/TUI, recovers abandoned
+leases after a restart, and terminates a worker process group if it exceeds its
+declared time budget. A service shutdown also terminates children it started.
+
+Neural dataset materialization is capped at 12,000 training windows per run and
+checks cancellation/deadline state while building the dataset. Exhausting a
+budget produces a visible waiting or timed-out state; it does not make an
+incompatible checkpoint live. Operator jobs remain subject to the same model
+trial, AI budget, evidence, cash, and governor gates as autonomous work.
+
+For a read-only health check before trading:
+
+```bash
+.venv/bin/stonk --mode live tui --once --no-color
+curl -fsS http://127.0.0.1:8420/api/health
+```
+
+If the preferred port is occupied, `serve` chooses a configured fallback and
+publishes it; the TUI attaches to that published service rather than starting a
+second scheduler.
 
 ## Going live (Robinhood)
 

@@ -122,3 +122,36 @@ def from_positions(store, ctx, account, horizon_days: int = 20) -> MonteCarloInp
         volatilities=[float(df[s].std()) for s in syms],
         correlation_matrix=df.corr().values.tolist(),
         position_weights=weights, horizon_days=horizon_days)
+
+
+def block_bootstrap(starting_equity: float, returns, weights: list[float],
+                    horizon_days: int = 21, n_paths: int = 10_000,
+                    block_days: int = 5, seed: int = 7,
+                    transaction_costs: float = .0016) -> MonteCarloOutput:
+    """Same-date block bootstrap preserving cross-symbol correlation."""
+    arr = np.asarray(returns, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != len(w) or len(arr) < block_days + 1:
+        raise ValueError("returns must be date×symbol and align with weights")
+    rng = np.random.default_rng(seed)
+    blocks = int(np.ceil(horizon_days / block_days))
+    starts = rng.integers(0, len(arr) - block_days + 1, size=(n_paths, blocks))
+    sampled = np.empty((n_paths, blocks * block_days, arr.shape[1]))
+    for p in range(n_paths):
+        sampled[p] = np.concatenate([arr[s:s + block_days] for s in starts[p]], axis=0)
+    daily = sampled[:, :horizon_days] @ w
+    daily -= transaction_costs * w.sum() / max(1, horizon_days)
+    equity = np.empty((n_paths, horizon_days + 1)); equity[:, 0] = starting_equity
+    for t in range(horizon_days): equity[:, t + 1] = equity[:, t] * (1 + daily[:, t])
+    terminal = equity[:, -1]
+    peaks = np.maximum.accumulate(equity, axis=1)
+    max_dd = ((peaks - equity) / peaks).max(axis=1)
+    pct = lambda q: float(np.percentile(terminal, q))  # noqa: E731
+    path = lambda q: np.percentile(equity, q, axis=0).round(2).tolist()  # noqa: E731
+    return MonteCarloOutput(
+        round(float(terminal.mean()), 2), round(pct(50), 2), round(pct(5), 2),
+        round(pct(25), 2), round(pct(75), 2), round(pct(95), 2),
+        round(float((terminal < starting_equity).mean()), 3),
+        round(float((max_dd > .05).mean()), 3),
+        round(float((max_dd > .10).mean()), 3), round(float(max_dd.mean()), 4),
+        {"p5": path(5), "p50": path(50), "p95": path(95)})

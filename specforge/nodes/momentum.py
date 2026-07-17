@@ -61,7 +61,7 @@ class Node(SignalNode):
             vol = (ctx.atr_pct(sym) or 0.02) * math.sqrt(self.horizon_days)
             events.append(SignalEvent(
                 symbol=sym, direction="long" if score > 0 else "avoid",
-                score=round(score, 4), confidence=round(agree, 3),
+                score=round(abs(score), 4), confidence=round(agree, 3),
                 horizon_days=self.horizon_days,
                 expected_return=round(score * vol * 0.5, 5),
                 expected_volatility=round(vol, 5),

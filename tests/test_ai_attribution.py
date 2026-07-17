@@ -1,8 +1,21 @@
 """AI budget/parse discipline + attribution weight-update bounds. Offline."""
 from __future__ import annotations
 
+import json
+
 from specforge.ai import AIClient, _parse_json_block
-from specforge.attribution import update_weights
+from specforge.attribution import node_scorecard, update_weights
+
+
+def _entry_candidate(store, node: str, signed: float, index: str) -> str:
+    candidate_id = f"cand-{node}-{index}"
+    payload = {"evidence_details": [{"node": node, "state": "running",
+                                     "signed_alpha": signed}]}
+    store.db.execute("INSERT INTO candidates VALUES(?,?,?,?,?,?)",
+                     (candidate_id, "cycle", "2026-01-01", "AAA", signed,
+                      json.dumps(payload)))
+    store.db.commit()
+    return candidate_id
 
 
 def test_parse_json_block_strictness():
@@ -98,32 +111,51 @@ def test_news_ai_work_is_bounded_per_cycle(cfg, store, monkeypatch):
     assert "capped at 2" in node.degraded_reason
 
 
-def test_weight_update_bounds_and_auto_disable(cfg, store):
-    # winner node: 25 solid trades → multiplier rises but clamps at max 2.0
-    for i in range(25):
+def test_weight_update_bounds_and_human_only_disable(cfg, store):
+    # winner node: enough solid trades → multiplier rises but clamps at max
+    for i in range(60):
         store.record_trade({"symbol": "AAA", "entry_date": "2026-01-01",
                             "exit_date": "2026-02-01", "entry_price": 100,
                             "exit_price": 104, "qty": 1, "pnl": 4, "ret": 0.04,
                             "nodes": ["momentum"], "source": "paper",
-                            "regime": "risk_on", "score_bucket": "s2"})
+                            "regime": "risk_on", "score_bucket": "s2",
+                            "entry_candidate_id": _entry_candidate(
+                                store, "momentum", .4, f"win-{i}")})
     res = update_weights(cfg, store, log=lambda *a: None)
     mult = store.get_weight_multiplier("momentum")
     assert 1.0 < mult <= 2.0
     assert res["momentum"]["action"] == "updated"
 
-    # loser node: 35 bad trades → auto-disabled via config override
+    # A losing node is deemphasized to its non-zero floor.  Automation must
+    # never write the human-owned enabled toggle.
     cfg.data["nodes"]["reversal"] = {"enabled": True, "weight": 0.1}
-    for i in range(35):
+    for i in range(60):
         store.record_trade({"symbol": "BBB", "entry_date": "2026-01-01",
                             "exit_date": "2026-02-01", "entry_price": 100,
                             "exit_price": 97, "qty": 1, "pnl": -3, "ret": -0.03,
                             "nodes": ["reversal"], "source": "paper",
-                            "regime": "risk_on", "score_bucket": "s1"})
+                            "regime": "risk_on", "score_bucket": "s1",
+                            "entry_candidate_id": _entry_candidate(
+                                store, "reversal", .4, f"loss-{i}")})
     res = update_weights(cfg, store, log=lambda *a: None)
-    assert "AUTO-DISABLED" in res["reversal"]["action"]
-    ov = store.kv_get("config_overrides")
-    assert ov["nodes"]["reversal"]["enabled"] is False
-    assert store.get_weight_multiplier("reversal") == 0.3   # clamped at min
+    assert res["reversal"]["action"] == "deemphasized"
+    ov = store.kv_get("config_overrides", {}) or {}
+    assert "enabled" not in ov.get("nodes", {}).get("reversal", {})
+    assert store.get_weight_multiplier("reversal") == 0.25
+
+
+def test_avoid_evidence_is_rewarded_for_correctly_opposing_a_loss(store):
+    candidate_id = _entry_candidate(store, "business_fundamentals", -.8, "avoid")
+    store.record_trade({"symbol": "CAT", "entry_date": "2026-01-01",
+                        "exit_date": "2026-02-01", "entry_price": 100,
+                        "exit_price": 92, "qty": 1, "pnl": -8, "ret": -.08,
+                        "nodes": ["business_fundamentals"], "source": "paper",
+                        "regime": "risk_on", "score_bucket": "s1",
+                        "entry_candidate_id": candidate_id})
+    card = node_scorecard(store, "business_fundamentals")
+    assert card["n"] == 1
+    assert card["expectancy"] == .064
+    assert card["attribution_basis"] == "signed_entry_contribution_only"
 
 def test_regime_conditioned_multipliers(cfg, store):
     # 30 risk_on winners + 30 risk_off losers on one node: the regime cells
@@ -136,7 +168,10 @@ def test_regime_conditioned_multipliers(cfg, store):
                                 "exit_price": px, "qty": 1, "pnl": ret * 100,
                                 "ret": ret + (i % 3) * 0.001,  # non-zero variance
                                 "nodes": ["momentum"], "source": "paper",
-                                "regime": regime, "score_bucket": "s2"})
+                                "regime": regime, "score_bucket": "s2",
+                                "entry_candidate_id": _entry_candidate(
+                                    store, "momentum", .4,
+                                    f"{regime}-{i}")})
     update_weights(cfg, store, log=lambda *a: None)
     rm = store.kv_get("regime_multipliers")["momentum"]
     assert rm["risk_on"] > 1.0 and rm["risk_off"] < 1.0
