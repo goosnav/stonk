@@ -984,3 +984,196 @@ def test_inference_runs_once_per_cycle_engine_reads_stash(cfg, monkeypatch):
     assert node.last_forecast_as_of == ctx.as_of      # stash bound to this cycle
     engine_src = pathlib.Path("specforge/engine.py").read_text()
     assert "predict_today" not in engine_src          # engine reads only the stash
+
+
+# ── Sprint D: explicit lifecycle + finalist promotion ─────────────────────────
+
+import json as _json
+
+from specforge.ml import lifecycle as ml_lifecycle
+
+
+def _passing_metrics(score=1.0, **over):
+    folds = [{"ic_5d": .02, "ic_21d": .03, "net_alpha_5d": .01,
+              "net_alpha_21d": .01} for _ in range(5)]
+    h = {"correlation": .03, "top_decile_alpha_after_cost": .01, "coverage": .8}
+    out = {"beats_baselines": True, "folds": folds,
+           "median_fold_ic_5d": .02, "median_fold_ic_21d": .03,
+           "5": dict(h), "21": dict(h), "validation_selection_score": score,
+           "evaluation_split": "sealed_test"}
+    out.update(over)
+    return out
+
+
+def _insert_run(store, rid, state, score=1.0, created_at="2026-07-01T00:00:00",
+                symbol=None, incompat=None, metrics=None):
+    store.db.execute(
+        "INSERT INTO model_runs(id,kind,symbol,created_at,data_as_of,status,"
+        "parent_id,metrics,checkpoint,feature_hash,schema_version,"
+        "architecture_hash,checkpoint_sha256,incompatibility_reason,"
+        "lifecycle_state,permitted_blend) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rid, "global_tcn", symbol, created_at, "2026-07-01",
+         ml_lifecycle.project_status(state), None,
+         _json.dumps(metrics if metrics is not None else _passing_metrics(score)),
+         f"ckpt-{rid}.pt", neural.FEATURE_HASH, neural.MODEL_SCHEMA,
+         neural.ARCHITECTURE_HASH, "sha", incompat, state, 0.0))
+    store.db.commit()
+
+
+@pytest.fixture()
+def promo(monkeypatch):
+    """maybe_promote without checkpoint-file compatibility churn."""
+    monkeypatch.setattr(neural, "refresh_compatibility", lambda s: {})
+    monkeypatch.setattr(neural, "_load_checked",
+                        lambda path, sha=None: ({}, None, None))
+
+
+def test_newer_weak_finalist_cannot_hide_older_qualified(cfg, store, promo):
+    _insert_run(store, "old-good", "sealed_candidate", score=2.0,
+                created_at="2026-07-01T00:00:00")
+    _insert_run(store, "new-weak", "sealed_candidate", score=9.0,
+                created_at="2026-07-10T00:00:00",
+                metrics=_passing_metrics(9.0, beats_baselines=False))
+    out = neural.maybe_promote(cfg, store)
+    assert out["action"] == "experimental_live" and out["id"] == "old-good"
+    weak = store.db.execute("SELECT lifecycle_state FROM model_runs WHERE id='new-weak'").fetchone()
+    assert weak["lifecycle_state"] == "sealed_candidate"   # untouched
+
+
+def test_validation_only_global_cannot_become_champion(cfg, store, promo):
+    _insert_run(store, "val-only", "validation_candidate", score=9.0)
+    out = neural.maybe_promote(cfg, store)
+    assert out["action"] == "none"
+    assert store.db.execute("SELECT COUNT(*) n FROM model_runs WHERE "
+                            "lifecycle_state='champion'").fetchone()["n"] == 0
+
+
+def test_validation_only_holding_cannot_promote(cfg, store, promo):
+    _insert_run(store, "hold-1", "validation_candidate", symbol="AAA")
+    with pytest.raises(ValueError, match="out-of-sample"):
+        neural.promote(cfg, store, "hold-1")
+    row = store.db.execute("SELECT lifecycle_state FROM model_runs WHERE id='hold-1'").fetchone()
+    assert row["lifecycle_state"] == "validation_candidate"
+
+
+def test_incompatible_finalist_excluded(cfg, store, promo):
+    _insert_run(store, "better-incompat", "sealed_candidate", score=9.0,
+                incompat="architecture mismatch")
+    _insert_run(store, "ok", "sealed_candidate", score=1.0)
+    out = neural.maybe_promote(cfg, store)
+    assert out["id"] == "ok"
+
+
+def test_deterministic_tie_breaking():
+    a = {"id": "a", "created_at": "2026-07-01", "metrics": _json.dumps({"validation_selection_score": 1.0})}
+    b = {"id": "b", "created_at": "2026-07-05", "metrics": _json.dumps({"validation_selection_score": 1.0})}
+    c = {"id": "c", "created_at": "2026-07-05", "metrics": _json.dumps({"validation_selection_score": 1.0})}
+    ranked = sorted([c, b, a], key=ml_lifecycle.rank_key)
+    assert [r["id"] for r in ranked] == ["a", "b", "c"]    # date asc, then id asc
+    assert ranked == sorted([b, a, c], key=ml_lifecycle.rank_key)   # stable/deterministic
+
+
+def test_transition_history_is_persisted(cfg, store, promo):
+    _insert_run(store, "hist-1", "sealed_candidate", score=1.0)
+    neural.maybe_promote(cfg, store)
+    hist = ml_lifecycle.history(store, "hist-1")
+    assert len(hist) == 1
+    t = hist[0]
+    assert t["prior_state"] == "sealed_candidate"
+    assert t["new_state"] == "experimental_live"
+    assert "offline gates" in t["reason"]
+    assert _json.loads(t["evidence"])["rank"] == 1
+    assert t["permitted_blend"] == pytest.approx(0.15)
+    assert t["architecture_hash"] == neural.ARCHITECTURE_HASH and t["at"]
+
+
+def test_champion_swap_is_atomic_and_retires_after_activation(cfg, store, promo):
+    _insert_run(store, "champ-old", "champion")
+    _insert_run(store, "cand-new", "production_candidate", score=2.0,
+                created_at="2026-07-05T00:00:00")
+    neural.promote(cfg, store, "cand-new", reason="test swap")
+    states = {r["id"]: r["lifecycle_state"] for r in
+              store.db.execute("SELECT id,lifecycle_state FROM model_runs")}
+    assert states["cand-new"] == "champion" and states["champ-old"] == "retired"
+    assert store.db.execute("SELECT COUNT(*) n FROM model_runs WHERE "
+                            "lifecycle_state='champion'").fetchone()["n"] == 1
+
+
+def test_failed_activation_leaves_prior_champion_intact(cfg, store, monkeypatch):
+    monkeypatch.setattr(neural, "refresh_compatibility", lambda s: {})
+    monkeypatch.setattr(neural, "_load_checked",
+                        lambda path, sha=None: (None, None, "corrupt checkpoint"))
+    _insert_run(store, "champ-old", "champion")
+    _insert_run(store, "cand-bad", "production_candidate", score=2.0)
+    with pytest.raises(ValueError, match="incompatible checkpoint"):
+        neural.promote(cfg, store, "cand-bad")
+    states = {r["id"]: r["lifecycle_state"] for r in
+              store.db.execute("SELECT id,lifecycle_state FROM model_runs")}
+    assert states["champ-old"] == "champion" and states["cand-bad"] == "production_candidate"
+
+
+def test_concurrent_promotions_yield_exactly_one_champion(cfg, store, promo):
+    _insert_run(store, "f1", "production_candidate", score=1.0)
+    _insert_run(store, "f2", "production_candidate", score=2.0)
+    neural.promote(cfg, store, "f1")
+    neural.promote(cfg, store, "f2")           # racing/second attempt
+    champs = store.db.execute("SELECT id FROM model_runs WHERE "
+                              "lifecycle_state='champion'").fetchall()
+    assert [r["id"] for r in champs] == ["f2"]
+
+
+def _graph_metrics(temporal_id, utility=0.1):
+    folds = [{"ic_5d": .02, "ic_21d": .03, "net_alpha_5d": .01,
+              "net_alpha_21d": .01} for _ in range(5)]
+    coverage = {n["id"]: 1.0 for n in graph.default_topology()["nodes"]}
+    return {"temporal_model_id": temporal_id, "folds": folds,
+            "median_fold_ic_5d": .02, "median_fold_ic_21d": .03,
+            "coverage_5d": .8, "coverage_21d": .8,
+            "sample_coverage": coverage, "portfolio_utility": utility,
+            "oos_sharpe": 1.0, "utility_evidence": "ok"}
+
+
+def test_graph_tcn_dependency_mismatch_blocks_activation(cfg, store, promo):
+    _insert_run(store, "tcnA", "champion")
+    vid = graph.save_version(store, graph.default_topology(),
+                             metrics=_graph_metrics("tcnB"))
+    out = graph.maybe_promote(cfg, store)
+    assert out["action"] == "shadow"
+    row = store.db.execute("SELECT lifecycle_state FROM graph_versions WHERE id=?",
+                           (vid,)).fetchone()
+    assert row["lifecycle_state"] == "validation_candidate"   # not activated
+
+
+def test_graph_offline_pass_earns_experimental_live_not_champion(cfg, store, promo):
+    _insert_run(store, "tcnA", "champion")
+    vid = graph.save_version(store, graph.default_topology(),
+                             metrics=_graph_metrics("tcnA"))
+    out = graph.maybe_promote(cfg, store)
+    assert out["action"] == "experimental_live" and out["id"] == vid
+    row = store.db.execute("SELECT lifecycle_state,status FROM graph_versions "
+                           "WHERE id=?", (vid,)).fetchone()
+    assert row["lifecycle_state"] == "experimental_live"
+    assert row["status"] == "challenger"       # projection: still NOT champion
+    assert store.db.execute("SELECT COUNT(*) n FROM graph_versions WHERE "
+                            "lifecycle_state='champion'").fetchone()["n"] == 0
+
+
+def test_lifecycle_reads_do_not_mutate(cfg, store, promo):
+    _insert_run(store, "r1", "sealed_candidate", score=1.0)
+    _insert_run(store, "r2", "experimental_live", score=2.0)
+    before = [tuple(r) for r in store.db.execute(
+        "SELECT id,lifecycle_state,status,permitted_blend FROM model_runs ORDER BY id")]
+    ml_lifecycle.finalists(store, "model_runs", kind="global_tcn")
+    ml_lifecycle.history(store, "r1")
+    for row in ml_lifecycle.finalists(store, "model_runs", kind="global_tcn"):
+        ml_lifecycle.rank_key(row)
+    after = [tuple(r) for r in store.db.execute(
+        "SELECT id,lifecycle_state,status,permitted_blend FROM model_runs ORDER BY id")]
+    assert before == after
+
+
+def test_experimental_live_serves_at_permitted_blend_cap(cfg, store):
+    from specforge.ml.policy import effective_blend
+    assert effective_blend(cfg, 0.0, True, permitted=0.10)[0] == pytest.approx(0.10)
+    assert effective_blend(cfg, 0.0, True, permitted=0.0)[0] == 0.0   # fail closed
+    assert effective_blend(cfg, 0.0, True, permitted=None)[0] == pytest.approx(0.15)

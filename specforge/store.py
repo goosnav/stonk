@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS graph_versions(          -- immutable champion/challe
   id TEXT PRIMARY KEY, created_at TEXT, data_as_of TEXT, status TEXT,
   parent_id TEXT, topology TEXT, metrics TEXT, checkpoint TEXT
 );
+CREATE TABLE IF NOT EXISTS model_transitions(       -- lifecycle audit (Sprint D)
+  id TEXT PRIMARY KEY, model_id TEXT NOT NULL, model_table TEXT NOT NULL,
+  prior_state TEXT, new_state TEXT NOT NULL, reason TEXT NOT NULL,
+  evidence TEXT, permitted_blend REAL, parent_id TEXT,
+  architecture_hash TEXT, feature_hash TEXT, target_schema_hash TEXT,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transitions_model ON model_transitions(model_id, at);
 CREATE TABLE IF NOT EXISTS model_runs(              -- global + holding TCNs
   id TEXT PRIMARY KEY, kind TEXT, symbol TEXT, created_at TEXT, data_as_of TEXT,
   status TEXT, parent_id TEXT, metrics TEXT, checkpoint TEXT, feature_hash TEXT,
@@ -282,12 +290,40 @@ class Store:
                 ("schema_version", "INTEGER DEFAULT 1"),
                 ("architecture_hash", "TEXT"),
                 ("checkpoint_sha256", "TEXT"),
-                ("incompatibility_reason", "TEXT")):
+                ("incompatibility_reason", "TEXT"),
+                ("lifecycle_state", "TEXT"),           # authoritative (Sprint D)
+                ("permitted_blend", "REAL DEFAULT 0")):
             try:
                 self.db.execute(f"ALTER TABLE model_runs ADD COLUMN {column} {declaration}")
                 self.db.commit()
             except sqlite3.OperationalError:
                 pass
+        for column, declaration in (("lifecycle_state", "TEXT"),
+                                    ("temporal_model_id", "TEXT")):
+            try:
+                self.db.execute(f"ALTER TABLE graph_versions ADD COLUMN {column} {declaration}")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass
+        # Backfill lifecycle for rows created before Sprint D. Additive only:
+        # historical records are classified, never rewritten or deleted. The
+        # legacy `status` column remains as a compatibility projection.
+        self.db.execute(
+            "UPDATE model_runs SET lifecycle_state = CASE status "
+            "WHEN 'champion' THEN 'champion' WHEN 'retired' THEN 'retired' "
+            "WHEN 'incompatible' THEN 'incompatible' ELSE CASE WHEN "
+            "json_extract(metrics,'$.evaluation_split')='sealed_test' "
+            "THEN 'sealed_candidate' ELSE 'validation_candidate' END END "
+            "WHERE lifecycle_state IS NULL")
+        self.db.execute(
+            "UPDATE graph_versions SET lifecycle_state = CASE status "
+            "WHEN 'champion' THEN 'champion' WHEN 'retired' THEN 'retired' "
+            "ELSE 'validation_candidate' END WHERE lifecycle_state IS NULL")
+        self.db.execute(
+            "UPDATE graph_versions SET temporal_model_id = "
+            "json_extract(metrics,'$.temporal_model_id') "
+            "WHERE temporal_model_id IS NULL")
+        self.db.commit()
         for column, declaration in (
                 ("qualified", "INTEGER DEFAULT 1"),
                 ("evidence_version", "TEXT DEFAULT 'legacy'"),

@@ -181,27 +181,42 @@ def save_version(store, topology: dict, status: str = "challenger",
                  data_as_of: str | None = None, checkpoint: str = "") -> str:
     validate(topology)
     vid = new_id()
-    store.db.execute("INSERT INTO graph_versions VALUES(?,?,?,?,?,?,?,?)", (
+    lifecycle = {"challenger": "validation_candidate", "champion": "champion",
+                 "retired": "retired"}.get(status, "validation_candidate")
+    store.db.execute(
+        "INSERT INTO graph_versions(id,created_at,data_as_of,status,parent_id,"
+        "topology,metrics,checkpoint,lifecycle_state,temporal_model_id) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)", (
         vid, datetime.now().astimezone().isoformat(timespec="seconds"), data_as_of,
-        status, parent_id, json.dumps(topology), json.dumps(metrics or {}), checkpoint))
+        status, parent_id, json.dumps(topology), json.dumps(metrics or {}), checkpoint,
+        lifecycle, (metrics or {}).get("temporal_model_id")))
     store.db.commit()
     store.audit("graph_version_saved", {"id": vid, "status": status,
+                                         "lifecycle_state": lifecycle,
                                          "parent": parent_id, "metrics": metrics or {}})
     return vid
 
 
-def promote(store, version_id: str) -> None:
-    """Atomic champion swap. A failed transaction leaves the old champion."""
+def promote(store, version_id: str, *, reason: str = "promotion gates passed") -> None:
+    """Atomic champion swap: activation is validated first, the previous
+    champion retires in the same transaction that activates the successor."""
+    from .ml import lifecycle as ml_lifecycle
+    row = store.db.execute("SELECT * FROM graph_versions WHERE id=?",
+                           (version_id,)).fetchone()
+    if not row:
+        raise ValueError("unknown graph version")
+    json.loads(row["topology"])                # activation check before the swap
+    prior = store.db.execute(
+        "SELECT id FROM graph_versions WHERE lifecycle_state='champion' AND id<>?",
+        (version_id,)).fetchall()
     with store.db:
-        row = store.db.execute("SELECT id FROM graph_versions WHERE id=?",
-                               (version_id,)).fetchone()
-        if not row:
-            raise ValueError("unknown graph version")
-        store.db.execute("UPDATE graph_versions SET status='retired' "
-                         "WHERE status='champion'")
-        store.db.execute("UPDATE graph_versions SET status='champion' WHERE id=?",
-                         (version_id,))
-    store.audit("graph_champion_promoted", {"id": version_id})
+        ml_lifecycle.transition(store, "graph_versions", version_id, "champion",
+                                reason=reason, in_tx=True)
+        for old in prior:
+            ml_lifecycle.transition(store, "graph_versions", old["id"], "retired",
+                                    reason=f"superseded by {version_id}", in_tx=True)
+    store.audit("graph_champion_promoted", {"id": version_id, "reason": reason,
+                                            "retired": [o["id"] for o in prior]})
 
 
 def mutate(topology: dict, seed: int = 0) -> dict:
@@ -710,29 +725,17 @@ def blend_candidates(candidates, events, regime: str, cfg, store,
                          None, None, "analog_graph"))
 
 
-def maybe_promote(cfg, store) -> dict:
-    """Forward-shadow gate for topology challengers; single-split graphs stay shadow."""
-    row = store.db.execute("SELECT * FROM graph_versions WHERE status='challenger' "
-                           "ORDER BY created_at DESC LIMIT 1").fetchone()
-    if not row:
-        return {"action": "none"}
-    from .neural import shadow_metrics
-    sm, metrics = shadow_metrics(store, row["id"]), json.loads(row["metrics"] or "{}")
-    tcn = store.db.execute(
-        "SELECT id FROM model_runs WHERE kind='global_tcn' AND status='champion' "
-        "AND incompatibility_reason IS NULL ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()
-    temporal_compatible = bool(tcn and metrics.get("temporal_model_id") == tcn["id"])
-    hs = sm["horizons"]
+def _graph_offline_gate(cfg, metrics: dict, current_metrics: dict) -> bool:
+    """Offline eligibility for ONE graph version against persisted metrics."""
     folds = metrics.get("folds") or []
     fold_gate = len(folds) >= 5 and \
         sum(f.get("ic_5d", 0) > 0 for f in folds) >= 4 and \
         sum(f.get("ic_21d", 0) > 0 for f in folds) >= 4 and \
-        min(f.get("ic_5d", -1) for f in folds) > -.01 and \
-        min(f.get("ic_21d", -1) for f in folds) > -.01 and \
+        min((f.get("ic_5d", -1) for f in folds), default=-1) > -.01 and \
+        min((f.get("ic_21d", -1) for f in folds), default=-1) > -.01 and \
         metrics.get("median_fold_ic_5d", 0) >= .015 and \
         metrics.get("median_fold_ic_21d", 0) >= .02
-    offline_passed = fold_gate and all(
+    horizon_gate = all(
         .75 <= metrics.get(f"coverage_{h}d", 0) <= .85 and
         sum(f.get(f"net_alpha_{h}d", -1) > 0 for f in folds) >= 4
         for h in (5, 21))
@@ -744,29 +747,66 @@ def maybe_promote(cfg, store) -> dict:
                   cfg.get("nodes", n["id"], "enabled", default=False)))]
     coverage_passed = all(coverage.get(node, 0) >= (.9 if node == "macro_regime" else .01)
                           for node in required)
-    current_row = store.db.execute(
-        "SELECT metrics FROM graph_versions WHERE status='champion' AND id<>? "
-        "ORDER BY created_at DESC LIMIT 1", (row["id"],)).fetchone()
-    current_metrics = json.loads(current_row["metrics"] or "{}") if current_row else {}
     utility_passed = metrics.get("portfolio_utility", -1) > 0 and \
         metrics.get("portfolio_utility", -1) >= current_metrics.get("portfolio_utility", -1) and \
         metrics.get("oos_sharpe", -99) >= current_metrics.get("oos_sharpe", -99)
-    offline_passed = (offline_passed and coverage_passed and temporal_compatible and
-                      utility_passed)
-    passed = offline_passed and sm["sessions"] >= 30 and all(
+    return fold_gate and horizon_gate and coverage_passed and utility_passed
+
+
+def maybe_promote(cfg, store) -> dict:
+    """Lifecycle promotion over ALL eligible graph finalists (Sprint D).
+
+    A graph can only activate against the exact TCN it was trained with, with
+    complete metrics and sufficient (fail-closed) cohort utility evidence.
+    Offline validity earns experimental_live — recorded, still zero live blend
+    (activation_state keys on champion); the champion swap requires forward
+    shadow evidence. The old promote_stage1 direct-championship is gone.
+    """
+    from .ml import lifecycle as ml_lifecycle
+    from .neural import active_global_run, shadow_metrics
+    rows = ml_lifecycle.finalists(
+        store, "graph_versions",
+        states=("validation_candidate",) + ml_lifecycle.FINALIST_STATES)
+    if not rows:
+        return {"action": "none"}
+    active_tcn = active_global_run(store)
+    current_row = store.db.execute(
+        "SELECT metrics FROM graph_versions WHERE lifecycle_state='champion' "
+        "ORDER BY created_at DESC LIMIT 1").fetchone()
+    current_metrics = json.loads(current_row["metrics"] or "{}") if current_row else {}
+    eligible = []
+    for r in rows:
+        metrics = json.loads(r["metrics"] or "{}")
+        if not active_tcn or metrics.get("temporal_model_id") != active_tcn["id"]:
+            continue                    # TCN dependency mismatch blocks activation
+        if metrics.get("utility_evidence") != "ok":
+            continue                    # insufficient cohort evidence fails closed
+        if not _graph_offline_gate(cfg, metrics, current_metrics):
+            continue
+        eligible.append(r)
+    if not eligible:
+        return {"action": "shadow", "candidates": [r["id"] for r in rows]}
+    eligible.sort(key=lambda r: ml_lifecycle.rank_key(r, primary="portfolio_utility"))
+    top = eligible[0]
+    if top["lifecycle_state"] == "validation_candidate":
+        ml_lifecycle.transition(
+            store, "graph_versions", top["id"], "experimental_live",
+            reason="offline gates passed against active TCN "
+                   f"{active_tcn['id']}; awaiting forward shadow evidence",
+            evidence={"rank": 1, "eligible": len(eligible)})
+        store.kv_set("graph_offline_gate", {"passed": True, "id": top["id"],
+                                             "at": datetime.now().astimezone().isoformat()})
+        return {"action": "experimental_live", "id": top["id"]}
+    sm = shadow_metrics(store, top["id"])
+    hs = sm["horizons"]
+    forward = sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0
         for h in (5, 21))
-    current = store.db.execute("SELECT 1 FROM graph_versions WHERE status='champion'").fetchone()
-    if offline_passed and not current:
-        promote(store, row["id"])
-        store.kv_set("graph_offline_gate", {"passed": True, "id": row["id"],
-                                             "at": datetime.now().astimezone().isoformat()})
-        return {"action": "promote_stage1", "id": row["id"], "metrics": metrics}
-    if passed:
-        promote(store, row["id"])
-        return {"action": "promote", "id": row["id"], "metrics": sm}
-    return {"action": "shadow", "id": row["id"], "metrics": sm}
+    if forward:
+        promote(store, top["id"], reason="forward shadow gates passed")
+        return {"action": "promote", "id": top["id"], "metrics": sm}
+    return {"action": "shadow", "id": top["id"], "metrics": sm}
 
 
 def activation_state(cfg, store, refresh_checkpoints: bool = True) -> dict:

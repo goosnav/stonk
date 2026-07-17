@@ -19,6 +19,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import pandas as pd
 
+from .ml import lifecycle as ml_lifecycle
 from .ml import targets as ml_targets
 
 
@@ -1212,6 +1213,14 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         parent_row["id"] if parent_row else tournament_winner_id, json.dumps(metrics), str(path),
         FEATURE_HASH, MODEL_SCHEMA, ARCHITECTURE_HASH, sha, None))
     store.db.commit()
+    ml_lifecycle.transition(
+        store, "model_runs", rid,
+        "sealed_candidate" if metrics.get("evaluation_split") == "sealed_test"
+        else "validation_candidate",
+        reason=f"trained; evaluated on {metrics.get('evaluation_split', 'validation')}",
+        evidence={"validation_selection_score": metrics.get("validation_selection_score"),
+                  "evaluation_split": metrics.get("evaluation_split")},
+        parent_id=parent_row["id"] if parent_row else tournament_winner_id)
     if oos_predictions:
         with store.db:
             store.db.executemany(
@@ -1232,9 +1241,14 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     store.audit("neural_challenger_trained", status)
     if symbol and parent_row and parent_row["status"] == "champion" and \
             holding_gate_passed(metrics):
-        promote(cfg, store, rid)
-        status["status"] = "champion"
-        status["promoted"] = True
+        # Sprint D: validation-only evidence can NEVER auto-promote a holding
+        # model. It stays validation_candidate until genuine out-of-sample
+        # shadow history at both horizons exists (enforced inside promote()).
+        status["validation_gate_passed"] = True
+        store.audit("holding_promotion_blocked", {
+            "id": rid, "symbol": symbol,
+            "reason": "validation-only evidence; holding promotion requires "
+                      "out-of-sample shadow observations at both horizons"})
     return status
 
 
@@ -1301,20 +1315,43 @@ def holding_gate_passed(metrics: dict) -> bool:
         return False
 
 
-def promote(cfg, store, run_id: str) -> None:
+def holding_forward_gate(store, run_id: str, min_observations: int = 200) -> bool:
+    """Holding models may promote only on genuine out-of-sample evidence:
+    resolved forward-shadow observations at BOTH horizons with positive IC."""
+    sm = shadow_metrics(store, run_id)
+    hs = sm["horizons"]
+    return all(hs.get(str(h), {}).get("n", 0) >= min_observations and
+               hs[str(h)].get("ic", 0) > 0 for h in (5, 21))
+
+
+def promote(cfg, store, run_id: str, *, reason: str = "promotion gates passed",
+            evidence: dict | None = None) -> None:
+    """Atomic champion swap. Activation (checkpoint load) is verified BEFORE
+    the transaction; the previous champion is retired in the same transaction
+    that activates the new one, so a failure leaves it fully intact."""
     row = store.db.execute("SELECT * FROM model_runs WHERE id=?", (run_id,)).fetchone()
     if not row:
         raise ValueError("unknown model run")
-    payload, _, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
+    if row["symbol"] and not holding_forward_gate(store, run_id):
+        raise ValueError("holding model lacks out-of-sample shadow evidence "
+                         "at both horizons; validation-only results cannot promote")
+    payload, _, load_reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
     if payload is None:
-        raise ValueError(f"incompatible checkpoint: {reason}")
+        raise ValueError(f"incompatible checkpoint: {load_reason}")
     symbol = row["symbol"]
+    prior = store.db.execute(
+        "SELECT id FROM model_runs WHERE kind=? AND COALESCE(symbol,'')=COALESCE(?,'') "
+        "AND lifecycle_state='champion' AND id<>?",
+        (row["kind"], symbol, run_id)).fetchall()
     with store.db:
-        store.db.execute("UPDATE model_runs SET status='retired' WHERE kind=? AND "
-                         "COALESCE(symbol,'')=COALESCE(?,'') AND status='champion'",
-                         (row["kind"], symbol))
-        store.db.execute("UPDATE model_runs SET status='champion' WHERE id=?", (run_id,))
-    store.audit("neural_champion_promoted", {"id": run_id, "symbol": symbol})
+        ml_lifecycle.transition(store, "model_runs", run_id, "champion",
+                                reason=reason, evidence=evidence, in_tx=True)
+        for old in prior:            # retire ONLY after the successor is active
+            ml_lifecycle.transition(store, "model_runs", old["id"], "retired",
+                                    reason=f"superseded by {run_id}", in_tx=True)
+    store.audit("neural_champion_promoted", {"id": run_id, "symbol": symbol,
+                                             "reason": reason,
+                                             "retired": [o["id"] for o in prior]})
 
 
 def _latest_window(cfg, store, ctx, symbol: str, payload: dict) -> np.ndarray | None:
@@ -1399,8 +1436,13 @@ def refresh_compatibility(store) -> dict:
             reason = "architecture mismatch"
         incompatible = reason is not None
         status = "incompatible" if incompatible else row["status"]
-        store.db.execute("UPDATE model_runs SET status=?,incompatibility_reason=? WHERE id=?",
-                         (status, reason, row["id"]))
+        keys = row.keys()
+        lifecycle = ("incompatible" if incompatible else
+                     (row["lifecycle_state"] if "lifecycle_state" in keys else None))
+        store.db.execute(
+            "UPDATE model_runs SET status=?,incompatibility_reason=?,"
+            "lifecycle_state=COALESCE(?,lifecycle_state) WHERE id=?",
+            (status, reason, lifecycle, row["id"]))
         out["incompatible" if incompatible else "compatible"] += 1
     store.db.commit()
     return out
@@ -1443,9 +1485,30 @@ def _structured_calibrated(model, x, payload, torch):
 
 
 def _forecast_meta(row, payload) -> dict:
+    keys = row.keys()
+    state = row["lifecycle_state"] if "lifecycle_state" in keys else None
+    # A full champion serves under the config's whole blend range; ramp states
+    # are capped by the blend persisted at their lifecycle transition.
+    permitted = (None if state == "champion" else
+                 float(row["permitted_blend"] or 0.0)
+                 if "permitted_blend" in keys else None)
     return {"model_id": row["id"], "feature_hash": payload.get("feature_hash"),
             "target_schema_hash": payload.get("target_schema_hash"),
-            "dataset_manifest_id": payload.get("dataset_manifest_id")}
+            "dataset_manifest_id": payload.get("dataset_manifest_id"),
+            "lifecycle_state": state, "permitted_blend": permitted}
+
+
+def active_global_run(store):
+    """The global model currently allowed to serve live inference, or None.
+    Serving priority (Sprint D): champion > production_candidate >
+    experimental_live. Validation-only rows never serve."""
+    return store.db.execute(
+        "SELECT * FROM model_runs WHERE kind='global_tcn' AND symbol IS NULL "
+        "AND incompatibility_reason IS NULL AND lifecycle_state IN "
+        "('champion','production_candidate','experimental_live') "
+        "ORDER BY CASE lifecycle_state WHEN 'champion' THEN 0 "
+        "WHEN 'production_candidate' THEN 1 ELSE 2 END, created_at DESC LIMIT 1"
+    ).fetchone()
 
 
 def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
@@ -1453,8 +1516,9 @@ def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
         import torch
     except ImportError:
         return {}, {"silent": "torch not installed"}
-    row = store.db.execute("SELECT * FROM model_runs WHERE kind='global_tcn' "
-                           "AND status='champion' ORDER BY created_at DESC LIMIT 1").fetchone()
+    # An experimental_live model serves at its BOUNDED permitted blend (the
+    # influence ramp); a full champion serves under the whole config range.
+    row = active_global_run(store)
     if not row:
         return {}, {"silent": "no validated global TCN champion"}
     payload, model, reason = _load_checked(Path(row["checkpoint"]), row["checkpoint_sha256"])
@@ -1588,9 +1652,12 @@ def maybe_promote(cfg, store) -> dict:
         integrity_failed = not _offline_gate(champion_metrics)
         if stale or decay or integrity_failed:
             retired_id = champion_row["id"]
+            rollback_reason = ("stale" if stale else
+                               "forward decay" if decay else "offline gate failed")
             with store.db:
-                store.db.execute("UPDATE model_runs SET status='retired' WHERE id=?",
-                                 (retired_id,))
+                ml_lifecycle.transition(store, "model_runs", retired_id, "retired",
+                                        reason=f"champion rollback: {rollback_reason}",
+                                        evidence={"shadow": hs}, in_tx=True)
                 predecessor = None
                 for candidate in store.db.execute(
                         "SELECT * FROM model_runs WHERE kind='global_tcn' AND status='retired' "
@@ -1605,18 +1672,24 @@ def maybe_promote(cfg, store) -> dict:
                         break
                 restored_graph = None
                 if predecessor:
-                    store.db.execute("UPDATE model_runs SET status='champion' WHERE id=?",
-                                     (predecessor["id"],))
+                    ml_lifecycle.transition(store, "model_runs", predecessor["id"],
+                                            "champion",
+                                            reason=f"restored after rollback of {retired_id}",
+                                            in_tx=True)
                     for graph_row in store.db.execute(
                             "SELECT * FROM graph_versions WHERE status='retired' "
                             "ORDER BY created_at DESC").fetchall():
                         graph_metrics = json.loads(graph_row["metrics"] or "{}")
                         if graph_metrics.get("temporal_model_id") == predecessor["id"]:
-                            store.db.execute(
-                                "UPDATE graph_versions SET status='retired' WHERE status='champion'")
-                            store.db.execute(
-                                "UPDATE graph_versions SET status='champion' WHERE id=?",
-                                (graph_row["id"],))
+                            for old_graph in store.db.execute(
+                                    "SELECT id FROM graph_versions WHERE "
+                                    "lifecycle_state='champion'").fetchall():
+                                ml_lifecycle.transition(
+                                    store, "graph_versions", old_graph["id"], "retired",
+                                    reason="TCN dependency rolled back", in_tx=True)
+                            ml_lifecycle.transition(
+                                store, "graph_versions", graph_row["id"], "champion",
+                                reason=f"restored with TCN {predecessor['id']}", in_tx=True)
                             restored_graph = graph_row["id"]
                             break
             store.audit("neural_champion_rolled_back", {"id": retired_id,
@@ -1630,28 +1703,45 @@ def maybe_promote(cfg, store) -> dict:
                     "restored": predecessor["id"] if predecessor else None,
                     "restored_graph": restored_graph,
                     "offline_gate_failed": integrity_failed, "metrics": sm}
-    row = store.db.execute("SELECT * FROM model_runs WHERE kind='global_tcn' "
-                           "AND status='challenger' ORDER BY created_at DESC LIMIT 1").fetchone()
-    if not row:
-        return {"action": "none"}
-    test = json.loads(row["metrics"] or "{}")
-    sm = shadow_metrics(store, row["id"]); hs = sm["horizons"]
-    folds = test.get("folds") or []
-    fold_gate = len(folds) >= 5 and all(
-        sum(f.get(f"ic_{h}d", 0) > 0 for f in folds) >= 4 and
-        min(f.get(f"ic_{h}d", -1) for f in folds) > -.01 and
-        test.get(f"median_fold_ic_{h}d", 0) >= (.015 if h == 5 else .02)
-        for h in (5, 21))
-    offline_passed = _offline_gate(test)
-    if offline_passed and not champion_row:
-        promote(cfg, store, row["id"])
-        store.kv_set("tcn_offline_gate", {"passed": True, "id": row["id"], "at": _now()})
-        return {"action": "promote_stage1", "id": row["id"], "metrics": test}
-    passed = offline_passed and sm["sessions"] >= 30 and all(
+    # ---- finalist evaluation (Sprint D): ALL eligible models compete, ranked
+    # deterministically on persisted metrics — a newer weak model can never
+    # conceal an older qualified finalist. Validation-only rows are not
+    # finalists; incompatible/missing-checkpoint rows are filtered upstream.
+    rows = [r for r in ml_lifecycle.finalists(store, "model_runs", kind="global_tcn")
+            if not r["symbol"]]
+    eligible = [r for r in rows if _offline_gate(json.loads(r["metrics"] or "{}"))]
+    if not eligible:
+        return ({"action": "none"} if not rows else
+                {"action": "shadow", "candidates": [r["id"] for r in rows]})
+    eligible.sort(key=ml_lifecycle.rank_key)
+    top = eligible[0]
+    state = top["lifecycle_state"]
+    blend = float(cfg.get("neural", "experimental_blend", default=0.15))
+    if state == "sealed_candidate":
+        # Offline validity earns a BOUNDED experimental-live blend — never a
+        # silent full championship (the old promote_stage1 hole is closed).
+        ml_lifecycle.transition(
+            store, "model_runs", top["id"], "experimental_live",
+            reason="offline gates passed on sealed evaluation",
+            evidence={"rank": 1, "eligible": len(eligible)},
+            permitted_blend=blend)
+        store.kv_set("tcn_offline_gate", {"passed": True, "id": top["id"], "at": _now()})
+        return {"action": "experimental_live", "id": top["id"],
+                "permitted_blend": blend}
+    sm = shadow_metrics(store, top["id"]); hs = sm["horizons"]
+    forward = sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0 and
         .75 <= hs[str(h)].get("coverage", 0) <= .85 for h in (5, 21))
-    if passed:
-        promote(cfg, store, row["id"])
-        return {"action": "promote", "id": row["id"], "metrics": sm}
-    return {"action": "shadow", "id": row["id"], "metrics": sm}
+    if not forward:
+        return {"action": "shadow", "id": top["id"], "metrics": sm}
+    if state == "experimental_live":
+        ml_lifecycle.transition(
+            store, "model_runs", top["id"], "production_candidate",
+            reason="forward shadow gates passed",
+            evidence={"sessions": sm["sessions"], "horizons": hs},
+            permitted_blend=blend)
+        return {"action": "production_candidate", "id": top["id"], "metrics": sm}
+    promote(cfg, store, top["id"], reason="forward gates re-confirmed as "
+            "production_candidate", evidence={"sessions": sm["sessions"]})
+    return {"action": "promote", "id": top["id"], "metrics": sm}

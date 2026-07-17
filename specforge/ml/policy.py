@@ -49,10 +49,13 @@ def _valid_forecast(nf, expected_as_of: str, expected_model_id: str) -> bool:
             and nf.feature_schema_hash == neural.FEATURE_HASH)
 
 
-def effective_blend(cfg, graph_blend: float, forecasts_available: bool) -> tuple[float, str]:
+def effective_blend(cfg, graph_blend: float, forecasts_available: bool,
+                    permitted: float | None = None) -> tuple[float, str]:
     """(blend, reason). Bounded by [min_blend, max_blend]; a configured value
     below the floor means OFF (never silently raised), above the cap is clamped
-    down (never silently increased past max_blend)."""
+    down (never silently increased past max_blend). `permitted` is the serving
+    model's lifecycle-granted ceiling (None for a full champion): a ramp-state
+    model can never exceed the blend recorded at its lifecycle transition."""
     if not forecasts_available:
         return 0.0, "model unavailable/stale/invalid — deterministic fallback"
     if graph_blend > 0:
@@ -64,7 +67,13 @@ def effective_blend(cfg, graph_blend: float, forecasts_available: bool) -> tuple
         return 0.0, "blend disabled by config"
     if b < lo:
         return 0.0, f"configured blend {b} below min_blend {lo} — treated as off"
-    return min(b, hi), "active"
+    b = min(b, hi)
+    if permitted is not None:
+        if permitted <= 0:
+            return 0.0, "serving model has no permitted lifecycle blend"
+        if permitted < b:
+            return permitted, f"capped at lifecycle permitted blend {permitted}"
+    return b, "active"
 
 
 def apply_neural_blend(candidates, forecasts, cfg, store, cycle_id,
@@ -79,7 +88,8 @@ def apply_neural_blend(candidates, forecasts, cfg, store, cycle_id,
     """
     cost = ml_targets.round_trip_cost(cfg)
     expected_model = str((meta or {}).get("model_id") or "")
-    blend, reason = effective_blend(cfg, graph_blend, bool(forecasts))
+    blend, reason = effective_blend(cfg, graph_blend, bool(forecasts),
+                                    permitted=(meta or {}).get("permitted_blend"))
     scored = rejected = 0
     for c in candidates:
         hs = (forecasts or {}).get(c.symbol) or {}
