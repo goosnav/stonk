@@ -191,3 +191,42 @@ headroom · one dedicated slot beyond the deterministic batch but inside the
 global position cap · governor retains full authority (resizes or
 hard-rejects a probe like any order) · neural failure ⇒ no probe, no blend,
 deterministic behaviour, exits unaffected.
+
+---
+
+# Sprint D addendum (2026-07-16) — explicit model lifecycle
+
+Commit: **`ec13199`** — 297 tests pass (284 → 297). Software validation only;
+no predictive claim.
+
+## Lifecycle state machine (authoritative field: `lifecycle_state`)
+```
+training ──▶ validation_candidate ──▶ validation_winner ──▶ sealed_candidate
+                                                                  │ offline gates
+                                                                  ▼
+                     champion ◀── production_candidate ◀── experimental_live
+                        │           ▲ forward shadow        (BOUNDED permitted
+                        │           │ gates re-confirmed     blend, persisted)
+                        ▼           │
+                     retired    rejected / incompatible (terminal side states)
+```
+Legacy `status` is now only a projection (champion/incompatible/retired map
+through; everything else reads 'challenger') so existing queries/APIs work.
+
+Key properties, each with a test:
+- promotion evaluates ALL eligible finalists, ranked deterministically
+  (metric desc → created_at asc → id): a newer weak model cannot hide an
+  older qualified one;
+- validation-only rows are never finalists; holding models additionally need
+  out-of-sample shadow observations at BOTH horizons (the validation-only
+  auto-promotion is removed);
+- champion swaps validate activation first and retire the predecessor in the
+  same transaction — a failed activation leaves it intact; concurrent
+  attempts converge to exactly one champion;
+- every transition persists prior/new state, reason, evidence, permitted
+  blend, parent, and hashes in `model_transitions`;
+- the old `promote_stage1` holes are closed for BOTH the TCN and the graph:
+  offline validity now earns `experimental_live` (bounded blend for the TCN,
+  zero live blend for the graph) — full championship requires forward shadow
+  evidence; a graph activates only against the exact TCN it was trained with,
+  with fail-closed cohort utility evidence.
