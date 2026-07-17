@@ -151,3 +151,43 @@ LOCAL COMMITS ............... 8 stage commits, none pushed
 WHAT REMAINS UNPROVEN ....... neural predictive edge; survivorship; holding adapters
 STAGE C READINESS ........... ready — bounded graph-independent blend + probe next
 ```
+
+---
+
+# Stage C addendum (2026-07-16) — direct blend + exploration probe
+
+**This section documents SOFTWARE validation only. Nothing here is evidence of
+predictive performance.** The model has no schema-6 champion yet; measured
+edge, calibration quality, and incremental-vs-deterministic results remain
+entirely unproven until shadow forecasts mature and the Stage F policy
+comparison runs.
+
+## Commits
+| Commit | Sprint | Tests |
+|--------|--------|------:|
+| `d017e00` | C1 direct bounded neural blend (graph-independent) | 270 |
+| `39ddd7b` | C2 exploration probe + C1 cached-forecast audit fixes | 284 |
+
+## C1 audit outcome (fixed in `39ddd7b`)
+The C1 stash had three real defects, all confirmed and closed:
+1. not cleared on entry — an offline cycle or a raised exception preserved the
+   previous cycle's forecasts → now cleared before anything can raise, and
+   stamped with the cycle `as_of`;
+2. no cycle identity — engine now discards a stash whose `as_of` stamp
+   mismatches, and `policy._valid_forecast` re-validates every forecast
+   (typed, current `as_of`, reported model id, current feature schema) —
+   stale/foreign/malformed forecasts are inert and counted in the audit;
+3. inference count unproven — now asserted: offline/replay cycles run ZERO
+   live inference; online cycles exactly one (engine consumes only the stash;
+   it has no `predict_today` call site).
+
+## Probe limits (all enforced, all tested)
+one probe max (durable `positions.entry_mode`, additive migration) · vetted
+candidates only, never fabricated from a forecast · not held / not normally
+selected · absolute edge after 0.16% round-trip cost ≥ 0.75% · P(abs edge)
+≥ 0.57 · abs q90−q10 ≤ 0.15 · size = normal position × 0.25, applied exactly
+once in `portfolio.construct()` · capped by 20% of equity and remaining cash
+headroom · one dedicated slot beyond the deterministic batch but inside the
+global position cap · governor retains full authority (resizes or
+hard-rejects a probe like any order) · neural failure ⇒ no probe, no blend,
+deterministic behaviour, exits unaffected.
