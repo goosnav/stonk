@@ -1458,3 +1458,55 @@ def test_repriced_values_persist_on_order_row(cfg, store):
                            (intent.id,)).fetchone()
     assert row["limit_price"] == pytest.approx(ex._limit_price(fresh, "buy"))
     assert row["qty"] * row["limit_price"] == pytest.approx(row["notional"], rel=1e-3)
+
+
+# ── Sprint F: policy comparison under identical conditions ───────────────────
+
+def test_policy_overrides_set_expected_knobs(cfg):
+    from specforge.backtest import _policy_cfg
+    det = _policy_cfg(cfg, "deterministic")
+    assert det.get("neural", "experimental_blend") == 0.0
+    assert det.get("neural", "exploration", "enabled") is False
+    only = _policy_cfg(cfg, "neural_only")
+    assert only.get("neural", "experimental_blend") == 1.0
+    assert only.get("neural", "max_blend") == 1.0
+    blend = _policy_cfg(cfg, "fixed_blend")
+    assert blend.get("neural", "experimental_blend") == pytest.approx(0.15)
+    with pytest.raises(ValueError, match="unknown policy"):
+        _policy_cfg(cfg, "yolo")
+
+
+def test_incremental_math_vs_deterministic():
+    from specforge.backtest import _incremental
+    base = {"overall": {"cagr": 0.10, "sharpe": 1.0, "max_drawdown": 0.20},
+            "turnover_multiple": 2.0, "n_trades": 50}
+    other = {"overall": {"cagr": 0.12, "sharpe": 0.9, "max_drawdown": 0.25},
+             "turnover_multiple": 3.5, "n_trades": 80}
+    inc = _incremental(base, other)
+    assert inc["delta_cagr"] == pytest.approx(0.02)
+    assert inc["delta_sharpe"] == pytest.approx(-0.1)
+    assert inc["delta_max_drawdown"] == pytest.approx(0.05)
+    assert inc["delta_turnover_multiple"] == pytest.approx(1.5)
+
+
+def test_compare_policies_identical_conditions_isolated_books(cfg, store, tmp_path):
+    from specforge.backtest import compare_policies
+    _long_history(store)                       # ~700 sessions of synthetic bars
+    out = compare_policies(cfg, years=1, scale="research",
+                           policies=("deterministic", "fixed_blend"),
+                           log=lambda *a: None, out_dir=tmp_path)
+    det = out["policies"]["deterministic"]
+    blend = out["policies"]["fixed_blend"]
+    # identical window: same sessions, same source bars → like-for-like
+    assert det["window"] == blend["window"] == out["window"]
+    assert det["costs_included"] and blend["costs_included"]
+    # isolated books: one DB per policy, both real files
+    assert (tmp_path / "backtest_policy_deterministic_research.db").exists()
+    assert (tmp_path / "backtest_policy_fixed_blend_research.db").exists()
+    # incremental block computed against the deterministic baseline
+    assert "fixed_blend" in out["incremental_vs_deterministic"]
+    # HONESTY CHECK (documented, not hidden): with no champion checkpoint the
+    # blend has no forecasts to consume, so today the policies coincide.
+    assert det["overall"] == blend["overall"]
+    # comparison artifact persisted
+    assert (tmp_path / "policy_comparison_research.json").exists()

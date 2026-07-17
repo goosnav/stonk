@@ -46,11 +46,12 @@ def _seed_backtest_db(src_path: str, bt_path: Path) -> Store:
 
 
 def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "research",
-                 copy_analogs_to: Store | None = None, log=print) -> dict:
+                 copy_analogs_to: Store | None = None, log=print,
+                 out_dir: Path | None = None) -> dict:
     src_db = cfg.get("db_path", default="data/specforge.db")
     if scale not in ("live", "research"):
         raise ValueError("scale must be live or research")
-    bt_path = Path(f"data/backtest_{tag}_{scale}.db")
+    bt_path = (Path(out_dir) if out_dir else Path("data")) / f"backtest_{tag}_{scale}.db"
     bt = _seed_backtest_db(src_db, bt_path)
 
     # backtest config: the caller's merged config (so `--mode aggressive
@@ -97,8 +98,9 @@ def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "resea
 
     report = _report(bt, bt_cfg, dates, years, tag)
     report.update(scale=scale, starting_cash=starting_cash)
-    out_dir = Path("dev/reports"); out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"backtest_{tag}_{scale}.json").write_text(
+    reports_dir = Path(out_dir) if out_dir else Path("dev/reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / f"backtest_{tag}_{scale}.json").write_text(
         json.dumps(report, indent=2, default=str))
 
     # push earnings/fundamentals kv caches back to the main DB so the next
@@ -109,6 +111,83 @@ def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "resea
         n = _copy_analogs(bt_path, copy_analogs_to)
         report["analogs_copied_to_live_db"] = n
     return report
+
+
+# ── policy comparison (Sprint F) ─────────────────────────────────────────────
+# The question the neural experiment must answer is INCREMENTAL: does adding
+# the model improve the SAME system under the SAME opportunity set, execution
+# model, and capital constraints? Each policy runs the identical same-engine
+# backtest (same source bars → same session list, same governor, same costs)
+# in its own isolated DB; only the neural scoring knobs differ.
+POLICY_OVERRIDES: dict[str, dict] = {
+    # pure deterministic ensemble: blend off, probe sleeve off
+    "deterministic": {"neural": {"experimental_blend": 0.0,
+                                 "exploration": {"enabled": False}}},
+    # the production Stage-C configuration exactly as configured
+    "fixed_blend": {},
+    # candidate ranking handed entirely to the model (diagnostic upper bound)
+    "neural_only": {"neural": {"experimental_blend": 1.0, "min_blend": 0.0,
+                               "max_blend": 1.0}},
+}
+
+
+def _policy_cfg(cfg, policy: str):
+    from .config import Config, _deep_merge
+    if policy not in POLICY_OVERRIDES:
+        raise ValueError(f"unknown policy {policy!r}; choose from "
+                         f"{sorted(POLICY_OVERRIDES)}")
+    return Config(_deep_merge(cfg.data, POLICY_OVERRIDES[policy]))
+
+
+def _incremental(base: dict, other: dict) -> dict:
+    """Per-metric deltas vs the deterministic baseline (positive = better,
+    except drawdown/turnover where sign is reported raw)."""
+    b, o = base.get("overall") or {}, other.get("overall") or {}
+    out = {}
+    for key in ("total_return", "cagr", "sharpe", "sortino", "max_drawdown"):
+        if key in b and key in o:
+            out[f"delta_{key}"] = round(o[key] - b[key], 4)
+    for key in ("turnover_multiple", "average_exposure", "n_trades"):
+        if base.get(key) is not None and other.get(key) is not None:
+            out[f"delta_{key}"] = round(other[key] - base[key], 4)
+    return out
+
+
+def compare_policies(cfg, years: int = 3, scale: str = "research",
+                     policies: tuple = ("deterministic", "fixed_blend",
+                                        "neural_only"),
+                     log=print, out_dir: Path | None = None) -> dict:
+    """Run the SAME backtest window under each scoring policy and report each
+    policy's results plus its increment over the deterministic baseline.
+
+    Honesty note: with no valid champion checkpoint, offline cycles produce no
+    neural forecasts, so every policy degenerates to the deterministic result
+    (the framework proves the comparison is fair, not that the model helps —
+    that evidence must come from a real champion + replayable OOS forecasts).
+    """
+    results: dict[str, dict] = {}
+    for name in policies:
+        log(f"policy backtest: {name}")
+        results[name] = run_backtest(_policy_cfg(cfg, name), years=years,
+                                     tag=f"policy_{name}", scale=scale,
+                                     log=log, out_dir=out_dir)
+    windows = {tuple(r.get("window") or ()) for r in results.values()}
+    if len(windows) > 1:
+        raise RuntimeError(f"policy windows diverged: {windows} — comparison "
+                           "would not be like-for-like")
+    base = results.get("deterministic")
+    comparison = {name: _incremental(base, r) for name, r in results.items()
+                  if base is not None and name != "deterministic"}
+    out = {"window": (results.get("deterministic") or {}).get("window"),
+           "scale": scale, "policies": results,
+           "incremental_vs_deterministic": comparison,
+           "identical_conditions": {"sessions": True, "costs": True,
+                                    "governor": True, "isolated_dbs": True}}
+    reports_dir = Path(out_dir) if out_dir else Path("dev/reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / f"policy_comparison_{scale}.json").write_text(
+        json.dumps(out, indent=2, default=str))
+    return out
 
 
 def _sync_caches_back(bt: Store, src_db: str) -> None:
