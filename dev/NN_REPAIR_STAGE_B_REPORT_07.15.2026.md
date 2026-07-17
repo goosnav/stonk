@@ -248,3 +248,22 @@ Commit: **`ebc7772`** — 305 tests pass (297 → 305). Software validation only
   MarketContext / blend_candidates; research discovery + shadow inference use
   the same mechanism. The hypothesis-watchlist test now asserts immutability
   instead of demanding the old leak.
+
+---
+
+# Sprint E2 addendum (2026-07-17) — approval repricing + scoped exceptions
+
+Commit: **`3b7c624`** — 319 tests pass (305 → 319). Software validation only.
+
+- Approved intents are repriced at placement: fresh quote → 3% drift gate
+  (expire back to operator) → qty/limit recomputed at fresh price preserving
+  the approved notional → governor re-review → broker review. Live mode with
+  no fresh quote defers fail-closed; the order row carries the repriced
+  economics so reconciliation never sees stale values. Options keep the
+  legacy path, visibly audited (documented limitation).
+- `advanced_override` no longer exists — setting it is a ConfigError. Scoped
+  `risk_exceptions` entries cover exactly one parameter/bound with reason +
+  expiry (+ optional max_equity, enforced by the governor voiding new buys
+  above the cap). Hard invariants (leverage) are never exceptable.
+  live.yaml migrated (same effective values, now bounded, applies on next
+  restart); paper/default run inside standard limits.
