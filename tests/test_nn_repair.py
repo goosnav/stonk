@@ -1531,3 +1531,26 @@ def test_health_reports_config_error_instead_of_500(cfg, store, monkeypatch):
     assert body["status"] == "error"
     assert "test breakage" in body["config_error"]
     assert any("config invalid" in a for a in body["alerts"])
+
+
+def test_gui_overrides_pruned_per_key_not_discarded(cfg, store):
+    from specforge.app import current_config
+    store.kv_set("config_overrides", {
+        "nodes": {"news_sentiment": {"enabled": True}},         # safe — keep
+        "risk": {"max_single_equity_position": 0.7,             # dangerous — prune
+                 "max_daily_new_positions": 9},                 # safe — keep
+        "advanced_override": True})                             # removed flag — prune
+    c = current_config(store, "paper")
+    assert c.get("nodes", "news_sentiment", "enabled") is True      # kept
+    assert c.get("risk", "max_daily_new_positions") == 9            # kept
+    assert c.get("risk", "max_single_equity_position") <= 0.25      # pruned to file value
+    audits = [a for a in store.audit_rows()
+              if a["event_type"] == "config_override_rejected"]
+    assert len(audits) == 1
+    payload = _json.loads(audits[0]["payload"])
+    assert "risk.max_single_equity_position" in payload["removed_keys"]
+    assert "advanced_override" in payload["removed_keys"]
+    # identical rejection does NOT re-audit (health polls continuously)
+    current_config(store, "paper")
+    assert len([a for a in store.audit_rows()
+                if a["event_type"] == "config_override_rejected"]) == 1

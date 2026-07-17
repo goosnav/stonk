@@ -74,15 +74,44 @@ def current_config(store: Store, mode: str):
     try:
         return load_config(mode, overrides=overrides)
     except ConfigError as e:
-        # D38: config_overrides is a mode-agnostic kv blob, but a value set in
-        # the GUI while live (where live.yaml's advanced_override permits e.g.
-        # single-position 30%) is DANGEROUS when the same DB loads in paper
-        # mode. Refuse the override and keep the SAFE committed file config —
-        # never take the server down over it. This is stricter, not weaker:
-        # the dangerous value is rejected exactly as validate() intends.
-        # ponytail: drops the whole blob; per-key pruning if this ever bites a
-        # mode where some overrides are safe and others aren't worth keeping.
-        store.audit("config_override_rejected", {"mode": mode, "error": str(e)})
+        # D38/E2: the GUI kv blob may hold values validate() now refuses
+        # (e.g. GUI-set 70% single-position that the removed advanced_override
+        # used to bless globally). Per-key pruning: drop ONLY the offending
+        # dangerous keys (and the removed advanced_override flag) and keep the
+        # user's safe settings — node toggles, AI routing — instead of
+        # discarding the whole blob. Never take the server down over config.
+        import copy as _copy
+
+        from .config import _DANGEROUS
+        pruned = _copy.deepcopy(overrides)
+        removed = []
+        if pruned.pop("advanced_override", None) is not None:
+            removed.append("advanced_override")
+        for path, pred, _msg in _DANGEROUS:
+            node = pruned
+            for key in path[:-1]:
+                node = node.get(key) if isinstance(node, dict) else None
+                if node is None:
+                    break
+            if isinstance(node, dict) and path[-1] in node:
+                try:
+                    dangerous = pred(node[path[-1]])
+                except TypeError:
+                    dangerous = True
+                if dangerous:
+                    removed.append(".".join(path))
+                    del node[path[-1]]
+        # Audit once per distinct rejection, not once per request (the health
+        # feed polls continuously; 2026-07-17 spammed 400+ identical rows).
+        marker = {"mode": mode, "error": str(e), "removed_keys": removed}
+        if store.kv_get("config_override_rejected_last") != marker:
+            store.kv_set("config_override_rejected_last", marker)
+            store.audit("config_override_rejected", marker)
+        if removed:
+            try:
+                return load_config(mode, overrides=pruned)
+            except ConfigError:
+                pass                      # still bad → safe file config below
         return load_config(mode)
 
 
