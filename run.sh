@@ -3,6 +3,19 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+PORT=8420
+URL="http://127.0.0.1:$PORT"
+
+# Already serving? (e.g. the live server from Stonk Terminal.app, or a prior
+# run.) Open the dashboard and get out of the way — never rerun setup/tests or
+# fight for the port. This is the double-click contract: the website appears.
+existing=$(curl -sf --max-time 3 "$URL/api/version" 2>/dev/null || true)
+if [[ "$existing" == *'"version"'* && "$existing" == *'"mode"'* ]]; then
+  echo "» Stonk Terminal already running at $URL — opening dashboard"
+  open "$URL" 2>/dev/null || true
+  exit 0
+fi
+
 PY=python3
 command -v $PY >/dev/null || { echo "python3 not found — install Python 3.12+"; exit 1; }
 
@@ -35,5 +48,15 @@ print(f"  smoke OK: cycle {s['cycle_id']} regime={s['regime']} "
       f"signals={s['signals']} equity=${s['equity']}")
 EOF
 
-echo "» starting GUI at http://127.0.0.1:8420 (Ctrl-C to stop)"
+echo "» starting GUI at $URL (Ctrl-C to stop)"
+# open the browser once the server answers (background waiter — exec below
+# replaces this shell, so the open must not depend on it)
+( for _ in $(seq 1 60); do
+    v=$(curl -sf --max-time 2 "$URL/api/version" 2>/dev/null || true)
+    if [[ "$v" == *'"version"'* ]]; then
+      open "$URL" 2>/dev/null || true
+      exit 0
+    fi
+    sleep 1
+  done ) &
 exec .venv/bin/stonk serve --port 8420
