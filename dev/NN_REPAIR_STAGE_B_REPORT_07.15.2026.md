@@ -230,3 +230,21 @@ Key properties, each with a test:
   zero live blend for the graph) — full championship requires forward shadow
   evidence; a graph activates only against the exact TCN it was trained with,
   with fail-closed cohort utility evidence.
+
+---
+
+# Sprint E1 addendum (2026-07-16) — trading lease + immutable config
+
+Commit: **`ebc7772`** — 305 tests pass (297 → 305). Software validation only.
+
+- The SQLite lease (`lease:trading_cycle:<mode>` kv row, BEGIN IMMEDIATE) is
+  now the cross-process authority for trading cycles; the threading.Lock is
+  just a cheap in-process fast-path. Daemon/CLI/GUI/restarted instances can
+  never overlap; expired leases heal crashed workers; releases are owner-only;
+  a worker that loses the lease before order placement is fenced and sends
+  nothing (protective exits deliberately unfenced).
+- `cfg.data["universe"]["symbols"]` is never mutated anywhere anymore
+  (static test enforces it). The cycle universe is passed explicitly into
+  MarketContext / blend_candidates; research discovery + shadow inference use
+  the same mechanism. The hypothesis-watchlist test now asserts immutability
+  instead of demanding the old leak.
