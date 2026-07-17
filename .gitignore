@@ -20,3 +20,4 @@ logs/*
 # built app bundle (regenerate with scripts/build_stonk_app.sh)
 Stonk.app/
 *.iconset/
+.coverage
