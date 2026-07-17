@@ -399,7 +399,7 @@ My strongest conclusion: **the deterministic core is promising, but the learned 
 ---
 ---
 
-The previous section was the initial thoughts, the section below details the final path forward.
+# The previous section was the initial thoughts, the section below details the final path forward. :)
 
 ---
 ---
