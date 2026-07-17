@@ -1,11 +1,14 @@
 # Stonk Terminal default configuration. paper.yaml / live.yaml overlay this.
 # Everything here is editable from the GUI (changes are audit-logged);
-# the risk governor rejects dangerous values unless advanced_override: true.
+# the risk governor rejects dangerous values unless a scoped, expiring
+# risk_exceptions entry covers them (hard invariants are never exceptable).
 
 mode: paper                # paper | live
 broker: paper              # paper | robinhood_mcp | robinhood_bridge
 live_trading_enabled: false   # must ALSO set env LIVE_TRADING_ENABLED=true
-advanced_override: false
+# Scoped risk exceptions (see configs/live.yaml for the shape). Empty here:
+# paper/default must run inside standard limits.
+risk_exceptions: []
 
 db_path: data/specforge.db
 
@@ -89,7 +92,7 @@ risk:
   option_min_open_interest: 100
 
 execution:
-  order_type: limit                # limit | market (market requires advanced_override)
+  order_type: limit                # limit | market (market requires a risk_exceptions entry)
   limit_offset_pct: 0.001          # limit at last price +/- offset (cross the spread a hair)
   spread_cost_bps: 3               # cost model: half-spread for liquid names
   slippage_bps: 5

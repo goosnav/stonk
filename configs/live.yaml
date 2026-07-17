@@ -12,10 +12,17 @@ schedule:
   # open. Cron scans above stay as a belt-and-suspenders fallback; the cycle
   # lock makes any overlap a skip, never a duplicate order.
   scan_interval_minutes: 10
-# advanced_override justified: on a $50 probation account the standard
-# percentage caps produce sub-$5 orders (below exchange/engine minimums).
-# The DOLLAR amounts stay tiny; revert to defaults as equity grows past ~$500.
-advanced_override: true
+# Scoped, expiring risk exceptions (Sprint E2 — replaces advanced_override).
+# Each entry widens EXACTLY ONE limit, to an approved bound, for a reason,
+# until an expiry; max_equity voids it (governor stops new buys) once the
+# account outgrows the tiny-probation rationale. Hard invariants (leverage)
+# are never exceptable.
+risk_exceptions:
+  - parameter: risk.max_single_equity_position
+    value: 0.30
+    reason: "tiny probation account: the standard 25% cap yields sub-$5 orders"
+    expires: "2026-09-30"
+    max_equity: 500
 risk:
   time_step_budget_pct: 0.40     # $20/cycle on $50 — still an absolute pittance
   time_step_budget_abs_cap: 50   # hard ceiling regardless of account growth
@@ -29,9 +36,10 @@ risk:
   # the tiny dollar caps above + kill switches. To watch/gate instead, set
   # `all` (every order waits) or `threshold` here or in the GUI Risk tab.
   approval_mode: auto
-  # If you switch to a gated mode: approved intents place at their ORIGINAL
-  # limit/qty next cycle, so cap the TTL short — a stale intent must not fire
-  # at yesterday's price.
+  # Approved intents are REPRICED at placement (Sprint E2): fresh quote,
+  # drift beyond execution.approval_reprice_tolerance_pct expires them back
+  # to the operator, qty/limit recomputed, governor re-review. The TTL is
+  # now a backstop, not the only staleness defense.
   approval_timeout_hours: 6
   # D39: with ~40 cycles/day the old 6/day cap was the binding constraint.
   # Dollar caps (single-position, per-cycle budget, cash clamp) stay the

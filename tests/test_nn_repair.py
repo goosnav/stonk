@@ -1255,3 +1255,206 @@ def test_no_shared_config_mutation_remains_in_cycle_code():
     for module in ("specforge/engine.py", "specforge/research.py"):
         src = pathlib.Path(module).read_text()
         assert 'cfg.data["universe"]["symbols"] =' not in src, module
+
+
+# ── Sprint E2: approval repricing + scoped risk exceptions ───────────────────
+
+def _executor(cfg, store):
+    from specforge.broker.paper import PaperBroker
+    from specforge.execution import Executor
+    from specforge.risk import Governor
+    broker = PaperBroker(cfg, store)
+    return Executor(cfg, store, broker, Governor(cfg, store))
+
+
+def _approved_intent(store, symbol="AAA", limit=100.0, notional=50.0,
+                     mode="paper"):
+    from specforge.models import OrderIntent
+    cand = _candidate(symbol, 0.5)
+    cand.target_notional = notional
+    store.record_candidate(cand, "cyc-appr")
+    intent = OrderIntent.make(cand, qty=round(notional / limit, 6), limit_price=limit)
+    intent.notional = notional
+    intent.status = "pending_approval"
+    store.record_order(intent, mode=mode)
+    store.queue_approval(intent.id, expires_at="2099-01-01T00:00:00")
+    store.decide_approval(intent.id, "approved")
+    return intent
+
+
+def _run_queue(cfg, store, live_prices=None):
+    from specforge.data import MarketContext
+    from specforge.risk import CycleState
+    # fixture bars end ~2 weeks back; these tests exercise repricing, not the
+    # staleness policy (covered in test_risk)
+    cfg.data.setdefault("risk", {})["stale_data_max_age_days"] = 45
+    ex = _executor(cfg, store)
+    ctx = MarketContext(store, cfg)
+    account = ex.broker.get_account()
+    return ex, ex.process_approval_queue(account, ctx, CycleState(1000.0),
+                                         "cyc-appr", "neutral",
+                                         live_prices=live_prices)
+
+
+def test_approved_order_repriced_within_tolerance_places(cfg, store):
+    from specforge.data import MarketContext
+    ref = MarketContext(store, cfg).close("AAA")
+    intent = _approved_intent(store, limit=ref)           # approved at ref
+    fresh = round(ref * 1.01, 4)                          # 1% move < 3% tol
+    ex, results = _run_queue(cfg, store, live_prices={"AAA": fresh})
+    assert results and results[0] in ("filled", "resting", "placed")   # actually placed
+    repriced = store.db.execute("SELECT payload FROM audit WHERE "
+                                "event_type='approved_order_repriced'").fetchone()
+    assert repriced is not None
+    payload = _json.loads(repriced["payload"])
+    assert payload["fresh"] == pytest.approx(fresh)
+    assert payload["limit"]["new"] == pytest.approx(ex._limit_price(fresh, "buy"))
+    # qty recomputed so the HUMAN-APPROVED notional is preserved at fresh price
+    assert payload["qty"]["new"] * payload["limit"]["new"] == pytest.approx(50.0, rel=1e-3)
+    # governor re-ran AFTER repricing
+    reval = store.db.execute("SELECT payload FROM audit WHERE "
+                             "event_type='approved_order_revalidated'").fetchone()
+    assert reval is not None
+
+
+def test_approved_order_expires_when_price_moved_beyond_tolerance(cfg, store):
+    from specforge.data import MarketContext
+    ref = MarketContext(store, cfg).close("AAA")
+    intent = _approved_intent(store, limit=ref)
+    ex, results = _run_queue(cfg, store, live_prices={"AAA": round(ref * 1.10, 4)})
+    assert results == ["expired_price_moved"]
+    order = store.db.execute("SELECT status FROM orders WHERE id=?", (intent.id,)).fetchone()
+    assert order["status"] == "expired"                   # back to the operator
+    assert store.db.execute("SELECT 1 FROM audit WHERE "
+                            "event_type='approval_expired_price_moved'").fetchone()
+    assert not store.db.execute("SELECT 1 FROM audit WHERE event_type='order_filled' "
+                                "AND cycle_id='cyc-appr'").fetchone()
+
+
+def test_live_mode_defers_without_fresh_quote(cfg, store):
+    intent = _approved_intent(store, limit=100.0, mode="live")
+    cfg.data["mode"] = "live"                             # executor mode flips
+    try:
+        ex, results = _run_queue(cfg, store, live_prices={})
+    finally:
+        cfg.data["mode"] = "paper"
+    assert results == ["deferred"]                        # fail closed, no stale place
+    order = store.db.execute("SELECT status FROM orders WHERE id=?", (intent.id,)).fetchone()
+    assert order["status"] == "pending_approval"          # untouched, retried next cycle
+    assert store.db.execute("SELECT 1 FROM audit WHERE "
+                            "event_type='approval_reprice_deferred'").fetchone()
+
+
+def test_paper_mode_falls_back_to_simulation_price(cfg, store):
+    from specforge.data import MarketContext
+    ref = MarketContext(store, cfg).close("AAA")
+    _approved_intent(store, limit=ref)
+    ex, results = _run_queue(cfg, store, live_prices=None)   # sim price = ref, drift 0
+    assert results and results[0] not in ("deferred", "expired_price_moved")
+    assert store.db.execute("SELECT 1 FROM audit WHERE "
+                            "event_type='approved_order_repriced'").fetchone()
+
+
+def test_advanced_override_no_longer_bypasses():
+    from specforge.config import ConfigError, load_config
+    with pytest.raises(ConfigError, match="advanced_override was removed"):
+        load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
+                                        "advanced_override": True})
+
+
+def _exc(parameter="risk.max_daily_loss", value=0.5, expires="2099-01-01", **over):
+    out = {"parameter": parameter, "value": value, "reason": "test",
+           "expires": expires}
+    out.update(over)
+    return out
+
+
+def test_scoped_exception_allows_named_value_with_warning():
+    from specforge.config import load_config
+    cfg = load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
+                                          "risk_exceptions": [_exc()]})
+    assert any("risk_exception active" in w for w in cfg.validate())
+
+
+def test_expired_exception_fails_closed():
+    from specforge.config import ConfigError, load_config
+    with pytest.raises(ConfigError, match="Dangerous config rejected"):
+        load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
+                                        "risk_exceptions": [_exc(expires="2020-01-01")]})
+
+
+def test_exception_cannot_cover_value_above_its_approved_bound():
+    from specforge.config import ConfigError, load_config
+    with pytest.raises(ConfigError):
+        load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
+                                        "risk_exceptions": [_exc(value=0.3)]})
+
+
+def test_hard_invariant_never_exceptable():
+    from specforge.config import ConfigError, load_config
+    with pytest.raises(ConfigError, match="never exceptable"):
+        load_config("paper", overrides={
+            "risk": {"max_account_deployment": 1.2},
+            "risk_exceptions": [_exc(parameter="risk.max_account_deployment",
+                                     value=1.2)]})
+
+
+def test_malformed_exception_is_inactive():
+    from specforge.config import ConfigError, load_config
+    broken = {"parameter": "risk.max_daily_loss", "value": 0.5}   # no expires
+    with pytest.raises(ConfigError):
+        load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
+                                        "risk_exceptions": [broken]})
+
+
+def test_exception_scope_is_one_parameter_only():
+    from specforge.config import ConfigError, load_config
+    # an exception for max_daily_loss must not excuse a different dangerous key
+    with pytest.raises(ConfigError):
+        load_config("paper", overrides={
+            "risk": {"max_single_equity_position": 0.30},
+            "risk_exceptions": [_exc()]})
+
+
+def test_governor_voids_exceptions_above_max_equity(store):
+    from specforge.config import load_config
+    from specforge.models import AccountState, OrderIntent
+    from specforge.risk import CycleState, Governor
+    cfg = load_config("paper", overrides={
+        "risk": {"max_daily_loss": 0.5},
+        "risk_exceptions": [_exc(max_equity=500)]})
+    gov = Governor(cfg, store)
+    cand = _candidate("BBB", 0.5)
+    cand.target_notional = 50.0
+    intent = OrderIntent.make(cand, qty=0.5, limit_price=100.0)
+    rich = AccountState(equity=600.0, cash=500.0, buying_power=500.0,
+                        positions=[], as_of="2026-07-16")
+    decision = gov.review(intent, cand, rich, CycleState(1000.0), data_age_days=1)
+    assert decision.verdict == "REJECTED"
+    assert any("risk exception void" in r for r in decision.reasons)
+    small = AccountState(equity=400.0, cash=300.0, buying_power=300.0,
+                         positions=[], as_of="2026-07-16")
+    decision2 = gov.review(intent, cand, small, CycleState(1000.0), data_age_days=1)
+    assert not any("risk exception void" in r for r in decision2.reasons)
+
+
+def test_live_yaml_migration_is_coherent():
+    from specforge.config import load_config
+    cfg = load_config("live")
+    warnings = cfg.validate()
+    assert any("risk_exception active" in w and "single position" in w
+               for w in warnings)
+    assert cfg.risk_exception_equity_cap() == pytest.approx(500)
+    assert "advanced_override" not in cfg.data
+
+
+def test_repriced_values_persist_on_order_row(cfg, store):
+    from specforge.data import MarketContext
+    ref = MarketContext(store, cfg).close("AAA")
+    intent = _approved_intent(store, limit=ref)
+    fresh = round(ref * 1.02, 4)
+    ex, results = _run_queue(cfg, store, live_prices={"AAA": fresh})
+    row = store.db.execute("SELECT qty,limit_price,notional FROM orders WHERE id=?",
+                           (intent.id,)).fetchone()
+    assert row["limit_price"] == pytest.approx(ex._limit_price(fresh, "buy"))
+    assert row["qty"] * row["limit_price"] == pytest.approx(row["notional"], rel=1e-3)

@@ -1,6 +1,7 @@
 """Config loading: configs/default.yaml overlaid by configs/<mode>.yaml overlaid
 by runtime GUI edits stored in the DB (applied by app layer). Dangerous values
-are rejected unless advanced_override is set."""
+are rejected unless a scoped, expiring `risk_exceptions` entry covers them;
+hard invariants (leverage) can never be excepted."""
 from __future__ import annotations
 
 import copy
@@ -8,6 +9,7 @@ import os
 import re
 import tempfile
 import unicodedata
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -105,6 +107,19 @@ _DANGEROUS = [
     (("risk", "max_account_deployment"), lambda v: v > 1.0, "deployment > 100% (leverage)"),
     (("execution", "order_type"), lambda v: v == "market", "market orders"),
 ]
+# Hard invariants: NEVER exceptable, whatever risk_exceptions declares.
+# Deployment > 100% is leverage — worst-case loss beyond account value.
+_HARD_INVARIANTS = {("risk", "max_account_deployment")}
+
+
+def _exception_covers(configured, approved) -> bool:
+    """An exception approves a SPECIFIC bound: numeric config may not exceed
+    it; non-numeric must match exactly. Config drift past the approved value
+    fails closed."""
+    try:
+        return float(configured) <= float(approved)
+    except (TypeError, ValueError):
+        return configured == approved
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -145,17 +160,61 @@ class Config:
     def mode(self) -> str:
         return self.data.get("mode", "paper")
 
+    def active_risk_exceptions(self) -> dict[str, dict]:
+        """Unexpired scoped exceptions keyed by dotted parameter path.
+        Malformed entries (missing/invalid expires or parameter) are INACTIVE —
+        a typo can never widen a limit (fail closed)."""
+        out: dict[str, dict] = {}
+        for exc in self.data.get("risk_exceptions") or []:
+            if not isinstance(exc, dict):
+                continue
+            try:
+                if date.fromisoformat(str(exc.get("expires"))) < date.today():
+                    continue
+            except (TypeError, ValueError):
+                continue
+            parameter = str(exc.get("parameter") or "")
+            if parameter and "value" in exc:
+                out[parameter] = exc
+        return out
+
+    def risk_exception_equity_cap(self) -> float | None:
+        """Smallest max_equity across active exceptions, or None. Above this
+        the probation-account rationale is gone; the governor voids buys."""
+        caps = [float(e["max_equity"]) for e in self.active_risk_exceptions().values()
+                if e.get("max_equity") is not None]
+        return min(caps) if caps else None
+
     def validate(self) -> list[str]:
-        """Return warnings; raise ConfigError on dangerous values w/o override."""
+        """Return warnings; raise ConfigError on dangerous values without a
+        matching scoped exception. One global bypass no longer exists: each
+        exception names ONE parameter, ONE approved bound, a reason, and an
+        expiry — and hard invariants are not exceptable at all."""
+        if self.data.get("advanced_override"):
+            raise ConfigError(
+                "advanced_override was removed: it turned every dangerous "
+                "threshold into a warning at once. Declare scoped "
+                "risk_exceptions entries instead (parameter/value/reason/"
+                "expires[/max_equity]; see configs/live.yaml)")
         warnings = []
+        active = self.active_risk_exceptions()
         for path, pred, msg in _DANGEROUS:
             v = _get(self.data, path)
-            if v is not None and pred(v):
-                if self.data.get("advanced_override"):
-                    warnings.append(f"advanced_override active: {msg}")
-                else:
-                    raise ConfigError(f"Dangerous config rejected: {msg} "
-                                      f"(set advanced_override: true to force)")
+            if v is None or not pred(v):
+                continue
+            dotted = ".".join(path)
+            exc = active.get(dotted)
+            if (path not in _HARD_INVARIANTS and exc is not None
+                    and _exception_covers(v, exc.get("value"))):
+                warnings.append(
+                    f"risk_exception active: {msg} (approved {exc.get('value')}, "
+                    f"expires {exc.get('expires')}, reason: {exc.get('reason', '?')})")
+                continue
+            hint = ("hard invariant — never exceptable"
+                    if path in _HARD_INVARIANTS else
+                    "declare a scoped risk_exceptions entry with "
+                    "parameter/value/reason/expires")
+            raise ConfigError(f"Dangerous config rejected: {msg} ({hint})")
         return warnings
 
     def live_trading_allowed(self) -> tuple[bool, str]:

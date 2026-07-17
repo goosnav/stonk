@@ -150,9 +150,12 @@ def test_dangerous_config_rejected():
     from specforge.config import ConfigError, load_config
     with pytest.raises(ConfigError):
         load_config("paper", overrides={"risk": {"max_daily_loss": 0.5}})
-    # but allowed with explicit override
-    cfg = load_config("paper", overrides={"risk": {"max_daily_loss": 0.5},
-                                          "advanced_override": True})
+    # Sprint E2: the global advanced_override bypass is gone; only a scoped,
+    # expiring exception naming THIS parameter and bound may allow it.
+    cfg = load_config("paper", overrides={
+        "risk": {"max_daily_loss": 0.5},
+        "risk_exceptions": [{"parameter": "risk.max_daily_loss", "value": 0.5,
+                             "reason": "test", "expires": "2099-01-01"}]})
     assert cfg.validate()  # returns warnings
 
 

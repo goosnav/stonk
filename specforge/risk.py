@@ -206,6 +206,15 @@ class Governor:
             active = self.active_switches()
             if active:
                 return rj(f"kill switches active: {sorted(active)}")
+            # Scoped risk exceptions carry a max_equity: above it the tiny-
+            # account rationale is gone and every widened limit is void — new
+            # buys stop until the operator re-approves config at standard
+            # limits. Exits are never blocked by this.
+            cap = getattr(self.cfg, "risk_exception_equity_cap", lambda: None)()
+            if cap is not None and account.equity > cap:
+                return rj(f"risk exception void: equity {account.equity:.2f} "
+                          f"exceeds max_equity {cap:.2f} — re-approve config "
+                          f"at standard limits")
         if data_age_days is None or data_age_days > self.r.get("stale_data_max_age_days", 4):
             return rj(f"stale data: age={data_age_days} days")
         if not skip_duplicate and self.store.recent_order_exists(

@@ -222,7 +222,7 @@ def _run_cycle(cfg, store: Store, broker=None, as_of: str | None = None,
     # trading itself — approvals passed the governor and get re-reviewed at
     # placement; the deterministic ensemble is the proven fallback.
     approvals = executor.process_approval_queue(
-        account, ctx, cycle, cycle_id, reg.regime)
+        account, ctx, cycle, cycle_id, reg.regime, live_prices=live_px)
     if approvals:
         account = broker.get_account()
 

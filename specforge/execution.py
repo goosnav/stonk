@@ -252,8 +252,18 @@ class Executor:
         return results
 
     def process_approval_queue(self, account, ctx, cycle: CycleState,
-                               cycle_id: str, regime: str) -> list[str]:
-        """Revalidate then place human-approved intents against current funds."""
+                               cycle_id: str, regime: str,
+                               live_prices: dict | None = None) -> list[str]:
+        """Reprice, revalidate, then place human-approved intents.
+
+        Approval time and placement time can be hours apart (Sprint E2): each
+        equity intent is repriced against a CURRENT executable quote first —
+        drift beyond execution.approval_reprice_tolerance_pct expires it back
+        to the operator, otherwise qty/limit/notional are recomputed at the
+        fresh price — and only then does the governor re-review. In live mode
+        a missing fresh quote DEFERS the intent (fail closed: never place at a
+        stale reference); paper/backtest fall back to the simulation price.
+        """
         results = []
         now = self.now_iso
         for row in self.store.pending_approvals():
@@ -279,6 +289,47 @@ class Executor:
                 self.store.update_order(intent.id, status="vetoed")
                 results.append("rejected")
                 continue
+            if intent.asset_type == "equity":
+                fresh = (live_prices or {}).get(intent.symbol)
+                if fresh is None and self.mode != "live":
+                    fresh = ctx.close(intent.symbol)   # simulation price source
+                if not fresh or fresh <= 0:
+                    # Fail closed: without a current executable quote the
+                    # original reference may be hours stale. Stay pending.
+                    self.store.audit("approval_reprice_deferred", {
+                        "intent": intent.id, "symbol": intent.symbol,
+                        "reason": "no fresh quote"}, cycle_id)
+                    results.append("deferred")
+                    continue
+                reference = float(o["limit_price"])
+                drift = abs(fresh - reference) / max(1e-9, reference)
+                tolerance = float(self.cfg.get(
+                    "execution", "approval_reprice_tolerance_pct", default=0.03))
+                if drift > tolerance:
+                    # The market the human approved no longer exists.
+                    self.store.decide_approval(intent.id, "expired")
+                    self.store.update_order(intent.id, status="expired")
+                    self.store.audit("approval_expired_price_moved", {
+                        "intent": intent.id, "symbol": intent.symbol,
+                        "reference": reference, "fresh": fresh,
+                        "drift": round(drift, 5), "tolerance": tolerance}, cycle_id)
+                    results.append("expired_price_moved")
+                    continue
+                old_qty, old_limit = intent.qty, intent.limit_price
+                intent.limit_price = self._limit_price(fresh, intent.side)
+                intent.qty = round(intent.notional / intent.limit_price, 6)
+                intent.notional = round(intent.qty * intent.limit_price, 2)
+                self.store.audit("approved_order_repriced", {
+                    "intent": intent.id, "symbol": intent.symbol,
+                    "reference": reference, "fresh": fresh,
+                    "drift": round(drift, 5),
+                    "limit": {"old": old_limit, "new": intent.limit_price},
+                    "qty": {"old": old_qty, "new": intent.qty}}, cycle_id)
+            else:
+                # Options lack a fresh-chain quote source here; they keep the
+                # legacy revalidate-only path, visibly. Documented limitation.
+                self.store.audit("approval_reprice_skipped_option",
+                                 {"intent": intent.id}, cycle_id)
             account = self.broker.get_account()
             decision = self.governor.review(
                 intent, cand, account, cycle, ctx.data_age_days(intent.symbol),
@@ -298,6 +349,12 @@ class Executor:
                 self.store.update_order(intent.id, status="vetoed")
                 results.append("rejected")
                 continue
+            # Persist the repriced/resized economics on the order ROW too, so
+            # resting-order reconciliation never reads the stale approval-time
+            # qty/limit against a broker order placed at the fresh ones.
+            self.store.update_order(intent.id, qty=intent.qty,
+                                    limit_price=intent.limit_price,
+                                    notional=intent.notional)
             status = self._review_and_place(intent, cand, cycle, cycle_id, regime)
             results.append(status)
             if status == "broker_rejected":
