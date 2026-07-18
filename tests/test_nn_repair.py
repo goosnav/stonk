@@ -723,6 +723,7 @@ def test_neural_score_positive_and_bounded_for_real_edge():
 
 def test_blend_applied_exactly_once_and_attributed(cfg, store):
     from specforge.ml.policy import apply_neural_blend
+    cfg.data["neural"]["experimental_blend"] = 0.15   # R0 default is 0.0
     c = _candidate(score=0.5)
     out = apply_neural_blend([c], {"AAA": _nf_view(0.05, 0.03, p_abs=0.75)},
                              cfg, store, "cyc1", graph_blend=0.0, as_of="2026-07-15", meta=_META)
@@ -759,11 +760,12 @@ def test_blend_bounds_never_silently_increased(cfg, store):
     assert effective_blend(cfg, 0.0, True)[0] == pytest.approx(0.40)   # clamped down
     cfg.data["neural"]["experimental_blend"] = 0.01
     assert effective_blend(cfg, 0.0, True)[0] == 0.0                   # below floor = off
-    cfg.data["neural"]["experimental_blend"] = 0.15
+    cfg.data["neural"]["experimental_blend"] = 0.0
 
 
 def test_blend_is_audited(cfg, store):
     from specforge.ml.policy import apply_neural_blend
+    cfg.data["neural"]["experimental_blend"] = 0.15   # R0 default is 0.0
     apply_neural_blend([_candidate()], {"AAA": _nf_view(0.05, 0.03)},
                        cfg, store, "cyc-audit", graph_blend=0.0, as_of="2026-07-15", meta=_META)
     row = store.db.execute("SELECT * FROM audit WHERE event_type='neural_direct_blend' "
@@ -790,6 +792,7 @@ def _probe_forecasts(ctx, **by_symbol):
 
 def _select(cfg, store, ctx, account, candidates, targets, forecasts):
     from specforge.ml.policy import select_exploration_probe
+    cfg.data["neural"]["exploration"]["enabled"] = True   # R0 default is off
     return select_exploration_probe(candidates, targets, forecasts, _META,
                                     cfg, store, "cyc-probe", account, ctx,
                                     as_of=ctx.as_of,
@@ -1074,6 +1077,7 @@ def test_deterministic_tie_breaking():
 
 
 def test_transition_history_is_persisted(cfg, store, promo):
+    cfg.data["neural"]["experimental_blend"] = 0.15   # R0 default is 0.0
     _insert_run(store, "hist-1", "sealed_candidate", score=1.0)
     neural.maybe_promote(cfg, store)
     hist = ml_lifecycle.history(store, "hist-1")
@@ -1174,6 +1178,7 @@ def test_lifecycle_reads_do_not_mutate(cfg, store, promo):
 
 def test_experimental_live_serves_at_permitted_blend_cap(cfg, store):
     from specforge.ml.policy import effective_blend
+    cfg.data["neural"]["experimental_blend"] = 0.15   # R0 default is 0.0
     assert effective_blend(cfg, 0.0, True, permitted=0.10)[0] == pytest.approx(0.10)
     assert effective_blend(cfg, 0.0, True, permitted=0.0)[0] == 0.0   # fail closed
     assert effective_blend(cfg, 0.0, True, permitted=None)[0] == pytest.approx(0.15)
@@ -1471,7 +1476,9 @@ def test_policy_overrides_set_expected_knobs(cfg):
     assert only.get("neural", "experimental_blend") == 1.0
     assert only.get("neural", "max_blend") == 1.0
     blend = _policy_cfg(cfg, "fixed_blend")
-    assert blend.get("neural", "experimental_blend") == pytest.approx(0.15)
+    # R0 containment: the production config carries ZERO blend until R1's
+    # dual-family gates land, so fixed_blend == the config as committed.
+    assert blend.get("neural", "experimental_blend") == 0.0
     with pytest.raises(ValueError, match="unknown policy"):
         _policy_cfg(cfg, "yolo")
 

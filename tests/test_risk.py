@@ -126,9 +126,11 @@ def test_options_locked_at_small_scale(gov):
     d = gov.review(make_intent(c), c, acct(equity=1000), CycleState(100), 1)
     assert d.verdict == "REJECTED"
     assert any("locked" in r for r in d.reasons)
-    # unlocked at scale: equity 10k × 1.5% = $150 ≥ $75 minimum premium
+    # R0 containment: options are HARD-OFF (options_enabled: false) until the
+    # R4 dedicated adapter exists — scale no longer unlocks them. The live
+    # Robinhood adapter is equity-only; an option intent must never reach it.
     d = gov.review(make_intent(c), c, acct(equity=10000, cash=10000), CycleState(500), 1)
-    assert d.verdict in ("APPROVED", "APPROVED_WITH_SIZE_REDUCTION")
+    assert d.verdict == "REJECTED"
 
 
 def test_option_bounded_risk_validation(gov):

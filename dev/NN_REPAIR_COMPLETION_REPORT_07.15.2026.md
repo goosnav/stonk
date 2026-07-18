@@ -204,3 +204,22 @@ SAFE NEXT STEP .... let the research plane train schema-6 challengers and
                     training so compare_policies becomes a real experiment
                     before any blend fires live.
 ```
+
+---
+
+# R0 addendum (2026-07-17) — corrections + containment
+
+Staleness corrections to this report: the branch is **pushed** and was merged
+to main by the owner as PR #1 (`720b628`); the suite is now **325 passed**
+(three post-report fixes: health config-error reporting, per-key override
+pruning, shared worker loader). Sprint governance moved to
+`dev/SPRINT_PLAN_R_07.17.2026.md` (R0–R9); superseded plans → `dev/archive/`.
+
+R0 containment (external review, P0): the absolute head can TRADE while model
+SELECTION is still excess-only (`forward_all` in validation/tournament/folds/
+baselines; v1-only OOS persistence; `resolve_forecasts_v2` had no production
+call site). Until R1 closes that gap, learned influence is provably zero:
+`experimental_blend: 0.0`, `exploration.enabled: false`, and options hard-off
+(`options_enabled: false` in yaml AND the GUI kv override keys) so option
+intents can never reach the equity-only live adapter. Tests updated to the
+containment contract; active-blend tests opt in explicitly.

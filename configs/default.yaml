@@ -80,7 +80,9 @@ risk:
   approval_timeout_hours: 24       # queued (un-auto) intents expire after this
 
   # Options (node auto-unlocks by account scale)
-  options_enabled: auto            # auto | true | false
+  # R0: hard-off — option intents must never reach the equity-only live
+  # adapter. Re-enable only via the R4 dedicated, contract-tested adapter.
+  options_enabled: false           # R4 gate; was auto
   min_viable_option_premium: 75    # $; unlock when equity*max_single_option_premium_risk >= this
   max_single_option_premium_risk: 0.015
   max_total_options_premium_risk: 0.06
@@ -212,14 +214,19 @@ neural:
   # Direct bounded blend of the champion TCN into candidate scoring (Stage C1).
   # Graph-independent; 0 with deterministic fallback when no valid champion.
   # A value below min_blend means OFF; values above max_blend are clamped down.
-  experimental_blend: 0.15
+  # R0 CONTAINMENT (dev/SPRINT_PLAN_R_07.17.2026.md): learned influence is
+  # hard-zero until R1 closes the selection gap — models are still selected on
+  # excess-only evidence while the absolute head is what trades. Do not raise
+  # until the R1 exit gate (absolute-after-cost AND excess promotion gates on
+  # structured outputs) is proven.
+  experimental_blend: 0.0
   min_blend: 0.05
   max_blend: 0.40
   # Bounded neural-disagreement probe (Stage C2): at most one quarter-sized
   # exploration position beyond the deterministic batch. Still passes the
   # governor, cash/deployment caps, and duplicate checks like any order.
   exploration:
-    enabled: true
+    enabled: false                 # R0 containment — see sprint plan R1
     max_open_positions: 1
     budget_fraction: 0.20          # cap: fraction of equity a probe may use
     size_multiplier: 0.25          # quarter of the normal calculated position
