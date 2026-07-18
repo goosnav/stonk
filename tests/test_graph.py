@@ -59,6 +59,9 @@ def test_graph_backprop_and_atomic_champion(store):
     assert metrics["n_test"] > 0 and "test_ic_21d" in metrics
     vid = save_version(store, learned, metrics=metrics)
     assert champion(store)["status"] == "shadow"
+    from specforge.ml import lifecycle as _lc
+    _lc.transition(store, "graph_versions", vid, "experimental_live",
+                   reason="test: offline stub")   # R1: legal ramp, no jumps
     promote(store, vid)
     assert champion(store)["id"] == vid
     # Saving another challenger cannot mutate the live champion.
@@ -68,6 +71,9 @@ def test_graph_backprop_and_atomic_champion(store):
 
 def test_graph_champion_must_match_exact_tcn_checkpoint(cfg, store):
     vid = save_version(store, default_topology(), metrics={"temporal_model_id": "tcn-a"})
+    from specforge.ml import lifecycle as _lc
+    _lc.transition(store, "graph_versions", vid, "experimental_live",
+                   reason="test: offline stub")   # R1: legal ramp, no jumps
     promote(store, vid)
     store.db.execute(
         "INSERT INTO model_runs(id,kind,created_at,status,metrics,schema_version) "

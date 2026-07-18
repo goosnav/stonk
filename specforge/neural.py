@@ -1041,10 +1041,16 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         with torch.no_grad():
             for idx in va.split(2048):
                 xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
-                prediction, positive_probability = model.forward_all(xb)
-                objective = _pinball(prediction, yb) + .1 * \
-                    torch.nn.functional.binary_cross_entropy(
-                        positive_probability, (yr > 0).float())
+                vb_abs, vr_abs = Y_abs[idx].to(device), Yraw_abs[idx].to(device)
+                out = model.forward_structured(xb)
+                bce = torch.nn.functional.binary_cross_entropy
+                # R1 declared joint objective: the model is selected on BOTH
+                # families it will be judged (and traded) on — never excess only.
+                objective = (_pinball(out.excess_quantiles, yb)
+                             + _pinball(out.absolute_quantiles, vb_abs)
+                             + .1 * bce(out.probability_excess_positive, (yr > 0).float())
+                             + .1 * bce(out.probability_absolute_edge_positive,
+                                        (vr_abs > rtc).float()))
                 total_loss += float(objective) * len(idx)
                 total_rows += len(idx)
         val_loss = total_loss / max(1, total_rows)
@@ -1113,6 +1119,14 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     pred, probability = _apply_calibration(pred, probability, calibration)
     metric_dates = None if symbol else ds["dates"][eval_idx]
     metrics = _metrics(pred, ds["Y"][eval_idx], ds["horizons"], metric_dates)
+    # R1: the ABSOLUTE head is what trades, so it is evaluated first-class on
+    # the same rows, calibrated with its own validation-only transform.
+    abs_pred, abs_prob, _, _ = _predict_structured(
+        model, X, eval_idx, ds["target_scale"], ds["target_scale_absolute"], device)
+    abs_pred, abs_prob = _apply_calibration(abs_pred, abs_prob, absolute_cal)
+    metrics["absolute"] = _metrics(abs_pred, ds["Y_absolute"][eval_idx],
+                                   ds["horizons"], metric_dates)
+    metrics["absolute"]["evaluated_on"] = "structured_absolute_heads"
     metrics.update(evaluation_split="sealed_test" if final_trial else "validation",
                    validation_objective=round(best_loss, 6),
                    validation_selection_score=round(
@@ -1344,11 +1358,14 @@ def promote(cfg, store, run_id: str, *, reason: str = "promotion gates passed",
         "AND lifecycle_state='champion' AND id<>?",
         (row["kind"], symbol, run_id)).fetchall()
     with store.db:
-        ml_lifecycle.transition(store, "model_runs", run_id, "champion",
-                                reason=reason, evidence=evidence, in_tx=True)
-        for old in prior:            # retire ONLY after the successor is active
+        # Retire-then-crown inside ONE transaction: activation was validated
+        # BEFORE the tx (checkpoint load), the unique champion index holds at
+        # every statement, and any failure rolls the predecessor back intact.
+        for old in prior:
             ml_lifecycle.transition(store, "model_runs", old["id"], "retired",
                                     reason=f"superseded by {run_id}", in_tx=True)
+        ml_lifecycle.transition(store, "model_runs", run_id, "champion",
+                                reason=reason, evidence=evidence, in_tx=True)
     store.audit("neural_champion_promoted", {"id": run_id, "symbol": symbol,
                                              "reason": reason,
                                              "retired": [o["id"] for o in prior]})
@@ -1628,11 +1645,21 @@ def _offline_gate(metrics: dict) -> bool:
         metrics.get(f"median_fold_ic_{h}d", 0) >= (.015 if h == 5 else .02) and
         sum(f.get(f"net_alpha_{h}d", -1) > 0 for f in folds) >= 4
         for h in (5, 21))
-    return bool(metrics.get("beats_baselines")) and fold_gate and all(
+    excess_gate = all(
         float(metrics.get(str(h), {}).get("correlation", 0)) > 0 and
         float(metrics.get(str(h), {}).get("top_decile_alpha_after_cost", 0)) > 0 and
         .75 <= float(metrics.get(str(h), {}).get("coverage", 0)) <= .85
         for h in (5, 21))
+    # R1: the absolute head is what trades — a model whose absolute after-cost
+    # selection is not positive can NEVER pass, whatever its excess rank IC.
+    # Missing absolute metrics (legacy rows) fail closed.
+    absolute = metrics.get("absolute") or {}
+    absolute_gate = bool(absolute) and all(
+        float(absolute.get(str(h), {}).get("correlation", 0)) > 0 and
+        float(absolute.get(str(h), {}).get("top_decile_alpha_after_cost", 0)) > 0
+        for h in (5, 21))
+    return (bool(metrics.get("beats_baselines")) and fold_gate
+            and excess_gate and absolute_gate)
 
 
 def maybe_promote(cfg, store) -> dict:
@@ -1729,10 +1756,15 @@ def maybe_promote(cfg, store) -> dict:
         return {"action": "experimental_live", "id": top["id"],
                 "permitted_blend": blend}
     sm = shadow_metrics(store, top["id"]); hs = sm["horizons"]
+    ab = sm.get("absolute") or {}
     forward = sm["sessions"] >= 30 and all(
         hs.get(str(h), {}).get("n", 0) >= 10_000 and
         hs[str(h)].get("ic", 0) >= .01 and hs[str(h)].get("top_decile_alpha", 0) > 0 and
-        .75 <= hs[str(h)].get("coverage", 0) <= .85 for h in (5, 21))
+        .75 <= hs[str(h)].get("coverage", 0) <= .85 for h in (5, 21)) and all(
+        # R1: resolved DUAL-FAMILY (v2) evidence — the absolute head must show
+        # positive forward rank quality on its own outcomes before any ramp-up.
+        ab.get(str(h), {}).get("n", 0) >= 200 and
+        ab[str(h)].get("ic", 0) > 0 for h in (5, 21))
     if not forward:
         return {"action": "shadow", "id": top["id"], "metrics": sm}
     if state == "experimental_live":

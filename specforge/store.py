@@ -324,6 +324,20 @@ class Store:
             "json_extract(metrics,'$.temporal_model_id') "
             "WHERE temporal_model_id IS NULL")
         self.db.commit()
+        # R1: exactly ONE champion per kind/symbol (and one graph champion) is
+        # a database invariant, not a convention. Skipped with a warning if a
+        # legacy DB already violates it — promotion then still enforces order.
+        for ddl in (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_model_champion ON "
+                "model_runs(kind, COALESCE(symbol,'')) WHERE lifecycle_state='champion'",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_graph_champion ON "
+                "graph_versions(lifecycle_state) WHERE lifecycle_state='champion'"):
+            try:
+                self.db.execute(ddl)
+                self.db.commit()
+            except sqlite3.OperationalError as exc:
+                logging.getLogger("specforge").warning(
+                    "champion uniqueness index skipped: %s", exc)
         for column, declaration in (
                 ("qualified", "INTEGER DEFAULT 1"),
                 ("evidence_version", "TEXT DEFAULT 'legacy'"),

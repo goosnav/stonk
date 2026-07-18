@@ -128,9 +128,16 @@ def test_offline_gate_requires_profitable_folds_and_sealed_test():
                          for _ in range(5)]
     metrics.update(median_fold_ic_5d=.03, median_fold_ic_21d=.04)
     metrics["beats_baselines"] = True
+    # R1: the gate demands BOTH families on structured outputs
+    metrics["absolute"] = {str(h): {"correlation": .02,
+                                    "top_decile_alpha_after_cost": .005}
+                           for h in (5, 21)}
     assert neural._offline_gate(metrics)
+    metrics["absolute"]["21"]["top_decile_alpha_after_cost"] = -.001
+    assert not neural._offline_gate(metrics)       # absolute loses → no entry
+    metrics["absolute"]["21"]["top_decile_alpha_after_cost"] = .005
     metrics["21"]["top_decile_alpha_after_cost"] = -.001
-    assert not neural._offline_gate(metrics)
+    assert not neural._offline_gate(metrics)       # excess loses → no entry
 
 
 def test_tournament_selection_rewards_after_cost_rank_alpha():

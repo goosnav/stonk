@@ -210,11 +210,11 @@ def promote(store, version_id: str, *, reason: str = "promotion gates passed") -
         "SELECT id FROM graph_versions WHERE lifecycle_state='champion' AND id<>?",
         (version_id,)).fetchall()
     with store.db:
-        ml_lifecycle.transition(store, "graph_versions", version_id, "champion",
-                                reason=reason, in_tx=True)
-        for old in prior:
+        for old in prior:            # retire first: the unique champion index
             ml_lifecycle.transition(store, "graph_versions", old["id"], "retired",
                                     reason=f"superseded by {version_id}", in_tx=True)
+        ml_lifecycle.transition(store, "graph_versions", version_id, "champion",
+                                reason=reason, in_tx=True)
     store.audit("graph_champion_promoted", {"id": version_id, "reason": reason,
                                             "retired": [o["id"] for o in prior]})
 

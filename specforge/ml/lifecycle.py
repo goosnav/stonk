@@ -29,6 +29,32 @@ SERVING_STATES = ("champion", "production_candidate", "experimental_live")
 _STATUS_PROJECTION = {"champion": "champion", "incompatible": "incompatible",
                       "retired": "retired"}
 
+# R1: legal transitions only. None = legacy/new rows (backfill classification).
+# retired → champion exists solely for the champion-rollback restore path.
+ALLOWED_TRANSITIONS = {
+    None: {"training", "validation_candidate", "sealed_candidate",
+           "incompatible", "retired", "champion"},
+    "training": {"validation_candidate", "rejected", "incompatible", "retired"},
+    "validation_candidate": {"validation_winner", "sealed_candidate",
+                             "experimental_live", "rejected", "incompatible",
+                             "retired"},
+    "validation_winner": {"sealed_candidate", "rejected", "incompatible",
+                          "retired"},
+    "sealed_candidate": {"experimental_live", "rejected", "incompatible",
+                         "retired"},
+    "experimental_live": {"production_candidate", "champion", "rejected",
+                          "incompatible", "retired"},
+    "production_candidate": {"champion", "rejected", "incompatible", "retired"},
+    "champion": {"retired", "incompatible"},
+    "retired": {"champion"},
+    "rejected": {"incompatible", "retired"},
+    "incompatible": {"retired"},
+}
+
+
+class LifecycleError(ValueError):
+    """Illegal transition or lost compare-and-swap race."""
+
 
 def project_status(state: str) -> str:
     """Legacy `status` value for a lifecycle state (compatibility only)."""
@@ -51,11 +77,21 @@ def transition(store, model_table: str, model_id: str, new_state: str, *,
     if not row:
         raise ValueError(f"unknown model {model_id!r} in {model_table}")
     prior = row["lifecycle_state"]
+    if new_state not in ALLOWED_TRANSITIONS.get(prior, set()):
+        raise LifecycleError(
+            f"illegal transition {prior!r} → {new_state!r} for {model_id}")
     sets, args = ["lifecycle_state=?", "status=?"], [new_state, project_status(new_state)]
     if model_table == "model_runs" and permitted_blend is not None:
         sets.append("permitted_blend=?"); args.append(float(permitted_blend))
-    store.db.execute(f"UPDATE {model_table} SET {', '.join(sets)} WHERE id=?",
-                     args + [model_id])
+    # Compare-and-swap on the observed prior state: a concurrent transition
+    # between our read and this write loses exactly one of the two races.
+    cursor = store.db.execute(
+        f"UPDATE {model_table} SET {', '.join(sets)} "
+        f"WHERE id=? AND lifecycle_state IS ?",
+        args + [model_id, prior])
+    if cursor.rowcount != 1:
+        raise LifecycleError(
+            f"lost transition race on {model_id}: state changed from {prior!r}")
     keys = row.keys()
     store.db.execute(
         "INSERT INTO model_transitions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",

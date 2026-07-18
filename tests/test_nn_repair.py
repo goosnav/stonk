@@ -685,8 +685,13 @@ def test_smoke_end_to_end_dual_target(cfg, store):
                          "LIMIT 1").fetchone()
     assert r["realized_absolute"] is not None and r["realized_excess"] is not None
 
-    # 5) node computation via the real predict_today path (promote to champion)
-    neural.promote(cfg, store, run_id)
+    # 5) node computation via the real predict_today path — walking the LEGAL
+    # lifecycle ramp (R1): validation-only can no longer jump to champion, and
+    # predict_today serves experimental_live at its bounded permitted blend.
+    ml_lifecycle.transition(store, "model_runs", run_id, "sealed_candidate",
+                            reason="smoke: sealed evaluation stub")
+    ml_lifecycle.transition(store, "model_runs", run_id, "experimental_live",
+                            reason="smoke: offline gate stub", permitted_blend=0.15)
     node = _neural_node(cfg)
     events = node.compute(MarketContext(store, cfg))
     for e in events:                                       # may be empty; never malformed
@@ -996,13 +1001,20 @@ import json as _json
 from specforge.ml import lifecycle as ml_lifecycle
 
 
-def _passing_metrics(score=1.0, **over):
+def _passing_metrics(score=1.0, absolute_ok=True, **over):
     folds = [{"ic_5d": .02, "ic_21d": .03, "net_alpha_5d": .01,
               "net_alpha_21d": .01} for _ in range(5)]
     h = {"correlation": .03, "top_decile_alpha_after_cost": .01, "coverage": .8}
+    # R1: promotion demands BOTH families. absolute_ok=False models a model
+    # that ranks well on excess but LOSES money absolutely after costs.
+    a = (dict(h) if absolute_ok else
+         {"correlation": .04, "top_decile_alpha_after_cost": -.004, "coverage": .8})
     out = {"beats_baselines": True, "folds": folds,
            "median_fold_ic_5d": .02, "median_fold_ic_21d": .03,
-           "5": dict(h), "21": dict(h), "validation_selection_score": score,
+           "5": dict(h), "21": dict(h),
+           "absolute": {"5": dict(a), "21": dict(a),
+                        "evaluated_on": "structured_absolute_heads"},
+           "validation_selection_score": score,
            "evaluation_split": "sealed_test"}
     out.update(over)
     return out
@@ -1576,3 +1588,104 @@ def test_worker_config_loading_survives_poisoned_blob(cfg, store):
     cli_src = pathlib.Path("specforge/cli.py").read_text()
     assert "load_config_with_stored_overrides" in cli_src   # worker routes through it
     assert "load_config(cfg.mode, overrides=" not in cli_src  # raw path gone
+
+
+# ── R1: dual-family validation — the absolute head that trades must also be
+#        the evidence that promotes ─────────────────────────────────────────
+
+def test_positive_excess_negative_absolute_can_never_promote(cfg, store, promo):
+    # THE regression the R-plan demands: great excess rank, money-losing
+    # absolute after cost → offline gate refuses, model stays sealed_candidate.
+    _insert_run(store, "exc-only", "sealed_candidate", score=9.0,
+                metrics=_passing_metrics(9.0, absolute_ok=False))
+    out = neural.maybe_promote(cfg, store)
+    assert out["action"] in ("none", "shadow")
+    row = store.db.execute("SELECT lifecycle_state FROM model_runs "
+                           "WHERE id='exc-only'").fetchone()
+    assert row["lifecycle_state"] == "sealed_candidate"
+
+
+def test_offline_gate_fails_closed_without_absolute_block():
+    good = _passing_metrics()
+    assert neural._offline_gate(good)
+    legacy = dict(good); legacy.pop("absolute")       # pre-R1 metrics shape
+    assert not neural._offline_gate(legacy)
+    assert not neural._offline_gate(_passing_metrics(absolute_ok=False))
+
+
+def test_forward_gate_requires_resolved_absolute_v2_evidence(cfg, store, promo, monkeypatch):
+    _insert_run(store, "exp-1", "experimental_live", score=2.0)
+    rich_excess = {"sessions": 60, "horizons": {
+        "5": {"n": 20000, "ic": .05, "top_decile_alpha": .01, "coverage": .8},
+        "21": {"n": 20000, "ic": .05, "top_decile_alpha": .01, "coverage": .8}}}
+    # excess forward evidence alone — absolute v2 empty → must stay shadow
+    monkeypatch.setattr(neural, "shadow_metrics", lambda st, mid: {
+        **rich_excess, "absolute": {"5": {"n": 0}, "21": {"n": 0}}})
+    assert neural.maybe_promote(cfg, store)["action"] == "shadow"
+    # with resolved absolute evidence at both horizons → advances
+    monkeypatch.setattr(neural, "shadow_metrics", lambda st, mid: {
+        **rich_excess, "absolute": {"5": {"n": 400, "ic": .02},
+                                    "21": {"n": 400, "ic": .02}}})
+    assert neural.maybe_promote(cfg, store)["action"] == "production_candidate"
+
+
+def test_illegal_lifecycle_transitions_rejected(cfg, store, promo):
+    from specforge.ml.lifecycle import LifecycleError
+    _insert_run(store, "vc-1", "validation_candidate")
+    with pytest.raises(LifecycleError, match="illegal transition"):
+        ml_lifecycle.transition(store, "model_runs", "vc-1", "champion",
+                                reason="skip the queue")
+    _insert_run(store, "ret-1", "retired")
+    with pytest.raises(LifecycleError, match="illegal transition"):
+        ml_lifecycle.transition(store, "model_runs", "ret-1", "experimental_live",
+                                reason="zombie revival")
+    _insert_run(store, "ch-1", "champion")
+    with pytest.raises(LifecycleError, match="illegal transition"):
+        ml_lifecycle.transition(store, "model_runs", "ch-1", "training",
+                                reason="time travel")
+
+
+def test_transition_compare_and_swap_loses_race(cfg, store, promo):
+    from specforge.ml.lifecycle import LifecycleError
+    _insert_run(store, "race-1", "sealed_candidate")
+    real_execute = store.db.execute
+
+    def racing_execute(sql, *args):
+        if sql.startswith("UPDATE model_runs SET lifecycle_state"):
+            real_execute("UPDATE model_runs SET lifecycle_state='rejected' "
+                         "WHERE id='race-1'")   # competitor wins between read+write
+        return real_execute(sql, *args)
+
+    class RacingDB:                      # sqlite3.Connection attrs are read-only
+        def __init__(self, db): self._db = db
+        def __getattr__(self, name): return getattr(self._db, name)
+        def execute(self, sql, *args):
+            if sql.startswith("UPDATE model_runs SET lifecycle_state"):
+                self._db.execute("UPDATE model_runs SET lifecycle_state='rejected' "
+                                 "WHERE id='race-1'")
+            return self._db.execute(sql, *args)
+
+    class ShimStore:                     # Store.db is a read-only property
+        def __init__(self, real):
+            self.db = RacingDB(real.db)
+            self.audit = real.audit
+
+    with pytest.raises(LifecycleError, match="lost transition race"):
+        ml_lifecycle.transition(ShimStore(store), "model_runs", "race-1",
+                                "experimental_live", reason="racer")
+
+
+def test_champion_uniqueness_is_a_database_invariant(cfg, store):
+    import sqlite3 as _sq
+    _insert_run(store, "u-1", "champion")
+    with pytest.raises(_sq.IntegrityError):
+        store.db.execute("UPDATE model_runs SET lifecycle_state='champion' "
+                         "WHERE id=?", ("u-2",)) if False else \
+            _insert_run(store, "u-2", "champion")   # second champion same kind
+
+
+def test_v2_resolver_runs_in_research_loop_and_shadow_covers_finalists():
+    import pathlib
+    src = pathlib.Path("specforge/research.py").read_text()
+    assert "resolve_forecasts(store) + resolve_forecasts_v2(store)" in src
+    assert "'champion','production_candidate','experimental_live','sealed_candidate'" in src

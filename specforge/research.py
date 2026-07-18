@@ -1125,20 +1125,32 @@ def record_shadow_forecasts(cfg, store) -> int:
     # Shadow the newest challenger.  A champion is only the fallback: if
     # we always preferred it, challengers could never accumulate the
     # forward evidence required to replace it.
-    row = store.db.execute("SELECT id FROM model_runs WHERE kind='global_tcn' "
-                           "AND status IN ('champion','challenger') "
-                           "ORDER BY CASE status WHEN 'challenger' THEN 0 ELSE 1 END, "
-                           "created_at DESC LIMIT 1").fetchone()
-    if not row:
-        return 0
-    preds, meta = predict_run(cfg, store, MarketContext(store, cfg, symbols=syms),
-                              row["id"])
-    model_id = meta.get("model_id")
-    if not model_id:
+    # R1: EVERY prospective finalist accumulates forward evidence — the old
+    # newest-'challenger' pick let a fresh validation candidate starve an older
+    # finalist of the very observations promotion requires.
+    rows = store.db.execute(
+        "SELECT id FROM model_runs WHERE kind='global_tcn' AND symbol IS NULL "
+        "AND incompatibility_reason IS NULL AND lifecycle_state IN "
+        "('champion','production_candidate','experimental_live','sealed_candidate') "
+        "ORDER BY created_at DESC LIMIT 6").fetchall()
+    if not rows:
         return 0
     as_of = store.latest_bar_date(cfg.get("universe", "benchmark", default="SPY"))
-    fh, tsh = meta.get("feature_hash"), meta.get("target_schema_hash")
-    dmi = meta.get("dataset_manifest_id")
+    ctx = MarketContext(store, cfg, symbols=syms)
+    n = 0
+    for row in rows:
+        preds, meta = predict_run(cfg, store, ctx, row["id"])
+        model_id = meta.get("model_id")
+        if not model_id:
+            continue
+        fh, tsh = meta.get("feature_hash"), meta.get("target_schema_hash")
+        dmi = meta.get("dataset_manifest_id")
+        n += _record_model_shadow(store, preds, model_id, as_of, fh, tsh, dmi)
+    if n: store.audit("shadow_forecasts_recorded", {"models": len(rows), "count": n})
+    return n
+
+
+def _record_model_shadow(store, preds, model_id, as_of, fh, tsh, dmi) -> int:
     n = 0
     with store.db:
         for sym, hs in preds.items():
@@ -1152,7 +1164,6 @@ def record_shadow_forecasts(cfg, store) -> int:
                 record_forecast_v2(store, nf, model_id=model_id, as_of=as_of,
                                    feature_hash=fh, target_schema_hash=tsh,
                                    dataset_manifest_id=dmi)
-    if n: store.audit("shadow_forecasts_recorded", {"model": model_id, "count": n})
     return n
 
 
@@ -1382,7 +1393,7 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
         if (store.kv_get("universe_status") or {}).get("as_of") != newest:
             _stamp(store, "universe", "ranking research and active tiers")
             return {"task": "universe", **refresh_membership(cfg, store, newest)}
-        n = resolve_forecasts(store)
+        n = resolve_forecasts(store) + resolve_forecasts_v2(store)
         if n:
             _stamp(store, "resolve", f"resolved {n} matured forecasts")
             return {"task": "resolve", "count": n}

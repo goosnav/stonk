@@ -56,3 +56,10 @@ that currently grants it permission."
 
 ## Status log
 - 2026-07-17 R0: in progress this session.
+- 2026-07-17 R1 DONE (332 tests): joint dual-family early-stop; absolute
+  metrics first-class in sealed/tournament eval; _offline_gate + forward gate
+  require BOTH families (fail closed on legacy metrics); resolve_forecasts_v2
+  wired into the research unit; shadow recorder covers ALL finalists;
+  lifecycle = strict state machine (adjacency map, CAS, one-champion DB
+  uniqueness, retire-before-crown). Remainder → fold-internal structured
+  migration + per-family baselines tracked in R6.
