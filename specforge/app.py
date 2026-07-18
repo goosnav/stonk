@@ -70,49 +70,11 @@ def _job_summary(job: dict) -> dict:
 
 
 def current_config(store: Store, mode: str):
-    overrides = store.kv_get(OVERRIDES_KEY, {}) or {}
-    try:
-        return load_config(mode, overrides=overrides)
-    except ConfigError as e:
-        # D38/E2: the GUI kv blob may hold values validate() now refuses
-        # (e.g. GUI-set 70% single-position that the removed advanced_override
-        # used to bless globally). Per-key pruning: drop ONLY the offending
-        # dangerous keys (and the removed advanced_override flag) and keep the
-        # user's safe settings — node toggles, AI routing — instead of
-        # discarding the whole blob. Never take the server down over config.
-        import copy as _copy
-
-        from .config import _DANGEROUS
-        pruned = _copy.deepcopy(overrides)
-        removed = []
-        if pruned.pop("advanced_override", None) is not None:
-            removed.append("advanced_override")
-        for path, pred, _msg in _DANGEROUS:
-            node = pruned
-            for key in path[:-1]:
-                node = node.get(key) if isinstance(node, dict) else None
-                if node is None:
-                    break
-            if isinstance(node, dict) and path[-1] in node:
-                try:
-                    dangerous = pred(node[path[-1]])
-                except TypeError:
-                    dangerous = True
-                if dangerous:
-                    removed.append(".".join(path))
-                    del node[path[-1]]
-        # Audit once per distinct rejection, not once per request (the health
-        # feed polls continuously; 2026-07-17 spammed 400+ identical rows).
-        marker = {"mode": mode, "error": str(e), "removed_keys": removed}
-        if store.kv_get("config_override_rejected_last") != marker:
-            store.kv_set("config_override_rejected_last", marker)
-            store.audit("config_override_rejected", marker)
-        if removed:
-            try:
-                return load_config(mode, overrides=pruned)
-            except ConfigError:
-                pass                      # still bad → safe file config below
-        return load_config(mode)
+    """Config + GUI kv overrides via the ONE shared tolerant loader (see
+    config.load_config_with_stored_overrides) so the app and the worker
+    subprocesses can never diverge on how a bad blob degrades."""
+    from .config import load_config_with_stored_overrides
+    return load_config_with_stored_overrides(mode, store)
 
 
 def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:

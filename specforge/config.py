@@ -122,6 +122,55 @@ def _exception_covers(configured, approved) -> bool:
         return configured == approved
 
 
+def prune_dangerous_overrides(overrides: dict) -> tuple[dict, list[str]]:
+    """Drop ONLY the keys validate() would refuse (plus the removed
+    advanced_override flag); keep every safe operator setting."""
+    pruned = copy.deepcopy(overrides)
+    removed: list[str] = []
+    if pruned.pop("advanced_override", None) is not None:
+        removed.append("advanced_override")
+    for path, pred, _msg in _DANGEROUS:
+        node = pruned
+        for key in path[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and path[-1] in node:
+            try:
+                dangerous = pred(node[path[-1]])
+            except TypeError:
+                dangerous = True
+            if dangerous:
+                removed.append(".".join(path))
+                del node[path[-1]]
+    return pruned, removed
+
+
+def load_config_with_stored_overrides(mode: str, store) -> "Config":
+    """THE loader for config + the GUI kv override blob — used by the app AND
+    every worker subprocess. A blob the validator refuses must degrade the
+    same way everywhere: prune only the offending keys, keep the operator's
+    safe settings, fall back to the committed file config, and never crash
+    the process. (2026-07-17 incident: cmd_worker bypassed the app's pruning,
+    died on spawn, and stranded every operator job in QUEUED.)"""
+    overrides = store.kv_get(OVERRIDES_KEY, {}) or {}
+    try:
+        return load_config(mode, overrides=overrides)
+    except ConfigError as e:
+        pruned, removed = prune_dangerous_overrides(overrides)
+        # audit once per distinct rejection — the health feed polls constantly
+        marker = {"mode": mode, "error": str(e), "removed_keys": removed}
+        if store.kv_get("config_override_rejected_last") != marker:
+            store.kv_set("config_override_rejected_last", marker)
+            store.audit("config_override_rejected", marker)
+        if removed:
+            try:
+                return load_config(mode, overrides=pruned)
+            except ConfigError:
+                pass
+        return load_config(mode)
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in (overlay or {}).items():

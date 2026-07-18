@@ -106,8 +106,8 @@ def cmd_research(args, cfg, store):
 
 def cmd_worker(args, cfg, store):
     """Internal one-shot worker used by the scheduler's process boundary."""
-    from .config import OVERRIDES_KEY
-    cfg = load_config(cfg.mode, overrides=store.kv_get(OVERRIDES_KEY, {}) or {})
+    from .config import load_config_with_stored_overrides
+    cfg = load_config_with_stored_overrides(cfg.mode, store)
     try:
         os.nice(10)
     except (AttributeError, OSError):

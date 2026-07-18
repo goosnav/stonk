@@ -1554,3 +1554,18 @@ def test_gui_overrides_pruned_per_key_not_discarded(cfg, store):
     current_config(store, "paper")
     assert len([a for a in store.audit_rows()
                 if a["event_type"] == "config_override_rejected"]) == 1
+
+
+def test_worker_config_loading_survives_poisoned_blob(cfg, store):
+    # The exact 2026-07-17 worker crash: kv blob with a now-refused value must
+    # load (pruned) through the SHARED loader — the same one cmd_worker uses.
+    from specforge.config import load_config_with_stored_overrides
+    store.kv_set("config_overrides", {"risk": {"max_single_equity_position": 0.7},
+                                      "nodes": {"insider": {"enabled": True}}})
+    c = load_config_with_stored_overrides("paper", store)
+    assert c.get("risk", "max_single_equity_position") <= 0.25
+    assert c.get("nodes", "insider", "enabled") is True
+    import pathlib
+    cli_src = pathlib.Path("specforge/cli.py").read_text()
+    assert "load_config_with_stored_overrides" in cli_src   # worker routes through it
+    assert "load_config(cfg.mode, overrides=" not in cli_src  # raw path gone
