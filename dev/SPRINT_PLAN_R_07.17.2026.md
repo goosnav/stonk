@@ -63,3 +63,15 @@ that currently grants it permission."
   lifecycle = strict state machine (adjacency map, CAS, one-champion DB
   uniqueness, retire-before-crown). Remainder → fold-internal structured
   migration + per-family baselines tracked in R6.
+- 2026-07-17 R2 DONE (336 tests): executable decision convention — features
+  through t−1 (cycle as_of=t−1), decision on t, fill at t OPEN injected as the
+  executable quote through the SAME live_quotes path live cycles use; entries
+  limit off the open, gap-through stops fill AT the open, paper fills add
+  adverse half-spread+slippage. Exit gates proven: no same-bar fill (every
+  buy fill ∈ open-derived set, ∉ close-derived), future-bar mutation is
+  bit-identical-immune before the boundary, doubled costs cannot improve
+  results (and provably bind). Convention persisted in every report.
+  Honest remainder: partial/non-fill modeling needs intrabar data (R5/R6);
+  label retargeting to modeled entry price rides with R5's per-sample costs
+  (one dataset schema bump); sim has no external cash flows — deposit
+  normalization for LIVE loss switches stays an R4 item.

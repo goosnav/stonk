@@ -47,7 +47,8 @@ def _seed_backtest_db(src_path: str, bt_path: Path) -> Store:
 
 def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "research",
                  copy_analogs_to: Store | None = None, log=print,
-                 out_dir: Path | None = None) -> dict:
+                 out_dir: Path | None = None,
+                 max_sessions: int | None = None) -> dict:
     src_db = cfg.get("db_path", default="data/specforge.db")
     if scale not in ("live", "research"):
         raise ValueError("scale must be live or research")
@@ -80,15 +81,35 @@ def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "resea
         dates = all_dates[WARMUP_BARS:]           # ensure indicator warmup
     if not dates:
         return {"error": "not enough history — run `stonk data --full` first"}
+    if max_sessions:
+        dates = dates[:max_sessions]          # bounded runs (tests/smokes)
 
     registry = build_registry(bt_cfg)             # build once, reuse across days
     from .broker.paper import PaperBroker
     broker = PaperBroker(bt_cfg, bt)
 
-    log(f"backtest[{tag}]: {dates[0]} → {dates[-1]} ({len(dates)} sessions)")
-    for i, d in enumerate(dates):
-        run_cycle(bt_cfg, bt, broker=broker, as_of=d, refresh_data=False,
-                  registry=registry, log=lambda *a: None)
+    # R2 executable decision convention — mirrors the live design exactly:
+    #   features/settled bars through session t−1
+    #   → decision on session t (cycle as_of = t−1: MarketContext can only
+    #     see bars <= t−1, so session t's own bar can never leak into signals)
+    #   → execution at session t's OPEN, injected as the executable quote the
+    #     same way live cycles inject delayed intraday quotes (live_quotes).
+    # Entries limit off the t open, exits/stops price off the t open
+    # (gap-through: a stop breached by an opening gap fills AT the open, not
+    # at the stop), and the paper broker marks positions at the same quote.
+    opens: dict[str, dict[str, float]] = {}
+    for row in bt.db.execute(
+            "SELECT symbol, d, open FROM bars WHERE d>=? AND d<=?",
+            (dates[0], dates[-1])):
+        if row["open"]:
+            opens.setdefault(row["d"], {})[row["symbol"]] = float(row["open"])
+
+    log(f"backtest[{tag}]: {dates[0]} → {dates[-1]} ({len(dates)} sessions, "
+        "features t−1 → fill at t open)")
+    for i, d in enumerate(dates[1:], start=1):
+        run_cycle(bt_cfg, bt, broker=broker, as_of=dates[i - 1],
+                  refresh_data=False, registry=registry,
+                  live_quotes=opens.get(d, {}), log=lambda *a: None)
         if i % 250 == 0:
             eq = bt.equity_curve("paper")
             log(f"  {d}: equity ${eq[-1]['equity']:.0f}" if eq else f"  {d}")
@@ -97,7 +118,10 @@ def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "resea
     _liquidate(bt, bt_cfg, broker, dates[-1])
 
     report = _report(bt, bt_cfg, dates, years, tag)
-    report.update(scale=scale, starting_cash=starting_cash)
+    report.update(scale=scale, starting_cash=starting_cash,
+                  decision_convention="features<=t-1; decide t; fill at t open "
+                                      "(injected executable quote); gap-through "
+                                      "stops fill at the open")
     reports_dir = Path(out_dir) if out_dir else Path("dev/reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     (reports_dir / f"backtest_{tag}_{scale}.json").write_text(

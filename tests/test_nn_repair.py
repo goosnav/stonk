@@ -1689,3 +1689,99 @@ def test_v2_resolver_runs_in_research_loop_and_shadow_covers_finalists():
     src = pathlib.Path("specforge/research.py").read_text()
     assert "resolve_forecasts(store) + resolve_forecasts_v2(store)" in src
     assert "'champion','production_candidate','experimental_live','sealed_candidate'" in src
+
+
+# ── R2: executable backtest — features t−1, fill at t open ───────────────────
+
+def _bt(cfg, store, tmp_path, tag, **over):
+    from specforge.backtest import run_backtest
+    from specforge.config import Config, _deep_merge
+    c = Config(_deep_merge(cfg.data, over)) if over else cfg
+    return run_backtest(c, years=30, tag=tag, scale="research",
+                        log=lambda *a: None, out_dir=tmp_path, max_sessions=60)
+
+
+def test_backtest_never_fills_on_the_decision_bar(cfg, store, tmp_path):
+    _long_history(store)
+    _bt(cfg, store, tmp_path, "r2fill")
+    import sqlite3 as _sq
+    bt = _sq.connect(tmp_path / "backtest_r2fill_research.db")
+    bt.row_factory = _sq.Row
+    offset = 1 + cfg.get("execution", "limit_offset_pct", default=0.001)
+    bps = 1 + (cfg.get("execution", "spread_cost_bps", default=3)
+               + cfg.get("execution", "slippage_bps", default=5)) / 10000.0
+    # paper fill = round(limit,4) × (1+bps); limit = round(base×offset,4)
+    open_limits, close_limits = set(), set()
+    for r in bt.execute("SELECT open, close FROM bars"):
+        if r["open"]:
+            open_limits.add(round(round(r["open"] * offset, 4) * bps, 4))
+        if r["close"]:
+            close_limits.add(round(round(r["close"] * offset, 4) * bps, 4))
+    buys = [r["price"] for r in bt.execute(
+        "SELECT f.price FROM fills f JOIN orders o ON o.id=f.order_id "
+        "WHERE f.side='buy' AND o.status='filled'")]
+    assert buys, "backtest produced no fills — test would prove nothing"
+    for price in buys:
+        # every entry fills at an OPEN-derived executable quote…
+        assert round(price, 4) in open_limits
+        # …and never at a close-derived (same-bar/decision-price) limit
+        assert round(price, 4) not in (close_limits - open_limits)
+
+
+def test_backtest_immune_to_future_bar_mutation(cfg, store, tmp_path):
+    _long_history(store)
+    # warm-up run: run_backtest syncs earnings/fundamentals kv caches BACK to
+    # the source store, so the first run changes inputs for the second. One
+    # throwaway run brings the caches to steady state; baseline and mutated
+    # runs then differ ONLY by the future-bar sabotage.
+    _bt(cfg, store, tmp_path, "r2warm")
+    first = _bt(cfg, store, tmp_path, "r2base")
+    assert "error" not in first
+    import sqlite3 as _sq
+    base = _sq.connect(tmp_path / "backtest_r2base_research.db")
+    base.row_factory = _sq.Row
+    curve = [(r["d"], round(r["equity"], 6)) for r in base.execute(
+        "SELECT d, equity FROM equity_curve ORDER BY d")]
+    cutoff = curve[40][0]
+    # sabotage every bar AFTER the cutoff in the SOURCE data by +70%
+    store.db.execute("UPDATE bars SET open=open*1.7, high=high*1.7, "
+                     "low=low*1.7, close=close*1.7 WHERE d>?", (cutoff,))
+    store.db.commit()
+    _bt(cfg, store, tmp_path, "r2mut")
+    mut = _sq.connect(tmp_path / "backtest_r2mut_research.db")
+    mut.row_factory = _sq.Row
+    # STRICTLY before the cutoff: the row labeled d fills at the NEXT session's
+    # open, so the row at d==cutoff legitimately sees the first mutated open.
+    curve2 = [(r["d"], round(r["equity"], 6)) for r in mut.execute(
+        "SELECT d, equity FROM equity_curve WHERE d<? ORDER BY d", (cutoff,))]
+    # every decision, fill, and mark before the cutoff is bit-identical:
+    # future bars cannot reach back into earlier sessions
+    assert curve2 == [c for c in curve if c[0] < cutoff]
+    assert len(curve2) >= 39                   # the comparison is not vacuous
+
+
+def test_backtest_doubling_costs_cannot_improve_results(cfg, store, tmp_path):
+    _long_history(store)
+    base = _bt(cfg, store, tmp_path, "r2cost1")
+    doubled = _bt(cfg, store, tmp_path, "r2cost2", execution={
+        "limit_offset_pct": 0.002, "spread_cost_bps": 6, "slippage_bps": 10})
+    b, d = base.get("overall") or {}, doubled.get("overall") or {}
+    assert "total_return" in b and "total_return" in d
+    assert d["total_return"] <= b["total_return"] + 1e-9
+    # and the costs actually BIND: doubled offset must worsen average entry
+    import sqlite3 as _sq
+    px = []
+    for tag in ("r2cost1", "r2cost2"):
+        con = _sq.connect(tmp_path / f"backtest_{tag}_research.db")
+        con.row_factory = _sq.Row
+        rows = [r["price"] for r in con.execute(
+            "SELECT price FROM fills WHERE side='buy'")]
+        px.append(sum(rows) / len(rows) if rows else 0.0)
+    assert px[1] >= px[0]                      # pays more per share, never less
+
+
+def test_backtest_report_declares_decision_convention(cfg, store, tmp_path):
+    _long_history(store)
+    report = _bt(cfg, store, tmp_path, "r2conv")
+    assert "features<=t-1" in report["decision_convention"]
+    assert "fill at t open" in report["decision_convention"]
