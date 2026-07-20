@@ -222,7 +222,7 @@ FEATURE_FAMILIES = {
 }
 
 
-def ablate(ds, eval_idx, family: str = "absolute", model: str = "ridge",
+def ablate(ds, eval_idx, family: str = "absolute", model: str | None = None,
            families=None) -> dict:
     """Policy-return cost of removing each feature family, one at a time.
 
@@ -237,6 +237,16 @@ def ablate(ds, eval_idx, family: str = "absolute", model: str = "ridge",
     from .. import neural
     families = families or FEATURE_FAMILIES
     context = context_design(ds)
+    if model is None:
+        # Ablate the STRONGEST control, not a hardcoded one. Knocking a family
+        # out of a weaker model understates its value: elastic-net scored +0.805
+        # where ridge scored +0.683, so ridge's deltas describe a model nobody
+        # would use.
+        scored = {name: policy_return(prediction, ds, eval_idx, family)
+                  ["policy_utility"]
+                  for name, prediction in simple_predictions(
+                      ds, family, ("ridge", "elastic_net", "boosted_tree")).items()}
+        model = max(scored, key=scored.get)
     train_mean = context[ds["masks"]["train"]].mean(0)
     full = policy_return(simple_predictions(ds, family, (model,), context)[model],
                          ds, eval_idx, family)

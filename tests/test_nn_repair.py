@@ -2923,3 +2923,19 @@ def test_trial_grid_reaches_the_regularization_the_evidence_asks_for():
     assert any(t.get("feature_dropout", 0) == 0 for t in neural.TRIAL_SPECS)
     for spec in neural.TRIAL_SPECS:     # every spec is fully specified
         assert set(spec) == {"lr", "weight_decay", "rank_weight", "feature_dropout"}
+
+
+def test_ablation_uses_the_strongest_control_not_a_hardcoded_one():
+    """Knocking a family out of a weaker model understates its value."""
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    auto = bakeoff.ablate(ds, eval_idx, "absolute")
+    assert auto["ablated_model"] in ("ridge", "elastic_net", "boosted_tree")
+    scored = {name: bakeoff.policy_return(p, ds, eval_idx, "absolute")["policy_utility"]
+              for name, p in bakeoff.simple_predictions(
+                  ds, "absolute", ("ridge", "elastic_net", "boosted_tree")).items()}
+    assert auto["ablated_model"] == max(scored, key=scored.get)
+    # An explicit choice is still honoured.
+    assert bakeoff.ablate(ds, eval_idx, "absolute", model="ridge")["ablated_model"] \
+        == "ridge"
