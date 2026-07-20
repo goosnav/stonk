@@ -314,23 +314,41 @@ def compare(ds, eval_idx, tcn_predictions: dict[str, np.ndarray] | None = None,
     for family in families:
         entries = {name: policy_return(pred, ds, eval_idx, family)
                    for name, pred in simple_predictions(ds, family, models).items()}
+        raw_seeds = (tcn_predictions or {}).get(family, {})
         seeds = {name: policy_return(pred, ds, eval_idx, family)
-                 for name, pred in (tcn_predictions or {}).get(family, {}).items()}
+                 for name, pred in raw_seeds.items()}
+        # The deployable artifact is the ENSEMBLE, not one arbitrary draw. Seed
+        # spread exceeded the median seed's own utility in the first real run,
+        # which is exactly the variance an average removes. Scored alongside the
+        # individual seeds so the gain (or absence of one) is visible.
+        ensemble = None
+        if len(raw_seeds) > 1:
+            mean_prediction = np.mean([np.asarray(p) for p in raw_seeds.values()],
+                                      axis=0)
+            ensemble = policy_return(mean_prediction, ds, eval_idx, family)
         best_control = max((e["policy_utility"] for e in entries.values()),
                            default=-1.0)
         summary = {"controls": entries, "best_control_utility": best_control,
-                   "seeds": seeds}
+                   "seeds": seeds, "ensemble": ensemble}
         if seeds:
             utilities = sorted(e["policy_utility"] for e in seeds.values())
             median = float(np.median(utilities))
+            # The gate reads the ensemble when there is one, else the median
+            # seed — never the best seed, which is a lucky draw dressed up as
+            # ability. The ensemble is a legitimate model, not cherry-picking:
+            # it is fixed before seeing the scores and is what would ship.
+            decisive = (ensemble["policy_utility"] if ensemble is not None
+                        else median)
             summary.update(
                 tcn_median_utility=round(median, 5),
                 tcn_best_utility=round(utilities[-1], 5),
                 tcn_worst_utility=round(utilities[0], 5),
                 tcn_seed_spread=round(utilities[-1] - utilities[0], 5),
+                tcn_ensemble_utility=(round(ensemble["policy_utility"], 5)
+                                      if ensemble is not None else None),
                 n_seeds=len(utilities),
-                # The comparison the gate reads. Median seed, strict inequality.
-                beats_controls=bool(median > best_control))
+                decisive_utility=round(decisive, 5),
+                beats_controls=bool(decisive > best_control))
         else:
             summary.update(n_seeds=0, beats_controls=False)
         table[family] = summary

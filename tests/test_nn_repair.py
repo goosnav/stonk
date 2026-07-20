@@ -2807,3 +2807,85 @@ def test_candidate_cohort_matrix_columns_are_the_real_alternatives():
     thin_idx = np.flatnonzero(thin["masks"]["test"])
     empty, _ = bakeoff.candidate_cohort_matrix(thin, thin_idx, "absolute")
     assert empty.size == 0
+
+
+def test_gate_scores_the_ensemble_not_the_luckiest_seed():
+    """The deployable artifact is the average of the seeds, not one draw.
+
+    In the first real run the seed spread (0.276) exceeded the TCN's own median
+    utility — exactly the variance an ensemble removes.
+    """
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    truth = ds["Y_absolute"]
+    rng = np.random.default_rng(11)
+    # Three noisy-but-informative seeds: each alone is weak, the average is not.
+    noisy = {f: {f"tcn_seed_{i}": truth + rng.normal(scale=.03, size=truth.shape)
+                 for i in range(3)} for f in bakeoff.FAMILIES}
+    result = bakeoff.compare(ds, eval_idx, noisy)
+    a = result["absolute"]
+    assert a["ensemble"] is not None
+    assert a["tcn_ensemble_utility"] is not None
+    assert a["decisive_utility"] == a["tcn_ensemble_utility"]
+    # Averaging independent noise must not do worse than the typical seed.
+    assert a["tcn_ensemble_utility"] >= a["tcn_median_utility"]
+    # A single seed has no ensemble; the median still decides, and the BEST
+    # seed never does.
+    one = {f: {"tcn_seed_0": truth} for f in bakeoff.FAMILIES}
+    single = bakeoff.compare(ds, eval_idx, one)["absolute"]
+    assert single["ensemble"] is None
+    assert single["decisive_utility"] == single["tcn_median_utility"]
+
+
+def test_one_brilliant_seed_still_cannot_carry_an_ensemble():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    truth = ds["Y_absolute"]
+    strong = truth + np.random.default_rng(1).normal(scale=.001, size=truth.shape)
+    junk = np.random.default_rng(2).normal(scale=.05, size=truth.shape)
+    lucky = {f: {"tcn_seed_0": strong, "tcn_seed_1": junk, "tcn_seed_2": junk}
+             for f in bakeoff.FAMILIES}
+    result = bakeoff.compare(ds, eval_idx, lucky)
+    assert result["absolute"]["tcn_best_utility"] > \
+        result["absolute"]["decisive_utility"]
+    assert result["verdict"] is False
+
+
+def test_linear_skip_lets_the_network_represent_a_linear_model():
+    """The TCN saw 60x44 and scored +0.172 where ridge on ONE session scored
+    +0.683. A model with strictly more information should not lose to a linear
+    map of a subset of it. The skip makes a linear model representable exactly,
+    so the deep branches only have to learn the residual."""
+    import torch
+    from specforge import neural
+    model = neural._make_model(len(neural.FEATURES), 2)
+    model.eval()          # dropout is stochastic in train mode; isolate the skip
+    x = torch.randn(8, 60, len(neural.FEATURES))
+
+    # Zero-initialized: the skip must start as a no-op, so training begins from
+    # the previous architecture's behaviour rather than a random linear shift.
+    assert torch.allclose(model.skip.weight, torch.zeros_like(model.skip.weight))
+    baseline = model.forward_structured(x).absolute_quantiles.detach().clone()
+
+    # Give the skip a real weight; the median must move by exactly that amount.
+    with torch.no_grad():
+        model.skip.weight.normal_(0, .01)
+        model.skip.bias.normal_(0, .01)
+    shifted = model.forward_structured(x)
+    excess_skip, absolute_skip = model.skips(x)
+    assert torch.allclose(shifted.absolute_quantiles[..., 1],
+                          baseline[..., 1] + absolute_skip, atol=1e-5)
+    # Quantile ordering must survive the shift.
+    q = shifted.absolute_quantiles.detach().numpy()
+    assert (q[..., 0] <= q[..., 1]).all() and (q[..., 1] <= q[..., 2]).all()
+    # Each family gets its own offset — the skip is not shared between them.
+    assert not torch.allclose(excess_skip, absolute_skip)
+
+
+def test_architecture_hash_changed_with_the_skip():
+    """A silent architecture change would load old weights into a new model."""
+    from specforge import neural
+    stale = "8bd6be6dbb6f5b1e"          # v8, pre-skip
+    assert neural.ARCHITECTURE_HASH != stale

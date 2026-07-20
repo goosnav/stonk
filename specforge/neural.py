@@ -76,8 +76,9 @@ CONTEXT_HASH = hashlib.sha256("|".join(CONTEXT_FEATURES).encode()).hexdigest()[:
 MODEL_SCHEMA = 6           # dual-target (absolute+excess) dual-branch checkpoints
 FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
-    b"tcn-v8:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
-    b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated"
+    b"tcn-v9:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
+    b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated:"
+    b"linear-skip-to-median"          # v9: zero-init linear path over FEATURES
 ).hexdigest()[:16]
 
 TRIAL_SPECS = (
@@ -608,6 +609,22 @@ def _make_model(n_features: int, n_horizons: int,
                                         CausalBlock(32, 32, 16))
             self.context = nn.Sequential(nn.Linear(len(context_idx), 16), nn.GELU(),
                                          nn.Dropout(.1))
+            # Linear skip: the latest session's FULL feature row goes straight
+            # to the median of every head, bypassing both branches.
+            #
+            # The measured failure this addresses: given 60 sessions x 44
+            # features the network scored +0.172 net OOS policy utility while
+            # ridge on ONE session scored +0.683. A model with strictly more
+            # information should not lose to a linear map of a subset of it.
+            # With this path the network can reproduce a linear model exactly
+            # (zero out the deep branches) and has to learn only the RESIDUAL,
+            # so nonlinearity is added where it helps instead of having to be
+            # rediscovered from scratch. Initialized at zero so training starts
+            # from the deep model's behaviour and grows the linear term only if
+            # it reduces loss.
+            self.skip = nn.Linear(len(FEATURES), 2 * n_horizons)
+            nn.init.zeros_(self.skip.weight); nn.init.zeros_(self.skip.bias)
+            self.n_horizons = n_horizons
             # Dual return families, one quantile + one probability head per
             # horizon each. Absolute and excess are separate heads so the node
             # can read a genuine absolute forecast, not excess reinterpreted.
@@ -627,13 +644,19 @@ def _make_model(n_features: int, n_horizons: int,
             temporal = self.blocks(temporal_in)[..., -1]
             return torch.cat((temporal, self.context(x[:, -1, self.context_idx])), dim=1)
 
-        @staticmethod
-        def _quantiles(z, heads):
+        def _quantiles(self, z, heads, offset=None):
             raw = torch.stack([head(z) for head in heads], dim=1)
             q50 = raw[..., 1]
+            if offset is not None:
+                q50 = q50 + offset        # linear skip shifts the median only
             q10 = q50 - torch.nn.functional.softplus(raw[..., 0])
             q90 = q50 + torch.nn.functional.softplus(raw[..., 2])
             return torch.stack((q10, q50, q90), dim=-1)
+
+        def skips(self, x):
+            """(excess_offset, absolute_offset), one per horizon each."""
+            linear = self.skip(x[:, -1, :])
+            return linear[:, :self.n_horizons], linear[:, self.n_horizons:]
 
         @staticmethod
         def _probs(z, heads):
@@ -642,9 +665,12 @@ def _make_model(n_features: int, n_horizons: int,
         def forward_structured(self, x):
             """Full dual-family output from one encoder pass."""
             z = self.encoded(x)
+            excess_skip, absolute_skip = self.skips(x)
             return NeuralModelOutput(
-                absolute_quantiles=self._quantiles(z, self.absolute_quantile_heads),
-                excess_quantiles=self._quantiles(z, self.excess_quantile_heads),
+                absolute_quantiles=self._quantiles(
+                    z, self.absolute_quantile_heads, absolute_skip),
+                excess_quantiles=self._quantiles(
+                    z, self.excess_quantile_heads, excess_skip),
                 probability_absolute_edge_positive=self._probs(
                     z, self.absolute_probability_heads),
                 probability_excess_positive=self._probs(
@@ -655,14 +681,17 @@ def _make_model(n_features: int, n_horizons: int,
             unmigrated consumers (inference, calibration, metrics) read this
             until B4C migrates them to forward_structured."""
             z = self.encoded(x)
-            return (self._quantiles(z, self.excess_quantile_heads),
+            return (self._quantiles(z, self.excess_quantile_heads,
+                                    self.skips(x)[0]),
                     self._probs(z, self.excess_probability_heads))
 
         def forward_legacy_excess(self, x):
-            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads,
+                                   self.skips(x)[0])
 
         def forward(self, x):
-            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads,
+                                   self.skips(x)[0])
 
         def probability(self, x):
             return self._probs(self.encoded(x), self.excess_probability_heads)
@@ -976,7 +1005,13 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
     import torch
     trial_spec = trial_spec or TRIAL_SPECS[0]
     device = _training_device(cfg, torch)
-    epochs = epochs or int(cfg.get("neural", "bakeoff_epochs", default=6))
+    # Early stopping on the validation split, NOT a fixed epoch count. The
+    # controls this model is compared against (ridge, elastic-net, boosted
+    # stumps) are all fit to convergence, so training the network for a handful
+    # of epochs measured undertraining and reported it as architecture. That is
+    # a defect in the comparison, not evidence about the model.
+    epochs = epochs or int(cfg.get("neural", "bakeoff_epochs", default=40))
+    patience = int(cfg.get("neural", "bakeoff_patience", default=4))
     horizons = list(ds["horizons"])
     train_mask = ds["masks"]["train"]
     X = torch.from_numpy(np.asarray(ds["X"], dtype=np.float32))
@@ -990,6 +1025,7 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
         ds.get("sample_cost", np.full(len(ds["dates"]), ds.get("round_trip_cost", .0016))),
         dtype=np.float32)).unsqueeze(1)
     rows = np.flatnonzero(train_mask)
+    validation_rows = np.flatnonzero(ds["masks"]["val"])
     started = time.monotonic()
     out: dict[str, dict[str, np.ndarray]] = {"absolute": {}, "excess": {}}
     for seed in range(seeds):
@@ -1001,21 +1037,46 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         bce = torch.nn.functional.binary_cross_entropy
+
+        def objective(idx, out):
+            return (_pinball(out.excess_quantiles, Y_e[idx].to(device))
+                    + _pinball(out.absolute_quantiles, Y_a[idx].to(device))
+                    + .1 * bce(out.probability_excess_positive,
+                               (raw_e[idx].to(device) > 0).float())
+                    + .1 * bce(out.probability_absolute_edge_positive,
+                               (raw_a[idx].to(device) > cost[idx].to(device)).float()))
+
+        best_state, best_loss, stale = None, float("inf"), 0
         for _ in range(epochs):
             model.train()
             for batch in date_grouped_batches(ds["dates"], rows, 512, rng):
                 idx = torch.from_numpy(batch)
                 opt.zero_grad()
-                result = model.forward_structured(X[idx].to(device))
-                loss = (_pinball(result.excess_quantiles, Y_e[idx].to(device))
-                        + _pinball(result.absolute_quantiles, Y_a[idx].to(device))
-                        + .1 * bce(result.probability_excess_positive,
-                                   (raw_e[idx].to(device) > 0).float())
-                        + .1 * bce(result.probability_absolute_edge_positive,
-                                   (raw_a[idx].to(device) > cost[idx].to(device)).float()))
+                loss = objective(idx, model.forward_structured(X[idx].to(device)))
                 loss.backward(); opt.step()
                 if max_seconds is not None and time.monotonic() - started >= max_seconds:
                     break
+            # Validation on the SAME joint objective the model is trained on.
+            model.eval()
+            total, rows_seen = 0.0, 0
+            with torch.no_grad():
+                for chunk in torch.from_numpy(validation_rows).split(4096):
+                    value = objective(chunk, model.forward_structured(
+                        X[chunk].to(device)))
+                    total += float(value) * len(chunk); rows_seen += len(chunk)
+            current = total / max(1, rows_seen)
+            if current < best_loss - 1e-5:
+                best_loss, stale = current, 0
+                best_state = {k: v.detach().clone()
+                              for k, v in model.state_dict().items()}
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                break
+        if best_state is not None:
+            model.load_state_dict(best_state)     # the epoch that generalized best
         abs_pred, _, exc_pred, _ = _predict_structured(
             model, X, eval_idx, scale_e, scale_a, device)
         for family, pred in (("absolute", abs_pred), ("excess", exc_pred)):
