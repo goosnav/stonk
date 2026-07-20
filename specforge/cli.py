@@ -104,6 +104,37 @@ def cmd_research(args, cfg, store):
                          indent=2, default=str))
 
 
+def cmd_bars_audit(args, cfg, store):
+    """Report — and optionally repair — adjustment seams in the bars table.
+
+    Report-only by default on purpose: a repair rewrites stored price history,
+    so the operator should see what would change before it does.
+    """
+    from . import bars_audit
+    report = bars_audit.audit(store, symbols=args.symbols, repair=args.repair,
+                              limit=args.limit)
+    print(f"scanned {report['symbols_scanned']} symbols")
+    print(f"  seams (auto-repairable): {report['seams']} "
+          f"across {len(report['symbols_affected'])} symbols")
+    print(f"  suspicious (reported, never auto-repaired): {report['suspicious']}")
+    seams = [f for f in report["findings"] if f["kind"] == "seam"]
+    for finding in sorted(seams, key=lambda f: -abs(f["ratio"]))[:args.show]:
+        print(f"    {finding['symbol']:8} {finding['d']}  x{finding['ratio']:<12.4f}"
+              f" {finding['prior_close']} -> {finding['close']}")
+    if not args.repair:
+        if seams:
+            print("\nreport only. re-run with --repair to rewrite these symbols.")
+        return None
+    print(f"\nrepaired {len(report['repaired'])} symbols")
+    failed = [r for r in report["repaired"] if r["status"] != "repaired"]
+    for r in failed:
+        print(f"    FAILED {r['symbol']}: {r['status']} {r.get('error', '')}")
+    if report["still_seamed"]:
+        # The provider itself is serving a mixed series; retrying will not help.
+        print(f"    STILL SEAMED after refetch: {report['still_seamed']}")
+    return None
+
+
 def cmd_worker(args, cfg, store):
     """Internal one-shot worker used by the scheduler's process boundary."""
     from .config import load_config_with_stored_overrides
@@ -644,6 +675,18 @@ def main(argv=None):
     sub.add_parser("bridge-dump")
     s = sub.add_parser("bridge-report")
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")
+
+    s = sub.add_parser("bars-audit",
+                       help="find split-adjustment seams in stored bars")
+    s.add_argument("--repair", action="store_true",
+                   help="rewrite affected symbols from a single full fetch "
+                        "(default is report-only: this changes price history)")
+    s.add_argument("--symbols", nargs="*",
+                   help="limit to these symbols (default: every symbol with bars)")
+    s.add_argument("--limit", type=int,
+                   help="repair at most N symbols this run")
+    s.add_argument("--show", type=int, default=20,
+                   help="how many findings to print")
 
     args = p.parse_args(argv)
     if args.cmd == "tui" and args.mode is None:

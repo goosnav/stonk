@@ -101,6 +101,36 @@ def fetch_yfinance(symbol: str, period: str = "max") -> list[dict]:
     return out
 
 
+BASIS_TOLERANCE = 0.02          # provider rounding, not a re-adjustment
+BASIS_MIN_OVERLAP = 5           # too few shared sessions to conclude anything
+
+
+def _basis_changed(store: Store, symbol: str, rows: list[dict],
+                   tolerance: float = BASIS_TOLERANCE) -> bool:
+    """Do freshly fetched bars disagree with stored bars on the SAME dates?
+
+    Agreement on the overlap is what licenses appending. Disagreement means the
+    provider re-adjusted its history (split, dividend, or a restatement) and the
+    stored rows are now on a different basis — appending would manufacture a
+    price discontinuity at the join. Compares medians of the per-date ratio so
+    one corrected bad print does not trigger a full re-fetch.
+    """
+    fetched = {r["d"]: float(r["close"]) for r in rows if r.get("close")}
+    if not fetched:
+        return False
+    stored = store.db.execute(
+        "SELECT d, close FROM bars WHERE symbol=? AND d>=? AND d<=?",
+        (symbol, min(fetched), max(fetched))).fetchall()
+    ratios = [float(row["close"]) / fetched[row["d"]]
+              for row in stored
+              if row["d"] in fetched and fetched[row["d"]] and row["close"]]
+    if len(ratios) < BASIS_MIN_OVERLAP:
+        return False
+    ratios.sort()
+    median = ratios[len(ratios) // 2]
+    return abs(median - 1.0) > tolerance
+
+
 def refresh(store: Store, symbols: list[str], full: bool = False,
             log=print) -> dict[str, int]:
     """Bring bars up to date. Incremental (yfinance 1mo) when we already have
@@ -116,8 +146,22 @@ def refresh(store: Store, symbols: list[str], full: bool = False,
                 if not rows:
                     rows, source = fetch_yfinance(sym, period="1mo"), "yfinance"
             elif latest and not full and latest >= (date.today() - timedelta(days=30)).isoformat():
-                rows = fetch_yfinance(sym, period="1mo")
+                # Fetch a LONGER window than we need and check the overlap
+                # against what is stored. Providers re-adjust their whole series
+                # after a split or dividend, so an incremental write silently
+                # joins new-basis rows onto stale-basis history — the seam that
+                # put 1,834 impossible moves in this table. Disagreement in the
+                # overlap means the basis moved; re-fetch everything.
+                rows = fetch_yfinance(sym, period="3mo")
                 source = "yfinance"
+                if rows and _basis_changed(store, sym, rows):
+                    log(f"data: {sym} adjustment basis changed — full refetch")
+                    rows, source = fetch_stooq(sym), "stooq"
+                    if not rows:
+                        rows, source = fetch_yfinance(sym), "yfinance"
+                    if rows:
+                        with store.db:
+                            store.db.execute("DELETE FROM bars WHERE symbol=?", (sym,))
             else:
                 rows, source = fetch_stooq(sym), "stooq"
                 if not rows:
