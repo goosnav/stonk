@@ -1528,6 +1528,45 @@ def active_global_run(store):
     ).fetchone()
 
 
+def replay_forecasts(cfg, store, as_of: str) -> tuple[dict[str, dict], dict]:
+    """Offline (backtest) replay of IMMUTABLE dual-family forecasts (R3).
+
+    Serves the same {symbol: {horizon: NeuralForecast}} contract as
+    predict_today, but from persisted model_forecasts_v2 rows for the serving
+    model at exactly this decision date — no torch, no lookahead: each row was
+    produced from data <= as_of when it was recorded. Rows whose provenance
+    fails the fail-closed policy validation downstream are simply inert.
+    """
+    from .ml import NeuralForecast
+    row = active_global_run(store)
+    if not row:
+        return {}, {"silent": "no serving model to replay"}
+    out: dict[str, dict] = {}
+    for r in store.db.execute(
+            "SELECT * FROM model_forecasts_v2 WHERE model_id=? AND as_of=?",
+            (row["id"], as_of)).fetchall():
+        try:
+            nf = NeuralForecast(
+                symbol=r["symbol"], as_of=r["as_of"],
+                horizon_sessions=int(r["horizon"]),
+                absolute_q10=r["absolute_q10"], absolute_q50=r["absolute_q50"],
+                absolute_q90=r["absolute_q90"],
+                excess_q10=r["excess_q10"], excess_q50=r["excess_q50"],
+                excess_q90=r["excess_q90"],
+                probability_absolute_edge_positive=r["probability_absolute_edge_positive"],
+                probability_excess_positive=r["probability_excess_positive"],
+                model_id=r["model_id"],
+                dataset_manifest_id=r["dataset_manifest_id"] or r["model_id"],
+                feature_schema_hash=r["feature_hash"])
+        except ValueError:
+            continue                       # malformed persisted row: inert
+        out.setdefault(r["symbol"], {})[str(r["horizon"])] = nf
+    payload_stub = {"feature_hash": row["feature_hash"],
+                    "target_schema_hash": None, "dataset_manifest_id": None}
+    meta = {**_forecast_meta(row, payload_stub), "replayed": True, "as_of": as_of}
+    return out, (meta if out else {**meta, "silent": f"no v2 forecasts at {as_of}"})
+
+
 def predict_today(cfg, store, ctx) -> tuple[dict[str, dict], dict]:
     try:
         import torch

@@ -37,6 +37,13 @@ def _seed_backtest_db(src_path: str, bt_path: Path) -> Store:
     bt.db.execute("INSERT INTO bars SELECT * FROM src.bars")
     bt.db.execute("INSERT OR IGNORE INTO instruments SELECT * FROM src.instruments")
     bt.db.execute("INSERT OR IGNORE INTO filing_facts SELECT * FROM src.filing_facts")
+    # R3: immutable replay evidence — the registered models and their
+    # fold-specific dual-family OOS/shadow forecasts. Policies replay these
+    # instead of running torch inference mid-simulation; rows are copies, so
+    # a backtest can never mutate the research plane's evidence.
+    bt.db.execute("INSERT OR IGNORE INTO model_runs SELECT * FROM src.model_runs")
+    bt.db.execute("INSERT OR IGNORE INTO model_forecasts_v2 "
+                  "SELECT * FROM src.model_forecasts_v2")
     # carry over kv caches for flaky external data (earnings/fundamentals)
     bt.db.execute("INSERT OR IGNORE INTO kv SELECT * FROM src.kv WHERE "
                   "key LIKE 'earnings_%' OR key LIKE 'fundamentals_%'")
@@ -144,14 +151,20 @@ def run_backtest(cfg, years: int = 10, tag: str = "default", scale: str = "resea
 # backtest (same source bars → same session list, same governor, same costs)
 # in its own isolated DB; only the neural scoring knobs differ.
 POLICY_OVERRIDES: dict[str, dict] = {
-    # pure deterministic ensemble: blend off, probe sleeve off
+    # pure deterministic ensemble: no blend, no probes, no forecast replay,
+    # neural node off, and the learned GRAPH disabled too (R3) — every learned
+    # pathway is provably dark in this book.
     "deterministic": {"neural": {"experimental_blend": 0.0,
-                                 "exploration": {"enabled": False}}},
-    # the production Stage-C configuration exactly as configured
-    "fixed_blend": {},
+                                 "backtest_replay": False,
+                                 "exploration": {"enabled": False}},
+                      "analog_graph": {"enabled": False},
+                      "nodes": {"neural": {"enabled": False}}},
+    # the production configuration exactly as committed, plus offline replay of
+    # the immutable v2 forecasts so the blend has real inputs in simulation
+    "fixed_blend": {"neural": {"backtest_replay": True}},
     # candidate ranking handed entirely to the model (diagnostic upper bound)
     "neural_only": {"neural": {"experimental_blend": 1.0, "min_blend": 0.0,
-                               "max_blend": 1.0}},
+                               "max_blend": 1.0, "backtest_replay": True}},
 }
 
 
@@ -180,7 +193,8 @@ def _incremental(base: dict, other: dict) -> dict:
 def compare_policies(cfg, years: int = 3, scale: str = "research",
                      policies: tuple = ("deterministic", "fixed_blend",
                                         "neural_only"),
-                     log=print, out_dir: Path | None = None) -> dict:
+                     log=print, out_dir: Path | None = None,
+                     max_sessions: int | None = None) -> dict:
     """Run the SAME backtest window under each scoring policy and report each
     policy's results plus its increment over the deterministic baseline.
 
@@ -194,7 +208,8 @@ def compare_policies(cfg, years: int = 3, scale: str = "research",
         log(f"policy backtest: {name}")
         results[name] = run_backtest(_policy_cfg(cfg, name), years=years,
                                      tag=f"policy_{name}", scale=scale,
-                                     log=log, out_dir=out_dir)
+                                     log=log, out_dir=out_dir,
+                                     max_sessions=max_sessions)
     windows = {tuple(r.get("window") or ()) for r in results.values()}
     if len(windows) > 1:
         raise RuntimeError(f"policy windows diverged: {windows} — comparison "

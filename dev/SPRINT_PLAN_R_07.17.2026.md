@@ -75,3 +75,18 @@ that currently grants it permission."
   label retargeting to modeled entry price rides with R5's per-sample costs
   (one dataset schema bump); sim has no external cash flows — deposit
   normalization for LIVE loss switches stays an R4 item.
+- 2026-07-19 R2.5 ops: Errno 24 FD exhaustion killed the weekend server
+  (quotes "delisted" noise, yfinance cache OperationalError, broker probe
+  down). Launchers now ulimit -n 4096; /health exposes open_fds (83e7ad8).
+- 2026-07-19 R3 DONE (340 tests): policy comparison is a real experiment.
+  _seed_backtest_db copies model_runs + model_forecasts_v2 (immutable
+  replay evidence); neural.replay_forecasts serves persisted dual-family
+  forecasts for EXACTLY the decision date (no torch, provenance re-validated
+  fail-closed downstream); the node stashes them offline when
+  neural.backtest_replay is on. deterministic policy now provably darkens
+  EVERY learned pathway (blend 0, replay off, exploration off, neural node
+  off, analog_graph off); fixed_blend/neural_only replay. Exit gate proven:
+  injected forecasts flip actual fills between independent per-policy
+  ledgers, blend audits engage in the blend book and stay silent in the
+  deterministic book. Honest note: graph-policy book still N/A (no graph
+  champion exists; graph events are not synthesized offline).

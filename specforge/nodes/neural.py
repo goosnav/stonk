@@ -28,7 +28,16 @@ class Node(SignalNode):
         self.last_forecasts, self.last_meta = {}, {}
         self.last_forecast_as_of = None
         if ctx.offline:
-            return []                      # backtests: silent, lookahead-clean
+            # R3: policy backtests replay IMMUTABLE persisted forecasts for
+            # this exact decision date (never live inference — lookahead-clean
+            # by construction). Only the stash is filled: the direct blend and
+            # probe consume it; graph events are not synthesized offline.
+            if ctx.cfg.get("neural", "backtest_replay", default=False):
+                from .. import neural
+                preds, meta = neural.replay_forecasts(ctx.cfg, ctx.store, ctx.as_of)
+                self.last_forecasts, self.last_meta = preds, meta
+                self.last_forecast_as_of = ctx.as_of if preds else None
+            return []
         from .. import neural
         preds, meta = neural.predict_today(ctx.cfg, ctx.store, ctx)
         # Stash for the engine's direct blend (ml/policy.py) — one inference

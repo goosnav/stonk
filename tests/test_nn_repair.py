@@ -1021,7 +1021,8 @@ def _passing_metrics(score=1.0, absolute_ok=True, **over):
 
 
 def _insert_run(store, rid, state, score=1.0, created_at="2026-07-01T00:00:00",
-                symbol=None, incompat=None, metrics=None):
+                symbol=None, incompat=None, metrics=None,
+                checkpoint=None, sha="sha", permitted_blend=0.0):
     store.db.execute(
         "INSERT INTO model_runs(id,kind,symbol,created_at,data_as_of,status,"
         "parent_id,metrics,checkpoint,feature_hash,schema_version,"
@@ -1030,8 +1031,8 @@ def _insert_run(store, rid, state, score=1.0, created_at="2026-07-01T00:00:00",
         (rid, "global_tcn", symbol, created_at, "2026-07-01",
          ml_lifecycle.project_status(state), None,
          _json.dumps(metrics if metrics is not None else _passing_metrics(score)),
-         f"ckpt-{rid}.pt", neural.FEATURE_HASH, neural.MODEL_SCHEMA,
-         neural.ARCHITECTURE_HASH, "sha", incompat, state, 0.0))
+         checkpoint or f"ckpt-{rid}.pt", neural.FEATURE_HASH, neural.MODEL_SCHEMA,
+         neural.ARCHITECTURE_HASH, sha, incompat, state, permitted_blend))
     store.db.commit()
 
 
@@ -1785,3 +1786,98 @@ def test_backtest_report_declares_decision_convention(cfg, store, tmp_path):
     report = _bt(cfg, store, tmp_path, "r2conv")
     assert "features<=t-1" in report["decision_convention"]
     assert "fill at t open" in report["decision_convention"]
+
+
+# ── R3: real policy comparison — immutable v2 replay must cause divergence ───
+
+def _seed_replay_world(cfg, store, tmp_path):
+    """A champion model + immutable v2 forecasts: BBB strongly up, AAA/CCC
+    down, at EVERY session — so a working blend must reorder candidates."""
+    import hashlib
+    from specforge.research import record_forecast_v2
+    _long_history(store)
+    ckpt = tmp_path / "serving.pt"
+    ckpt.write_bytes(b"immutable-serving-checkpoint")
+    sha = hashlib.sha256(ckpt.read_bytes()).hexdigest()
+    _insert_run(store, "serve-1", "champion", checkpoint=str(ckpt), sha=sha)
+    sessions = [r["d"] for r in store.db.execute(
+        "SELECT DISTINCT d FROM bars WHERE symbol='SPY' ORDER BY d")]
+    # BBB strongly up; everything else — including the benchmark the momentum
+    # node loves — strongly down, so a live blend MUST reorder the book.
+    views = {"BBB": (0.08, 0.05, 0.9), "AAA": (-0.06, -0.04, 0.1),
+             "CCC": (-0.06, -0.04, 0.1), "SPY": (-0.06, -0.04, 0.1)}
+    for d in sessions:
+        for sym, (aq, eq_, pa) in views.items():
+            nf = NeuralForecast(
+                symbol=sym, as_of=d, horizon_sessions=21,
+                absolute_q10=aq - 0.03, absolute_q50=aq, absolute_q90=aq + 0.03,
+                excess_q10=eq_ - 0.02, excess_q50=eq_, excess_q90=eq_ + 0.02,
+                probability_absolute_edge_positive=pa,
+                probability_excess_positive=pa,
+                model_id="serve-1", dataset_manifest_id="d1",
+                feature_schema_hash=neural.FEATURE_HASH)
+            record_forecast_v2(store, nf, model_id="serve-1", as_of=d,
+                               feature_hash=neural.FEATURE_HASH,
+                               target_schema_hash=ml_targets.TARGET_SCHEMA_HASH)
+    store.db.commit()      # record_forecast_v2 leaves commit to its caller
+    return sessions
+
+
+def test_replay_serves_only_the_exact_decision_date(cfg, store, tmp_path):
+    sessions = _seed_replay_world(cfg, store, tmp_path)
+    preds, meta = neural.replay_forecasts(cfg, store, sessions[10])
+    assert set(preds) == {"AAA", "BBB", "CCC", "SPY"} and meta["replayed"]
+    assert all(v["21"].as_of == sessions[10] for v in preds.values())
+    empty, meta2 = neural.replay_forecasts(cfg, store, "1999-01-01")
+    assert empty == {} and "no v2 forecasts" in meta2["silent"]
+
+
+def test_replay_without_serving_model_is_silent(cfg, store):
+    preds, meta = neural.replay_forecasts(cfg, store, "2026-01-05")
+    assert preds == {} and "no serving model" in meta["silent"]
+
+
+def test_deterministic_policy_disables_every_learned_pathway(cfg):
+    from specforge.backtest import _policy_cfg
+    det = _policy_cfg(cfg, "deterministic")
+    assert det.get("neural", "experimental_blend") == 0.0
+    assert det.get("neural", "backtest_replay") is False
+    assert det.get("neural", "exploration", "enabled") is False
+    assert det.get("analog_graph", "enabled") is False
+    assert det.get("nodes", "neural", "enabled") is False
+    assert _policy_cfg(cfg, "fixed_blend").get("neural", "backtest_replay") is True
+
+
+def test_injected_forecasts_cause_policy_divergence(cfg, store, tmp_path):
+    from specforge.backtest import compare_policies
+    _seed_replay_world(cfg, store, tmp_path)
+    cfg.data["neural"]["experimental_blend"] = 0.30    # R0 default is 0; ≤ max 0.40
+    cfg.data["nodes"]["neural"] = {"enabled": True, "weight": 0.15,
+                                   "horizon_days": 21, "status": "experimental"}
+    out = compare_policies(cfg, years=30, scale="research",
+                           policies=("deterministic", "fixed_blend"),
+                           log=lambda *a: None, out_dir=tmp_path,
+                           max_sessions=45)
+    det, blend = out["policies"]["deterministic"], out["policies"]["fixed_blend"]
+    assert det["window"] == blend["window"]            # identical conditions…
+    import sqlite3 as _sq
+
+    def _book(tag):
+        con = _sq.connect(tmp_path / f"backtest_policy_{tag}_research.db")
+        con.row_factory = _sq.Row
+        fills = [(r["symbol"], r["side"], round(r["qty"], 4)) for r in
+                 con.execute("SELECT symbol, side, qty FROM fills ORDER BY rowid")]
+        blends = [r["payload"] for r in con.execute(
+            "SELECT payload FROM audit WHERE event_type='neural_direct_blend' "
+            "AND payload LIKE '%\"blend\": 0.3%'")]
+        return fills, blends
+
+    det_fills, det_blends = _book("deterministic")
+    blend_fills, blend_blends = _book("fixed_blend")
+    assert det_blends == []                            # learned pathway dark
+    assert blend_blends, "blend never engaged — replay path is dead"
+    # …and the injected forecasts changed actual trading (the exit gate)
+    assert det_fills != blend_fills
+    # every policy keeps an independent ledger
+    assert (tmp_path / "backtest_policy_deterministic_research.db").exists()
+    assert (tmp_path / "backtest_policy_fixed_blend_research.db").exists()
