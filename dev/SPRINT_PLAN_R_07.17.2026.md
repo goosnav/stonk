@@ -103,3 +103,40 @@ that currently grants it permission."
   (dashboard fetches it from /api/session behind loopback+origin checks).
   Every new limit has a failing property test. R0-R4 milestone reached —
   merge policy per review applies.
+- 2026-07-20 R5 DONE (356 tests): point-in-time data.
+  * News was the ONE feature violating known_at: `_news_series` keyed the
+    LLM sentiment score to `published_at` while the score itself came into
+    existence at `classified_at`. Now grouped by
+    `known_at = MAX(published_at, classified_at)`, so retro-scored history is
+    simply absent instead of silently backdated. `news_pit_stats()` reports
+    how much of the corpus was scored after the fact (retro count, max lag).
+  * Audited every other non-price feature: valuation, fundamentals and event
+    proximity already key on SEC `filed` (= acceptance/known_at). No further
+    violations found — the feature half of the exit gate holds.
+  * Universe membership is now point-in-time: `universe.membership_as_of`
+    returns the latest snapshot <= the date and **None** when history predates
+    coverage (uncovered != empty != today's list). `build_dataset` drops
+    windows on dates the symbol was not a member, counts covered/dropped/
+    uncovered windows into `ds["pit"]`, and unions the configured symbol list
+    with `universe.historical_symbols()` so delisted names stay in the panel —
+    the survivor-bias fix.
+  * Per-sample cost labels replace the flat 16bps: `ml_targets.sample_costs`
+    prices each session from its own liquidity (spread widens as
+    `sqrt(reference/dollar_volume)`, plus a sqrt-participation impact term),
+    floored at the old constant and capped at MAX_SAMPLE_COST. The absolute-
+    edge BCE label (train AND validation) now asks whether the return beat
+    THIS name's cost on THIS session. TARGET_SCHEMA_HASH bumped accordingly;
+    `ds["round_trip_cost"]` is now the median estimate and `ds["cost_floor"]`
+    carries the old constant.
+  Honest remainder: (a) the spread estimator is a dollar-volume proxy — real
+  historical bid/ask would beat it, the live quote path has quotes but there
+  is no quote archive; (b) `instruments.cik`/`sector` are still current-state
+  lookups, not point-in-time (a re-sectored or re-CIK'd name leaks its present
+  classification into its past); (c) corporate actions are still whatever the
+  bar vendor already adjusted — no independent split/dividend ledger; (d) the
+  universe PIT filter only binds where snapshots exist, and this deployment
+  has snapshots only from its own runtime forward, so nearly all training
+  history is `universe_uncovered_windows` — labeled, not fixed. Real
+  point-in-time membership needs a historical security master (R6 input).
+  * Label retargeting to modeled entry price (carried from R2) is NOT done —
+    it lands with R6's dataset rebuild rather than bumping the schema twice.

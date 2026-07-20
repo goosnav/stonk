@@ -280,7 +280,10 @@ def test_dataset_carries_both_target_families_and_cost(cfg, store):
     assert "error" not in ds, ds
     assert ds["Y_absolute"].shape == ds["Y_excess"].shape
     assert np.isfinite(ds["Y_absolute"]).all()
-    assert ds["round_trip_cost"] == pytest.approx(0.0016)
+    # R5: the flat 0.0016 is now only the FLOOR; the reported cost is the median
+    # of the per-sample estimates and can only sit at or above it.
+    assert ds["cost_floor"] == pytest.approx(0.0016)
+    assert ds["round_trip_cost"] >= ds["cost_floor"]
     assert ds["target_schema_hash"] == ml_targets.TARGET_SCHEMA_HASH
     # features and targets are disjoint arrays — no forward-looking feature names
     assert not any(k in " ".join(neural.FEATURES) for k in ("future", "target", "fwd"))
@@ -2079,3 +2082,112 @@ def test_api_mutations_require_session_token(cfg, store):
     ok = TestClient(app, headers={"X-Session-Token": token})
     assert ok.post("/api/research/jobs",
                    json={"kind": "discover"}).status_code in (200, 202, 409)
+
+
+# ── R5: point-in-time data — known_at <= decision_at, honest costs ────────────
+
+def _news(store, symbol, published, classified, stance=1.0):
+    with store.db:
+        store.db.execute(
+            "INSERT INTO news_intelligence(id,symbol,published_at,ingested_at,title,"
+            "summary,url,source,content_hash,stance,confidence,catalyst,novelty,"
+            "reliability,contradiction,price_reaction,classified_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"{symbol}-{published}-{classified}", symbol, published, published,
+             "t", "s", "u", "src", published, stance, 1.0, "none", 1.0, 1.0,
+             None, None, classified))
+
+
+def test_news_feature_is_keyed_to_classification_known_at(cfg, store):
+    """A story published in 2011 but classified today is NOT 2011 evidence."""
+    index = pd.Index([f"2026-07-{d:02d}" for d in range(10, 21)])
+    _news(store, "AAA", "2026-07-11T12:00:00+00:00", "2026-07-15T09:00:00+00:00")
+    score, missing = neural._news_series(store, "AAA", index)
+    # Nothing is known before the classification landed.
+    assert score.loc[:"2026-07-14"].eq(0).all()
+    assert missing.loc[:"2026-07-14"].eq(1).all()
+    assert score.loc["2026-07-15"] != 0 and missing.loc["2026-07-15"] == 0
+
+
+def test_news_provenance_reports_classification_lag(cfg, store):
+    _news(store, "AAA", "2026-07-11T00:00:00+00:00", "2026-07-11T05:00:00+00:00")
+    _news(store, "AAA", "2011-03-02T00:00:00+00:00", "2026-07-15T00:00:00+00:00")
+    stats = neural.news_pit_stats(store)
+    assert stats["classified"] == 2 and stats["retro_classified"] == 1
+    assert stats["max_lag_days"] > 5000
+
+
+def test_universe_membership_is_point_in_time(cfg, store):
+    from specforge import universe
+    with store.db:
+        for as_of, syms in (("2026-01-05", ("AAA", "OLD")),
+                            ("2026-04-05", ("AAA", "BBB"))):
+            for rank, s in enumerate(syms, 1):
+                store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                                 (as_of, s, "research", rank, "test", "{}"))
+    assert universe.membership_as_of(store, "2026-01-04") is None      # uncovered
+    assert universe.membership_as_of(store, "2026-02-01") == {"AAA", "OLD"}
+    assert universe.membership_as_of(store, "2026-09-01") == {"AAA", "BBB"}
+    # Delisted names stay in the historical panel — that is the survivor-bias fix.
+    assert "OLD" in universe.historical_symbols(store)
+
+
+def test_sample_costs_vary_with_spread_and_liquidity(cfg):
+    floor = ml_targets.round_trip_cost(cfg)
+    idx = pd.Index([f"2026-01-{d:02d}" for d in range(1, 32)])
+    tight = pd.DataFrame({"open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0,
+                          "volume": 5e7}, index=idx)
+    wide = pd.DataFrame({"open": 100.0, "high": 104.0, "low": 96.0, "close": 100.0,
+                         "volume": 2e4}, index=idx)
+    tight_cost = ml_targets.sample_costs(cfg, tight)
+    wide_cost = ml_targets.sample_costs(cfg, wide)
+    assert (tight_cost >= floor).all() and (wide_cost >= floor).all()
+    assert tight_cost.iloc[-1] == pytest.approx(floor, rel=.25)   # liquid ≈ the floor
+    assert wide_cost.iloc[-1] > 3 * tight_cost.iloc[-1]           # illiquid costs more
+    assert (wide_cost <= ml_targets.MAX_SAMPLE_COST).all()        # bounded, never absurd
+
+
+def test_dataset_carries_per_sample_cost_and_pit_provenance(cfg, store):
+    from conftest import synth_bars
+    for sym in ("AAA", "BBB", "CCC", "SPY"):
+        store.upsert_bars(sym, synth_bars(n_days=700, daily_drift=.001), "test")
+    store.upsert_bars("^VIX", [{**r, "open": 15, "high": 16, "low": 14, "close": 15}
+                               for r in synth_bars(n_days=700)], "test")
+    cfg.data["neural"]["input_sessions"] = 40
+    ds = neural.build_dataset(cfg, store, symbols=["AAA", "BBB", "CCC"])
+    assert "error" not in ds
+    costs = ds["sample_cost"]
+    assert costs.shape == (len(ds["dates"]),)
+    assert (costs >= ml_targets.round_trip_cost(cfg)).all()
+    # The flat constant remains only as the documented floor.
+    assert ds["round_trip_cost"] == pytest.approx(float(np.median(costs)))
+    assert ds["cost_floor"] == pytest.approx(ml_targets.round_trip_cost(cfg))
+    pit = ds["pit"]
+    assert pit["universe_snapshots"] == 0          # none seeded → uncovered, labeled
+    assert pit["universe_covered_windows"] == 0
+    assert "news" in pit
+
+
+def test_pit_filter_drops_windows_before_membership(cfg, store):
+    """With snapshots present, a symbol contributes no window before it joined."""
+    from conftest import synth_bars
+    for sym in ("AAA", "BBB", "CCC", "SPY"):
+        store.upsert_bars(sym, synth_bars(n_days=700, daily_drift=.001), "test")
+    store.upsert_bars("^VIX", [{**r, "open": 15, "high": 16, "low": 14, "close": 15}
+                               for r in synth_bars(n_days=700)], "test")
+    dates = [r["d"] for r in store.db.execute(
+        "SELECT DISTINCT d FROM bars WHERE symbol='AAA' ORDER BY d")]
+    join = dates[len(dates) // 2]
+    with store.db:
+        for rank, s in enumerate(("AAA", "BBB"), 1):        # CCC never joins
+            store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                             (dates[0], s, "research", rank, "test", "{}"))
+        store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                         (join, "CCC", "research", 3, "test", "{}"))
+    cfg.data["neural"]["input_sessions"] = 40
+    ds = neural.build_dataset(cfg, store, symbols=["AAA", "BBB", "CCC"])
+    assert "error" not in ds
+    ccc = ds["dates"][ds["owners"] == "CCC"]
+    assert len(ccc) and min(ccc) >= join
+    assert ds["pit"]["universe_snapshots"] == 2
+    assert ds["pit"]["universe_dropped_windows"] > 0

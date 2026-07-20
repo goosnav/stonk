@@ -153,6 +153,44 @@ def symbols(store, tier: str = "active") -> list[str]:
         (row["d"], tier))]
 
 
+PIT_TIERS = ("research", "active")
+
+
+def membership_history(store, tiers=PIT_TIERS) -> dict[str, set[str]]:
+    """{as_of: members} across every stored snapshot — the point-in-time index."""
+    marks = ",".join("?" for _ in tiers)
+    history: dict[str, set[str]] = {}
+    for row in store.db.execute(
+            f"SELECT as_of,symbol FROM universe_membership WHERE tier IN ({marks})",
+            tuple(tiers)):
+        history.setdefault(row["as_of"], set()).add(row["symbol"])
+    return history
+
+
+def membership_as_of(store, date: str, tiers=PIT_TIERS) -> set[str] | None:
+    """Members as of the latest snapshot on or before `date`.
+
+    Returns None when no snapshot covers that date — history predating the
+    system is UNCOVERED, not empty and not today's universe. Callers must
+    label uncovered spans rather than quietly assuming survivorship.
+    """
+    history = membership_history(store, tiers)
+    prior = [d for d in history if d <= date]
+    return history[max(prior)] if prior else None
+
+
+def historical_symbols(store, tiers=PIT_TIERS) -> list[str]:
+    """Every symbol that was ever a member, including names since delisted.
+
+    Training off today's membership is the strongest survivor bias available;
+    this is the panel that keeps the losers in.
+    """
+    marks = ",".join("?" for _ in tiers)
+    return [r["symbol"] for r in store.db.execute(
+        f"SELECT DISTINCT symbol FROM universe_membership WHERE tier IN ({marks}) "
+        "ORDER BY symbol", tuple(tiers))]
+
+
 def status(store) -> dict:
     return {"catalog": store.kv_get("catalog_status"),
             "tiers": store.kv_get("universe_status"),

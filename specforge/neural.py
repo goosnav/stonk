@@ -7,6 +7,7 @@ bounded by a persisted trial counter and can never mutate that champion.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -266,9 +267,31 @@ def _fundamental_series(store, symbol: str, index) -> dict[str, pd.Series]:
     return out
 
 
+_NEWS_KNOWN_AT = ("MAX(substr(published_at,1,10),"
+                  "substr(COALESCE(classified_at,published_at),1,10))")
+
+
+def news_pit_stats(store) -> dict:
+    """Provenance for the news feature: how much of it was scored after the fact.
+
+    A classification lag of days or years means the sentiment score was NOT
+    available on the publication date. The feature keys off `known_at`, so
+    retro-scored history is simply absent — this reports how much.
+    """
+    row = store.db.execute(
+        "SELECT COUNT(*) n,"
+        " SUM(julianday(substr(classified_at,1,10))-julianday(substr(published_at,1,10))>1) retro,"
+        " MAX(julianday(substr(classified_at,1,10))-julianday(substr(published_at,1,10))) lag "
+        "FROM news_intelligence WHERE classified_at IS NOT NULL").fetchone()
+    return {"classified": int(row["n"] or 0),
+            "retro_classified": int(row["retro"] or 0),
+            "max_lag_days": float(row["lag"] or 0.0)}
+
+
 def _news_series(store, symbol: str, index) -> tuple[pd.Series, pd.Series]:
+    # known_at, not published_at: the score exists only once the classifier ran.
     rows = store.db.execute(
-        "SELECT substr(published_at,1,10) d,AVG(stance*confidence*reliability) score "
+        f"SELECT {_NEWS_KNOWN_AT} d,AVG(stance*confidence*reliability) score "
         "FROM news_intelligence WHERE symbol=? AND classified_at IS NOT NULL GROUP BY 1",
         (symbol,)).fetchall()
     if not rows:
@@ -388,8 +411,14 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
     window = int(cfg.get("neural", "input_sessions", default=60))
     horizons = tuple(cfg.get("neural", "horizons", default=[5, 21]))
     since = cfg.get("neural", "train_since", default="2011-01-01")
-    symbols = symbols or [s for s in cfg.get("universe", "symbols", default=[])
-                          if not s.startswith("^")]
+    # Today's configured list is survivor-biased: it cannot contain a name that
+    # was delisted before today. Union it with every symbol that was ever a
+    # member so the losers stay in the panel.
+    from . import universe as _universe
+    symbols = symbols or sorted(
+        {s for s in cfg.get("universe", "symbols", default=[]) if not s.startswith("^")}
+        | set(_universe.historical_symbols(store)))
+    pit_dates = sorted(pit_history := _universe.membership_history(store))
     bench = cfg.get("universe", "benchmark", default="SPY")
     spy, vix = _bars(store, bench, since), _bars(
         store, cfg.get("universe", "vix_symbol", default="^VIX"), since)
@@ -402,8 +431,9 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
     sectors = {s: _bars(store, s, since) for s in sector_symbols}
     if len(spy) < window + max(horizons) + 100:
         return {"error": "not enough benchmark history"}
-    X, Y, Y_abs, dates, owners = [], [], [], [], []
-    rtc = ml_targets.round_trip_cost(cfg)
+    X, Y, Y_abs, dates, owners, sample_cost = [], [], [], [], [], []
+    cost_floor = ml_targets.round_trip_cost(cfg)
+    pit_covered = pit_dropped = pit_uncovered = 0
     window_limit = _training_window_limit(cfg)
     per_symbol_cap = min(int(cfg.get("neural", "max_windows_per_symbol", default=500)),
                          max(1, window_limit // max(1, len(symbols))))
@@ -437,6 +467,22 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
         indices = indices[(indices < len(f) - max(horizons)) &
                           np.isfinite(yvals[indices]).all(axis=1) &
                           np.isfinite(yvals_abs[indices]).all(axis=1)]
+        if pit_dates:
+            # known_at <= decision_at for universe membership: a window only
+            # counts on a date the symbol was actually in the tradable panel.
+            keep = []
+            for i in indices:
+                position = bisect.bisect_right(pit_dates, f.index[i]) - 1
+                if position < 0:
+                    pit_uncovered += 1; keep.append(i)          # predates coverage
+                elif sym in pit_history[pit_dates[position]]:
+                    pit_covered += 1; keep.append(i)
+                else:
+                    pit_dropped += 1
+            indices = np.asarray(keep, dtype=int)
+            if not len(indices):
+                continue
+        costs = ml_targets.sample_costs(cfg, b).to_numpy(np.float32)
         if len(indices) > per_symbol_cap:
             indices = indices[np.linspace(0, len(indices) - 1,
                                           per_symbol_cap, dtype=int)]
@@ -450,9 +496,12 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
             X.append(vals[i - window + 1:i + 1])
             Y.append(yvals[i]); Y_abs.append(yvals_abs[i])
             dates.append(f.index[i]); owners.append(sym)
+            sample_cost.append(costs[i])
     if len(X) < 100:
         return {"error": f"not enough training windows ({len(X)})"}
     X, Y, Y_abs = np.stack(X), np.stack(Y), np.stack(Y_abs)
+    sample_cost = np.asarray(sample_cost, dtype=np.float32)
+    median_cost = float(np.median(sample_cost))
     unique = sorted(set(dates))
     if len(unique) < 180:
         return {"error": f"not enough distinct dates ({len(unique)})"}
@@ -483,7 +532,16 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
             "mean": mean, "std": std, "horizons": horizons,
             "target_scale": target_scale,
             "target_scale_absolute": target_scale_absolute,
-            "round_trip_cost": rtc, "cost_threshold": rtc,
+            "sample_cost": sample_cost,
+            "cost_floor": cost_floor,
+            # The scalar survives only as the calibration threshold and as the
+            # reported central cost; labels use each sample's own estimate.
+            "round_trip_cost": median_cost, "cost_threshold": median_cost,
+            "pit": {"universe_snapshots": len(pit_dates),
+                    "universe_covered_windows": pit_covered,
+                    "universe_dropped_windows": pit_dropped,
+                    "universe_uncovered_windows": pit_uncovered,
+                    "news": news_pit_stats(store)},
             "target_schema_hash": ml_targets.TARGET_SCHEMA_HASH,
             "data_as_of": unique[-1], "train_end": train_end,
             "val_start": val_start, "val_end": val_end,
@@ -990,6 +1048,10 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     Yraw_abs = torch.from_numpy(ds["Y_absolute"])
     Y_abs = Yraw_abs / torch.from_numpy(ds["target_scale_absolute"])
     rtc = float(ds["round_trip_cost"])
+    # Per-sample cost labels (R5): the absolute-edge label asks whether the
+    # return beat THIS name's cost on THIS session, not a market-wide constant.
+    cost_vector = torch.from_numpy(
+        np.asarray(ds["sample_cost"], dtype=np.float32)).unsqueeze(1)
     tr = torch.from_numpy(np.flatnonzero(ds["masks"]["train"]))
     va = torch.from_numpy(np.flatnonzero(ds["masks"]["val"]))
     te = np.flatnonzero(ds["masks"]["test"])
@@ -1027,7 +1089,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                     + _pinball(out.absolute_quantiles, yb_abs)
                     + .1 * bce(out.probability_excess_positive, (yr > 0).float())
                     + .1 * bce(out.probability_absolute_edge_positive,
-                              (yr_abs > rtc).float()))
+                              (yr_abs > cost_vector[idx].to(device)).float()))
             rank = sum(_rank_loss(out.excess_quantiles[:, h, 1], yb[:, h],
                                   ds["dates"][idx.numpy()])
                        for h in range(len(ds["horizons"]))) / len(ds["horizons"])
@@ -1050,7 +1112,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                              + _pinball(out.absolute_quantiles, vb_abs)
                              + .1 * bce(out.probability_excess_positive, (yr > 0).float())
                              + .1 * bce(out.probability_absolute_edge_positive,
-                                        (vr_abs > rtc).float()))
+                                        (vr_abs > cost_vector[idx].to(device)).float()))
                 total_loss += float(objective) * len(idx)
                 total_rows += len(idx)
         val_loss = total_loss / max(1, total_rows)
