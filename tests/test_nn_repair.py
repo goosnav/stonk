@@ -2191,3 +2191,128 @@ def test_pit_filter_drops_windows_before_membership(cfg, store):
     assert len(ccc) and min(ccc) >= join
     assert ds["pit"]["universe_snapshots"] == 2
     assert ds["pit"]["universe_dropped_windows"] > 0
+
+
+# ── R6: model laboratory — earn the complexity or don't trade ─────────────────
+
+EDGE_FEATURE = 4          # vol21 — deliberately NOT r1, or the momentum control
+                          # would BE the planted edge and stop being a control.
+
+
+def _bakeoff_dataset(n_days=400, n_symbols=20, signal=0.0, seed=0, window=3):
+    """Synthetic panel with a KNOWN linear edge of strength `signal`.
+
+    `n_days` is large enough that the evaluation split still holds several
+    non-overlapping 21-session cohorts per offset — otherwise every model
+    scores 'insufficient' and the comparison proves nothing.
+    """
+    from specforge import neural
+    rng = np.random.default_rng(seed)
+    n = n_days * n_symbols
+    x = rng.normal(size=(n, window, len(neural.FEATURES))).astype(np.float32)
+    day = [f"2026-{1 + d // 28:02d}-{1 + d % 28:02d}" for d in range(n_days)]
+    dates = np.repeat(day, n_symbols)
+    edge = x[:, -1, EDGE_FEATURE]
+    y = np.column_stack([signal * edge + rng.normal(scale=.02, size=n) for _ in (5, 21)]
+                        ).astype(np.float32)
+    order = np.argsort(dates, kind="stable")
+    x, y, dates = x[order], y[order], dates[order]
+    train = dates <= day[n_days * 6 // 10]
+    return {"X": x, "Y": y, "Y_excess": y, "Y_absolute": y, "dates": dates,
+            "horizons": (5, 21), "masks": {"train": train, "val": ~train, "test": ~train},
+            "mean": np.zeros((1, 1, len(neural.FEATURES)), dtype=np.float32),
+            "std": np.ones((1, 1, len(neural.FEATURES)), dtype=np.float32),
+            "round_trip_cost": 0.0016,
+            "sample_cost": np.full(n, 0.0016, dtype=np.float32)}
+
+
+def test_bakeoff_simple_models_recover_a_planted_edge():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=0.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    preds = bakeoff.simple_predictions(ds, "absolute")
+    assert set(preds) == set(bakeoff.MODELS)
+    for name, pred in preds.items():
+        assert pred.shape == (len(ds["dates"]), 2), name
+    # The learners find the planted linear edge; zero cannot, by construction.
+    for learner in ("ridge", "elastic_net", "boosted_tree"):
+        assert np.corrcoef(preds[learner][eval_idx, 0],
+                           ds["Y_absolute"][eval_idx, 0])[0, 1] > .2, learner
+    assert np.allclose(preds["zero"], 0)
+
+
+def test_elastic_net_is_sparser_than_ridge():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=0.05)
+    x = bakeoff.context_design(ds)
+    train = ds["masks"]["train"]
+    mean, std = x[train].mean(0), x[train].std(0) + 1e-6
+    xn = (x - mean) / std
+    y = ds["Y_absolute"].astype(np.float64)
+    ridge = bakeoff._ridge(xn[train], y[train], xn[train])
+    net = bakeoff._elastic_net(xn[train], y[train], xn[train])
+    assert np.isfinite(net).all() and net.shape == ridge.shape
+    # L1 drives most coefficients to exactly zero; ridge drives none there.
+    weights = bakeoff._elastic_net(xn[train], y[train], np.eye(xn.shape[1])) - \
+        y[train].mean(0)
+    assert (np.abs(weights) < 1e-12).mean() > .5
+
+
+def test_policy_return_fails_closed_on_thin_evidence():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(n_days=40, n_symbols=12, signal=0.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    scored = bakeoff.policy_return(bakeoff.simple_predictions(ds, "absolute")["ridge"],
+                                   ds, eval_idx, "absolute")
+    # Too few non-overlapping 21-session cohorts to be evidence of anything.
+    assert scored["evidence"] == "insufficient"
+    assert scored["policy_utility"] <= 0
+
+
+def test_bakeoff_gate_requires_median_seed_to_beat_every_control():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=0.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    truth = ds["Y_absolute"]
+    strong = truth + np.random.default_rng(1).normal(scale=.001, size=truth.shape)
+    weak = np.random.default_rng(2).normal(scale=.02, size=truth.shape)
+    # One brilliant seed cannot carry two poor ones: the MEDIAN decides.
+    lucky = {f: {"tcn_seed_0": strong, "tcn_seed_1": weak, "tcn_seed_2": weak}
+             for f in bakeoff.FAMILIES}
+    assert bakeoff.compare(ds, eval_idx, lucky)["verdict"] is False
+    genuine = {f: {f"tcn_seed_{i}": strong for i in range(3)} for f in bakeoff.FAMILIES}
+    result = bakeoff.compare(ds, eval_idx, genuine)
+    assert result["verdict"] is True
+    assert result["absolute"]["n_seeds"] == 3
+    assert result["absolute"]["tcn_median_utility"] > \
+        result["absolute"]["best_control_utility"]
+    # No seeds at all is never a pass.
+    assert bakeoff.compare(ds, eval_idx, {})["verdict"] is False
+
+
+def test_bakeoff_scores_both_families_independently():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=0.05)
+    ds["Y_excess"] = np.random.default_rng(3).normal(scale=.02, size=ds["Y_absolute"].shape)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    strong_abs = ds["Y_absolute"] + np.random.default_rng(4).normal(
+        scale=.001, size=ds["Y_absolute"].shape)
+    preds = {"absolute": {f"tcn_seed_{i}": strong_abs for i in range(3)},
+             "excess": {f"tcn_seed_{i}": strong_abs for i in range(3)}}
+    result = bakeoff.compare(ds, eval_idx, preds)
+    # Winning the family you were fit on cannot buy a pass on the other.
+    assert result["absolute"]["beats_controls"] is True
+    assert result["excess"]["beats_controls"] is False
+    assert result["verdict"] is False
+
+
+def test_policy_return_uses_per_sample_costs():
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=0.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    pred = ds["Y_absolute"]
+    cheap = bakeoff.policy_return(pred, ds, eval_idx, "absolute",
+                                  costs=np.full(len(ds["dates"]), .0001))
+    dear = bakeoff.policy_return(pred, ds, eval_idx, "absolute",
+                                 costs=np.full(len(ds["dates"]), .02))
+    assert cheap["policy_utility"] > dear["policy_utility"]

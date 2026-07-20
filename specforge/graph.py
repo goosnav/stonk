@@ -487,93 +487,16 @@ def _daily_rank_ic(pred, truth, dates) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
-# Staggered-cohort gate thresholds. Fail-closed: below these, the metric is not
-# usable as promotion evidence (it returns a negative utility instead).
-_MIN_COHORTS_PER_OFFSET = 3
-_MIN_VALID_OFFSETS = 8
-
-
-def _cohort_returns(pred_col, truth_col, fold_dates, horizon: int, cost: float,
-                    offset: int = 0, min_names: int = 8) -> list[float]:
-    """After-cost top-decile return per NON-OVERLAPPING decision date, one
-    staggered alignment starting at `offset`.
-
-    Each element is the mean h-session forward return of the top-decile picks on
-    one date, sampled every `horizon` sessions from `offset` so the forward
-    windows never overlap — the only series it is valid to compound into an
-    equity curve or a Sharpe. Compounding the per-*every*-date version (adjacent
-    windows share ~20/21 of their period) double-counts the same price move and
-    understates volatility. Cost is deducted exactly once per cohort. See
-    NN_REPAIR plan A3.
-    """
-    import numpy as np
-    fd = np.asarray(fold_dates)
-    pc, tc = np.asarray(pred_col), np.asarray(truth_col)
-    days = sorted(set(fd.tolist()))                   # sorted-unique decision dates
-    out: list[float] = []
-    for k in range(offset, len(days), horizon):       # stride = horizon → no overlap
-        m = fd == days[k]
-        if int(m.sum()) < min_names:
-            continue
-        cutoff = np.quantile(pc[m], .9)
-        out.append(float(tc[m][pc[m] >= cutoff].mean() - cost))
-    return out
-
-
-def _offset_metrics(cohort: list[float], horizon: int) -> dict | None:
-    """Annualized/Sharpe/drawdown for ONE independent cohort series, or None."""
-    import numpy as np
-    if not cohort:
-        return None
-    arr = np.asarray(cohort, dtype=float)
-    curve = np.cumprod(1 + arr)
-    drawdown = float(np.max(1 - curve / np.maximum.accumulate(curve)))
-    per_year = 252 / horizon
-    return {"annualized": float(arr.mean() * per_year),
-            "sharpe": float(arr.mean() / (arr.std() + 1e-9) * np.sqrt(per_year)),
-            "max_drawdown": drawdown, "n_cohorts": len(cohort)}
-
-
-def _staggered_portfolio_metrics(pred_col, truth_col, fold_dates, horizon: int = 21,
-                                 cost: float = .0016, min_names: int = 8,
-                                 min_cohorts: int = _MIN_COHORTS_PER_OFFSET,
-                                 min_offsets: int = _MIN_VALID_OFFSETS) -> dict:
-    """Portfolio utility over ALL `horizon` staggered non-overlapping cohort
-    alignments (offsets 0..horizon-1), aggregated by median so no single
-    arbitrary phase decides the metric.
-
-    This is an INTERIM forecast-policy diagnostic, not a production equity
-    simulation — a real same-engine policy backtest supersedes it in Stage F.
-    Fails closed: too few valid cohorts/offsets → negative utility, so no
-    promotion gate can pass on thin evidence. Returns {} only for no data.
-    """
-    import numpy as np
-    if not len(np.asarray(fold_dates)):
-        return {}
-    offsets = []
-    for off in range(horizon):
-        m = _offset_metrics(
-            _cohort_returns(pred_col, truth_col, fold_dates, horizon, cost,
-                            offset=off, min_names=min_names), horizon)
-        if m and m["n_cohorts"] >= min_cohorts:
-            offsets.append(m)
-    if len(offsets) < min_offsets:
-        return {"portfolio_utility": -1.0, "oos_sharpe": -99.0, "max_drawdown": 1.0,
-                "n_valid_offsets": len(offsets), "utility_evidence": "insufficient",
-                "utility_basis": "staggered_non_overlapping_21s_cohorts"}
-    ann = [o["annualized"] for o in offsets]
-    shp = [o["sharpe"] for o in offsets]
-    dd = [o["max_drawdown"] for o in offsets]
-    med_ann, med_dd = float(np.median(ann)), float(np.median(dd))
-    return {"portfolio_utility": round(med_ann - .5 * med_dd, 5),
-            "oos_sharpe": round(float(np.median(shp)), 4),
-            "max_drawdown": round(med_dd, 5),
-            "worst_offset_sharpe": round(float(min(shp)), 4),
-            "worst_offset_drawdown": round(float(max(dd)), 5),
-            "n_valid_offsets": len(offsets),
-            "cohorts_per_offset": [o["n_cohorts"] for o in offsets],
-            "utility_evidence": "ok",
-            "utility_basis": "staggered_non_overlapping_21s_cohorts"}
+# R6: the staggered-cohort policy metric moved to ml/portfolio_metrics so the
+# graph, the TCN bakeoff and the promotion gate all score on ONE definition.
+# These aliases keep the existing call sites (and their tests) pointed at it.
+from .ml.portfolio_metrics import (            # noqa: E402
+    MIN_COHORTS_PER_OFFSET as _MIN_COHORTS_PER_OFFSET,
+    MIN_VALID_OFFSETS as _MIN_VALID_OFFSETS,
+    cohort_returns as _cohort_returns,
+    offset_metrics as _offset_metrics,
+    staggered_portfolio_metrics as _staggered_portfolio_metrics,
+)
 
 
 def walk_forward_fit(topology: dict, bases: list[dict[str, float]], targets,

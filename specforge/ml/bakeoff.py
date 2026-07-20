@@ -1,0 +1,239 @@
+"""Model bakeoff: does the TCN earn its complexity?
+
+The R6 gate: a temporal convolutional network is only allowed to influence
+trading if it beats genuinely simple models on **net out-of-sample policy
+return** — not on pinball loss, not on rank IC. A model that forecasts more
+accurately but selects worse baskets has not earned anything.
+
+Every candidate here is fit on the identical training rows and scored on the
+identical untouched evaluation rows with the identical policy
+(`portfolio_metrics.staggered_portfolio_metrics`) and the identical R5
+per-sample costs. The only thing that varies is the model.
+
+Candidates, in ascending order of "if this wins, we did not need a network":
+
+  zero          — predict nothing. Beats a surprising number of real models.
+  momentum      — last session's return, scaled by sqrt(horizon).
+  ridge         — closed-form L2 on the latest context row.
+  elastic_net   — L1+L2 via proximal gradient; sparse, so it also shows which
+                  features carry signal at all.
+  boosted_tree  — gradient-boosted depth-1 stumps on quantile-binned features;
+                  the nonlinear-but-not-deep control.
+
+Implemented in numpy on purpose: sklearn/lightgbm are not dependencies of this
+repo and a few dozen lines of readable numpy is cheaper to audit than a new
+supply-chain edge. These are controls, not production models — they need to be
+honest and fixed, not state of the art.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import portfolio_metrics
+
+MODELS = ("zero", "momentum", "ridge", "elastic_net", "boosted_tree")
+FAMILIES = ("absolute", "excess")
+
+
+# ── simple models ─────────────────────────────────────────────────────────────
+
+def _ridge(x_train, y_train, x_all, penalty: float = 1e-2) -> np.ndarray:
+    design = np.column_stack((np.ones(len(x_train)), x_train))
+    reg = np.eye(design.shape[1]) * penalty
+    reg[0, 0] = 0                                   # never penalize the intercept
+    coef = np.linalg.solve(design.T @ design + reg, design.T @ y_train)
+    return np.column_stack((np.ones(len(x_all)), x_all)) @ coef
+
+
+def _elastic_net(x_train, y_train, x_all, alpha: float = 1e-3,
+                 l1_ratio: float = .5, iterations: int = 200) -> np.ndarray:
+    """Proximal-gradient (ISTA) elastic net — L1 shrinkage plus L2 ridge.
+
+    Plain gradient step on the smooth part, soft-threshold for the L1 part.
+    The step size is 1/L for the Lipschitz constant of the smooth gradient, so
+    it converges without a line search.
+    """
+    n = len(x_train)
+    intercept = y_train.mean(0)
+    centered = y_train - intercept
+    lipschitz = float(np.linalg.norm(x_train, 2) ** 2 / n + alpha) + 1e-12
+    weights = np.zeros((x_train.shape[1], y_train.shape[1]))
+    threshold = alpha * l1_ratio / lipschitz
+    for _ in range(iterations):
+        gradient = (x_train.T @ (x_train @ weights - centered) / n
+                    + alpha * (1 - l1_ratio) * weights)
+        weights = weights - gradient / lipschitz
+        weights = np.sign(weights) * np.maximum(np.abs(weights) - threshold, 0)
+    return x_all @ weights + intercept
+
+
+def _quantile_bins(x_train, x_all, bins: int = 16):
+    """Bin every feature by TRAIN quantiles — edges never see evaluation rows."""
+    edges = np.quantile(x_train, np.linspace(0, 1, bins + 1)[1:-1], axis=0)
+    binned = np.empty(x_all.shape, dtype=np.int16)
+    for j in range(x_all.shape[1]):
+        binned[:, j] = np.searchsorted(edges[:, j], x_all[:, j], side="left")
+    return binned, bins
+
+
+def _boosted_trees(binned_train, y_train, binned_all, bins: int,
+                   rounds: int = 60, learning_rate: float = .05,
+                   min_leaf: int = 20) -> np.ndarray:
+    """Gradient-boosted depth-1 stumps, one additive model per target column.
+
+    Per round and per feature the per-bin residual sums come from a single
+    bincount, so a split search costs O(n) rather than O(n·thresholds).
+    """
+    n_features = binned_train.shape[1]
+    prediction_train = np.zeros_like(y_train, dtype=float)
+    prediction_all = np.zeros((len(binned_all), y_train.shape[1]), dtype=float)
+    base = y_train.mean(0)
+    prediction_train += base
+    prediction_all += base
+    for column in range(y_train.shape[1]):
+        for _ in range(rounds):
+            residual = y_train[:, column] - prediction_train[:, column]
+            best = None
+            for feature in range(n_features):
+                codes = binned_train[:, feature]
+                counts = np.bincount(codes, minlength=bins)
+                sums = np.bincount(codes, weights=residual, minlength=bins)
+                left_n, left_sum = np.cumsum(counts), np.cumsum(sums)
+                right_n = left_n[-1] - left_n
+                right_sum = left_sum[-1] - left_sum
+                usable = (left_n >= min_leaf) & (right_n >= min_leaf)
+                if not usable.any():
+                    continue
+                # SSE reduction of a two-leaf split, standard boosting gain.
+                gain = np.where(usable,
+                                left_sum ** 2 / np.maximum(left_n, 1)
+                                + right_sum ** 2 / np.maximum(right_n, 1), -np.inf)
+                cut = int(np.argmax(gain))
+                if best is None or gain[cut] > best[0]:
+                    best = (gain[cut], feature, cut,
+                            left_sum[cut] / max(left_n[cut], 1),
+                            right_sum[cut] / max(right_n[cut], 1))
+            if best is None:
+                break
+            _, feature, cut, left_value, right_value = best
+            for codes, target in ((binned_train, prediction_train),
+                                  (binned_all, prediction_all)):
+                go_left = codes[:, feature] <= cut
+                target[:, column] += learning_rate * np.where(
+                    go_left, left_value, right_value)
+    return prediction_all
+
+
+# ── panel assembly ────────────────────────────────────────────────────────────
+
+def context_design(ds) -> np.ndarray:
+    """The latest session of each window, de-normalized back to real units.
+
+    Simple models get one row per window (not the full 60-session tensor) on
+    purpose: that IS the control. If a linear model on the last session matches
+    the TCN, the sequence model bought nothing.
+    """
+    raw = ds["X"] * ds["std"] + ds["mean"]
+    return raw[:, -1, :].astype(np.float64)
+
+
+def simple_predictions(ds, family: str = "absolute",
+                       models=MODELS) -> dict[str, np.ndarray]:
+    """{model: (n_windows, n_horizons) median prediction} for every simple model."""
+    from .. import neural
+    y = ds["Y_absolute"] if family == "absolute" else ds["Y_excess"]
+    y = np.asarray(y, dtype=np.float64)
+    horizons = list(ds["horizons"])
+    train = ds["masks"]["train"]
+    x = context_design(ds)
+    mean, std = x[train].mean(0), x[train].std(0) + 1e-6
+    xn = (x - mean) / std
+    out: dict[str, np.ndarray] = {}
+    if "zero" in models:
+        out["zero"] = np.zeros_like(y)
+    if "momentum" in models:
+        last_return = x[:, neural.FEATURES.index("r1")]
+        out["momentum"] = np.column_stack(
+            [last_return * math.sqrt(max(1, h)) for h in horizons])
+    if "ridge" in models:
+        out["ridge"] = _ridge(xn[train], y[train], xn)
+    if "elastic_net" in models:
+        out["elastic_net"] = _elastic_net(xn[train], y[train], xn)
+    if "boosted_tree" in models:
+        binned_all, bins = _quantile_bins(xn[train], xn)
+        out["boosted_tree"] = _boosted_trees(binned_all[train], y[train],
+                                             binned_all, bins)
+    return out
+
+
+# ── scoring ───────────────────────────────────────────────────────────────────
+
+def policy_return(prediction, ds, eval_idx, family: str = "absolute",
+                  costs=None) -> dict:
+    """Net OOS policy return per horizon for one model's median predictions.
+
+    `prediction` is (n_windows, n_horizons); only the evaluation rows are read.
+    """
+    truth = np.asarray(ds["Y_absolute"] if family == "absolute"
+                       else ds["Y_excess"], dtype=np.float64)
+    dates = np.asarray(ds["dates"])[eval_idx]
+    if costs is None:
+        costs = ds.get("sample_cost", ds.get("round_trip_cost", .0016))
+    cost = (np.asarray(costs)[eval_idx] if not np.isscalar(costs)
+            and np.ndim(costs) else costs)
+    out = {}
+    for i, horizon in enumerate(ds["horizons"]):
+        out[str(horizon)] = portfolio_metrics.staggered_portfolio_metrics(
+            np.asarray(prediction)[eval_idx, i], truth[eval_idx, i], dates,
+            horizon=int(horizon), cost=cost)
+    usable = [m for m in out.values() if m.get("utility_evidence") == "ok"]
+    # Fail closed, and mean it: a model that carries evidence at ONE horizon and
+    # none at the other has not been measured. Averaging over just the horizon
+    # that happened to have enough cohorts hands it a real positive utility on
+    # partial evidence — which the gate would then read as a win.
+    complete = len(usable) == len(ds["horizons"])
+    out["evidence"] = "ok" if complete else "insufficient"
+    out["policy_utility"] = (round(float(np.mean(
+        [m["portfolio_utility"] for m in usable])), 5) if complete else -1.0)
+    return out
+
+
+def compare(ds, eval_idx, tcn_predictions: dict[str, np.ndarray] | None = None,
+            families=FAMILIES, models=MODELS) -> dict:
+    """Full bakeoff table: every simple model and every TCN seed, both families.
+
+    `tcn_predictions` maps a label (e.g. "tcn_seed_0") to (n, n_horizons)
+    medians for that family — pass {} to score the controls alone.
+
+    The TCN's entry is the MEDIAN seed, never the best: three seeds exist
+    precisely so a lucky draw cannot be presented as the model's ability.
+    """
+    table: dict[str, dict] = {}
+    for family in families:
+        entries = {name: policy_return(pred, ds, eval_idx, family)
+                   for name, pred in simple_predictions(ds, family, models).items()}
+        seeds = {name: policy_return(pred, ds, eval_idx, family)
+                 for name, pred in (tcn_predictions or {}).get(family, {}).items()}
+        best_control = max((e["policy_utility"] for e in entries.values()),
+                           default=-1.0)
+        summary = {"controls": entries, "best_control_utility": best_control,
+                   "seeds": seeds}
+        if seeds:
+            utilities = sorted(e["policy_utility"] for e in seeds.values())
+            median = float(np.median(utilities))
+            summary.update(
+                tcn_median_utility=round(median, 5),
+                tcn_best_utility=round(utilities[-1], 5),
+                tcn_worst_utility=round(utilities[0], 5),
+                tcn_seed_spread=round(utilities[-1] - utilities[0], 5),
+                n_seeds=len(utilities),
+                # The comparison the gate reads. Median seed, strict inequality.
+                beats_controls=bool(median > best_control))
+        else:
+            summary.update(n_seeds=0, beats_controls=False)
+        table[family] = summary
+    table["verdict"] = all(table[f].get("beats_controls") for f in families)
+    table["basis"] = "net_oos_policy_return_staggered_cohorts"
+    return table
