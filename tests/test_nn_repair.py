@@ -2889,3 +2889,37 @@ def test_architecture_hash_changed_with_the_skip():
     from specforge import neural
     stale = "8bd6be6dbb6f5b1e"          # v8, pre-skip
     assert neural.ARCHITECTURE_HASH != stale
+
+
+def test_feature_dropout_removes_whole_features_and_is_training_only():
+    """L1 beat L2 by a wide margin, so the network needs sparsity pressure.
+
+    Ordinary dropout scatters zeros across cells; this must remove an entire
+    feature for a sample, which is what forces redundancy across inputs.
+    """
+    import torch
+    from specforge import neural
+    model = neural._make_model(len(neural.FEATURES), 2, feature_dropout=.5)
+    x = torch.randn(64, 60, len(neural.FEATURES))
+
+    model.train()
+    dropped = model.feature_dropout(x.transpose(1, 2)).transpose(1, 2)
+    fully_zero = (dropped.abs().sum(dim=1) == 0).float().mean()
+    assert .35 < float(fully_zero) < .65          # whole columns, ~p of them
+    # Where a feature survives it is scaled, never partially zeroed.
+    survivors = dropped[0][:, (dropped[0].abs().sum(0) != 0)]
+    assert (survivors.abs().sum(0) != 0).all()
+
+    model.eval()                                   # inference must be untouched
+    assert torch.allclose(
+        model.feature_dropout(x.transpose(1, 2)).transpose(1, 2), x)
+
+
+def test_trial_grid_reaches_the_regularization_the_evidence_asks_for():
+    from specforge import neural
+    decays = [t["weight_decay"] for t in neural.TRIAL_SPECS]
+    assert max(decays) >= 1e-2          # an order of magnitude past the old grid
+    assert any(t.get("feature_dropout", 0) > 0 for t in neural.TRIAL_SPECS)
+    assert any(t.get("feature_dropout", 0) == 0 for t in neural.TRIAL_SPECS)
+    for spec in neural.TRIAL_SPECS:     # every spec is fully specified
+        assert set(spec) == {"lr", "weight_decay", "rank_weight", "feature_dropout"}

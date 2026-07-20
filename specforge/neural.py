@@ -78,16 +78,28 @@ FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
     b"tcn-v9:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
     b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated:"
-    b"linear-skip-to-median"          # v9: zero-init linear path over FEATURES
+    b"linear-skip-to-median:feature-dropout"     # v10: + whole-column dropout
 ).hexdigest()[:16]
 
+# The first clean bakeoff said two things about this data, and both argue for
+# heavier regularization than the original grid explored:
+#   * elastic-net (sparse L1) beat ridge (dense L2) in BOTH families
+#     (+0.805 vs +0.683 absolute, +0.583 vs +0.452 excess) — most of the 44
+#     features are noise and shrinking them to zero generalizes better;
+#   * boosted stumps (nonlinear) LOST to elastic-net (linear), +0.492 vs +0.805
+#     — nonlinearity is not paying here.
+# So the grid now reaches weight decay an order of magnitude higher, and
+# `feature_dropout` zeroes whole feature columns during training, which is the
+# closest a network gets to the sparsity L1 buys.
 TRIAL_SPECS = (
-    {"lr": 1e-3, "weight_decay": 1e-4, "rank_weight": .03},
-    {"lr": 5e-4, "weight_decay": 1e-4, "rank_weight": .05},
-    {"lr": 3e-4, "weight_decay": 3e-4, "rank_weight": .08},
-    {"lr": 1e-3, "weight_decay": 1e-3, "rank_weight": .05},
-    {"lr": 2e-4, "weight_decay": 1e-4, "rank_weight": .10},
-    {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08},
+    {"lr": 1e-3, "weight_decay": 1e-4, "rank_weight": .03, "feature_dropout": .0},
+    {"lr": 5e-4, "weight_decay": 1e-4, "rank_weight": .05, "feature_dropout": .1},
+    {"lr": 3e-4, "weight_decay": 3e-4, "rank_weight": .08, "feature_dropout": .0},
+    {"lr": 1e-3, "weight_decay": 1e-3, "rank_weight": .05, "feature_dropout": .2},
+    {"lr": 2e-4, "weight_decay": 1e-4, "rank_weight": .10, "feature_dropout": .0},
+    {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08, "feature_dropout": .1},
+    {"lr": 5e-4, "weight_decay": 3e-3, "rank_weight": .05, "feature_dropout": .2},
+    {"lr": 3e-4, "weight_decay": 1e-2, "rank_weight": .05, "feature_dropout": .3},
 )
 
 # The panel is the largest array in the process, so its size is a memory
@@ -575,7 +587,7 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
 
 
 def _make_model(n_features: int, n_horizons: int,
-                temporal_idx=None, context_idx=None):
+                temporal_idx=None, context_idx=None, feature_dropout: float = 0.0):
     import torch
     import torch.nn as nn
     temporal_idx = list(TEMPORAL_IDX if temporal_idx is None else temporal_idx)
@@ -625,6 +637,12 @@ def _make_model(n_features: int, n_horizons: int,
             self.skip = nn.Linear(len(FEATURES), 2 * n_horizons)
             nn.init.zeros_(self.skip.weight); nn.init.zeros_(self.skip.bias)
             self.n_horizons = n_horizons
+            # Zeroes whole FEATURE columns (not individual elements) during
+            # training, so the model cannot lean on any single input. Ordinary
+            # dropout perturbs; this forces redundancy across features, which is
+            # the closest a network gets to the sparsity L1 buys — and L1 beat
+            # L2 on this data by a wide margin.
+            self.feature_dropout = nn.Dropout1d(feature_dropout)
             # Dual return families, one quantile + one probability head per
             # horizon each. Absolute and excess are separate heads so the node
             # can read a genuine absolute forecast, not excess reinterpreted.
@@ -640,6 +658,10 @@ def _make_model(n_features: int, n_horizons: int,
         def encoded(self, x):
             # Temporal branch: only sequence-varying features, all sessions.
             # Context branch: only point-in-time features, latest session.
+            # Dropout1d wants (N, C, L), so features must be the channel axis —
+            # that is what makes it drop a whole feature rather than scattered
+            # cells.
+            x = self.feature_dropout(x.transpose(1, 2)).transpose(1, 2)
             temporal_in = x[:, :, self.temporal_idx].transpose(1, 2)
             temporal = self.blocks(temporal_in)[..., -1]
             return torch.cat((temporal, self.context(x[:, -1, self.context_idx])), dim=1)
@@ -1033,7 +1055,9 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
             break                     # partial seeds → bakeoff fails closed below
         torch.manual_seed(1000 + seed)
         rng = np.random.default_rng(1000 + seed)
-        model = _make_model(len(FEATURES), len(horizons)).to(device)
+        model = _make_model(len(FEATURES), len(horizons),
+                            feature_dropout=float(trial_spec.get(
+                                "feature_dropout", 0.0))).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         bce = torch.nn.functional.binary_cross_entropy
@@ -1149,7 +1173,9 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
             dtype=np.float32)).unsqueeze(1)
         tr = torch.from_numpy(np.flatnonzero(train_mask))
         te = np.flatnonzero(test_mask)
-        model = _make_model(len(FEATURES), len(ds["horizons"])).to(device)
+        model = _make_model(len(FEATURES), len(ds["horizons"]),
+                            feature_dropout=float(trial_spec.get(
+                                "feature_dropout", 0.0))).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         remaining_folds = max(1, len(windows) - fold)
@@ -1261,7 +1287,8 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     batch_rng = np.random.default_rng(trials)
     trial_spec = dict(TRIAL_SPECS[trials % len(TRIAL_SPECS)])
     device = _training_device(cfg, torch)
-    model = _make_model(len(FEATURES), len(ds["horizons"]))
+    model = _make_model(len(FEATURES), len(ds["horizons"]),
+                        feature_dropout=float(trial_spec.get("feature_dropout", 0.0)))
     # Holding nets are complete trainable clones of the global champion.
     parent_row = parent = None
     if symbol:
