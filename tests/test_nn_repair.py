@@ -1012,7 +1012,11 @@ def _passing_metrics(score=1.0, absolute_ok=True, **over):
     # that ranks well on excess but LOSES money absolutely after costs.
     a = (dict(h) if absolute_ok else
          {"correlation": .04, "top_decile_alpha_after_cost": -.004, "coverage": .8})
+    # R6: permission is granted on net OOS policy return, so a "passing"
+    # metrics blob must now carry a won bakeoff too.
     out = {"beats_baselines": True, "folds": folds,
+           "bakeoff": {"verdict": True,
+                       "basis": "net_oos_policy_return_staggered_cohorts"},
            "median_fold_ic_5d": .02, "median_fold_ic_21d": .03,
            "5": dict(h), "21": dict(h),
            "absolute": {"5": dict(a), "21": dict(a),
@@ -2316,3 +2320,102 @@ def test_policy_return_uses_per_sample_costs():
     dear = bakeoff.policy_return(pred, ds, eval_idx, "absolute",
                                  costs=np.full(len(ds["dates"]), .02))
     assert cheap["policy_utility"] > dear["policy_utility"]
+
+
+def test_date_grouped_batches_preserve_cross_sections():
+    """Random row batching destroys the ranking objective; date grouping keeps it."""
+    n_dates, n_symbols = 2500, 400
+    dates = np.repeat([f"d{i:05d}" for i in range(n_dates)], n_symbols)
+    rows = np.arange(len(dates))
+    rng = np.random.default_rng(0)
+    batches = neural.date_grouped_batches(dates, rows, 512, rng)
+    # Every row appears exactly once — grouping must not drop or duplicate data.
+    assert np.array_equal(np.sort(np.concatenate(batches)), rows)
+    # Each batch holds whole sessions, so nearly every row has same-day peers.
+    for batch in batches[:20]:
+        _, counts = np.unique(dates[batch], return_counts=True)
+        assert counts.min() == n_symbols          # no session split across batches
+        pairs = int((counts - 1).sum())
+        assert pairs > 0.9 * len(batch)
+    # The control: uniformly random batches of the same size leave almost none.
+    random_batch = rng.choice(rows, 512, replace=False)
+    _, counts = np.unique(dates[random_batch], return_counts=True)
+    assert int((counts[counts >= 2] - 1).sum()) < 0.25 * len(random_batch)
+
+
+def test_date_grouped_batches_are_deterministic_per_seed():
+    dates = np.repeat([f"d{i:03d}" for i in range(50)], 10)
+    rows = np.arange(len(dates))
+    first = neural.date_grouped_batches(dates, rows, 64, np.random.default_rng(7))
+    same = neural.date_grouped_batches(dates, rows, 64, np.random.default_rng(7))
+    other = neural.date_grouped_batches(dates, rows, 64, np.random.default_rng(8))
+    assert [b.tolist() for b in first] == [b.tolist() for b in same]
+    assert [b.tolist() for b in first] != [b.tolist() for b in other]
+
+
+def test_offline_gate_requires_a_policy_return_bakeoff_win():
+    assert neural._offline_gate(_passing_metrics())
+    # Losing the bakeoff blocks promotion even with every forecast metric intact.
+    losing = _passing_metrics()
+    losing["bakeoff"]["verdict"] = False
+    losing["beats_baselines"] = False
+    assert not neural._offline_gate(losing)
+    # A legacy row whose beats_baselines meant "lower pinball" cannot inherit
+    # a permission it was never measured for.
+    legacy = _passing_metrics()
+    del legacy["bakeoff"]
+    assert not neural._offline_gate(legacy)
+    # Nor can a bakeoff scored on some other basis.
+    wrong_basis = _passing_metrics()
+    wrong_basis["bakeoff"]["basis"] = "pinball"
+    assert not neural._offline_gate(wrong_basis)
+
+
+def test_seed_predictions_returns_independent_draws_per_family(cfg, store):
+    ds = _bakeoff_dataset(n_days=120, n_symbols=12, signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    preds = neural.seed_predictions(cfg, ds, eval_idx, seeds=3, epochs=1)
+    assert set(preds) == {"absolute", "excess"}
+    for family in ("absolute", "excess"):
+        assert len(preds[family]) == 3
+        for pred in preds[family].values():
+            assert pred.shape == (len(ds["dates"]), 2)
+            assert np.isfinite(pred).all()
+        # Different seeds are genuinely different models, not one run relabelled.
+        draws = list(preds[family].values())
+        assert not np.allclose(draws[0][eval_idx], draws[1][eval_idx])
+
+
+def test_bakeoff_result_is_json_serializable(cfg):
+    """Metrics are persisted to SQLite as JSON — numpy scalars would break it."""
+    import json
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    strong = ds["Y_absolute"] + np.random.default_rng(9).normal(
+        scale=.001, size=ds["Y_absolute"].shape)
+    result = bakeoff.compare(ds, eval_idx,
+                             {f: {f"tcn_seed_{i}": strong for i in range(3)}
+                              for f in bakeoff.FAMILIES})
+    assert json.loads(json.dumps(result))["verdict"] is True
+
+
+def test_feature_family_ablation_detects_the_carrying_family():
+    from specforge.ml import bakeoff
+    from specforge import neural
+    # Every feature family is covered exactly once, with no unknown names.
+    covered = [f for members in bakeoff.FEATURE_FAMILIES.values() for f in members]
+    assert sorted(covered) == sorted(neural.FEATURES)
+    assert len(covered) == len(set(covered))
+
+    ds = _bakeoff_dataset(signal=.05)          # edge planted on vol21 → "price"
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    result = bakeoff.ablate(ds, eval_idx, "absolute")
+    assert result["_full"]["evidence"] == "ok"
+    # Removing the family that carries the planted edge hurts most; families
+    # that are pure noise here cost roughly nothing.
+    assert result["price"]["delta"] < 0
+    assert result["price"]["delta"] == min(
+        v["delta"] for k, v in result.items()
+        if isinstance(v, dict) and "delta" in v)
+    assert abs(result["news"]["delta"]) < abs(result["price"]["delta"])

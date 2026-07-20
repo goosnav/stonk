@@ -20,6 +20,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import pandas as pd
 
+from .ml import bakeoff as ml_bakeoff
 from .ml import lifecycle as ml_lifecycle
 from .ml import targets as ml_targets
 
@@ -651,6 +652,35 @@ def _pinball(pred, target):
     return torch.maximum(q * err, (q - 1) * err).mean()
 
 
+def date_grouped_batches(dates, rows, batch_size: int, rng) -> list[np.ndarray]:
+    """Training batches built from WHOLE decision dates, not random rows.
+
+    The cross-sectional rank loss compares each name against its same-session
+    peers. A uniformly random 512-row batch drawn from a decade-wide panel
+    lands ~460 distinct dates and leaves roughly 50 comparable pairs out of
+    511 — the ranking objective, which is the one aligned with how the model
+    is actually used (rank names within a session), was ~90% discarded.
+
+    Sampling whole dates keeps every batch a set of real cross-sections. The
+    tradeoff is deliberate: same-day names share market-wide moves, so batch
+    gradients are more correlated than with i.i.d. sampling. For a
+    cross-sectional selection model that is the correct bias.
+    """
+    by_date: dict[str, list[int]] = {}
+    for row in rows:
+        by_date.setdefault(dates[row], []).append(int(row))
+    groups = [np.asarray(g, dtype=np.int64) for g in by_date.values()]
+    rng.shuffle(groups)
+    batches, current = [], []
+    for group in groups:
+        current.append(group)
+        if sum(len(g) for g in current) >= batch_size:
+            batches.append(np.concatenate(current)); current = []
+    if current:
+        batches.append(np.concatenate(current))
+    return batches
+
+
 def _rank_loss(pred, target, dates) -> object:
     """Small same-session pairwise loss, aligned with live cross-sectional rank."""
     import torch
@@ -865,6 +895,72 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
             "ridge": _metrics(ridge, y, horizons, dates)}
 
 
+def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
+                     seeds: int = 3, max_seconds: float | None = None,
+                     epochs: int | None = None) -> dict[str, dict[str, np.ndarray]]:
+    """Train `seeds` independent TCNs and return each one's eval-row medians.
+
+    One training run is one draw from a stochastic process — initialization,
+    batch order and dropout all vary. Reporting a single run's number as "the
+    model's ability" mistakes a draw for the distribution, and the temptation
+    to keep the best draw is exactly how a lucky seed becomes a promotion.
+    The bakeoff consumes the MEDIAN of these.
+
+    Returns {family: {"tcn_seed_N": (n_windows, n_horizons)}}, full-length so
+    callers index them with the same eval_idx they use everywhere else.
+    """
+    import torch
+    trial_spec = trial_spec or TRIAL_SPECS[0]
+    device = _training_device(cfg, torch)
+    epochs = epochs or int(cfg.get("neural", "bakeoff_epochs", default=6))
+    horizons = list(ds["horizons"])
+    train_mask = ds["masks"]["train"]
+    X = torch.from_numpy(np.asarray(ds["X"], dtype=np.float32))
+    scale_e = np.maximum(ds["Y_excess"][train_mask].std(axis=0), .005).astype(np.float32)
+    scale_a = np.maximum(ds["Y_absolute"][train_mask].std(axis=0), .005).astype(np.float32)
+    Y_e = torch.from_numpy(np.asarray(ds["Y_excess"], dtype=np.float32) / scale_e)
+    Y_a = torch.from_numpy(np.asarray(ds["Y_absolute"], dtype=np.float32) / scale_a)
+    raw_e = torch.from_numpy(np.asarray(ds["Y_excess"], dtype=np.float32))
+    raw_a = torch.from_numpy(np.asarray(ds["Y_absolute"], dtype=np.float32))
+    cost = torch.from_numpy(np.asarray(
+        ds.get("sample_cost", np.full(len(ds["dates"]), ds.get("round_trip_cost", .0016))),
+        dtype=np.float32)).unsqueeze(1)
+    rows = np.flatnonzero(train_mask)
+    started = time.monotonic()
+    out: dict[str, dict[str, np.ndarray]] = {"absolute": {}, "excess": {}}
+    for seed in range(seeds):
+        if max_seconds is not None and time.monotonic() - started >= max_seconds:
+            break                     # partial seeds → bakeoff fails closed below
+        torch.manual_seed(1000 + seed)
+        rng = np.random.default_rng(1000 + seed)
+        model = _make_model(len(FEATURES), len(horizons)).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
+                                weight_decay=trial_spec["weight_decay"])
+        bce = torch.nn.functional.binary_cross_entropy
+        for _ in range(epochs):
+            model.train()
+            for batch in date_grouped_batches(ds["dates"], rows, 512, rng):
+                idx = torch.from_numpy(batch)
+                opt.zero_grad()
+                result = model.forward_structured(X[idx].to(device))
+                loss = (_pinball(result.excess_quantiles, Y_e[idx].to(device))
+                        + _pinball(result.absolute_quantiles, Y_a[idx].to(device))
+                        + .1 * bce(result.probability_excess_positive,
+                                   (raw_e[idx].to(device) > 0).float())
+                        + .1 * bce(result.probability_absolute_edge_positive,
+                                   (raw_a[idx].to(device) > cost[idx].to(device)).float()))
+                loss.backward(); opt.step()
+                if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                    break
+        abs_pred, _, exc_pred, _ = _predict_structured(
+            model, X, eval_idx, scale_e, scale_a, device)
+        for family, pred in (("absolute", abs_pred), ("excess", exc_pred)):
+            full = np.zeros((len(ds["dates"]), len(horizons)), dtype=np.float32)
+            full[eval_idx] = pred[:, :, 1]          # median quantile
+            out[family][f"tcn_seed_{seed}"] = full
+    return out
+
+
 def _fold_windows(n_unique: int, folds: int, embargo: int) -> list[tuple[int, int, int]]:
     """Expanding purged walk-forward fold index positions over `n_unique`
     sorted sessions. Returns (train_pos, test_start_pos, test_end_pos) with a
@@ -894,6 +990,7 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
     dates, unique = ds["dates"], sorted(set(ds["dates"]))
     trial_spec = trial_spec or TRIAL_SPECS[0]
     device = _training_device(cfg, torch)
+    batch_rng = np.random.default_rng(0)   # deterministic fold batching
     folds = int(cfg.get("neural", "walk_forward_folds", default=5))
     embargo = max(ds["horizons"])
     windows = _fold_windows(len(unique), folds, embargo)
@@ -912,6 +1009,13 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
         scale = torch.from_numpy(scale_np)
         Yraw = torch.from_numpy(ds["Y"])
         Y = Yraw / scale
+        scale_abs = torch.from_numpy(np.maximum(
+            ds["Y_absolute"][train_mask].std(axis=0), .005).astype(np.float32))
+        Yraw_abs = torch.from_numpy(np.asarray(ds["Y_absolute"], dtype=np.float32))
+        Y_abs = Yraw_abs / scale_abs
+        fold_cost = torch.from_numpy(np.asarray(
+            ds.get("sample_cost", np.full(len(dates), ds.get("round_trip_cost", .0016))),
+            dtype=np.float32)).unsqueeze(1)
         tr = torch.from_numpy(np.flatnonzero(train_mask))
         te = np.flatnonzero(test_mask)
         model = _make_model(len(FEATURES), len(ds["horizons"])).to(device)
@@ -924,13 +1028,21 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
                      int(cfg.get("neural", "max_epochs", default=50)))
         for _ in range(epochs):
             model.train()
-            for idx in tr[torch.randperm(len(tr))].split(512):
+            for batch in date_grouped_batches(dates, tr.numpy(), 512, batch_rng):
+                idx = torch.from_numpy(batch)
                 xb, yb, yr = X[idx].to(device), Y[idx].to(device), Yraw[idx].to(device)
+                yb_abs = Y_abs[idx].to(device); yr_abs = Yraw_abs[idx].to(device)
                 opt.zero_grad()
-                prediction, positive_probability = model.forward_all(xb)
-                loss = _pinball(prediction, yb) + .1 * \
-                    torch.nn.functional.binary_cross_entropy(
-                        positive_probability, (yr > 0).float())
+                # R1 tail: folds train the SAME joint dual-family objective the
+                # main path does. Selecting folds on excess-only evidence while
+                # the absolute head is what trades was the original defect.
+                out = model.forward_structured(xb)
+                prediction = out.excess_quantiles
+                bce = torch.nn.functional.binary_cross_entropy
+                loss = (_pinball(prediction, yb) + _pinball(out.absolute_quantiles, yb_abs)
+                        + .1 * bce(out.probability_excess_positive, (yr > 0).float())
+                        + .1 * bce(out.probability_absolute_edge_positive,
+                                   (yr_abs > fold_cost[idx].to(device)).float()))
                 rank = sum(_rank_loss(prediction[:, h, 1], yb[:, h], dates[idx.numpy()])
                            for h in range(len(ds["horizons"]))) / len(ds["horizons"])
                 loss = loss + float(trial_spec["rank_weight"]) * rank
@@ -1015,6 +1127,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         return {"status": "caught_up", "reason": f"{trials}/{cap} trials used",
                 "data_as_of": snapshot}
     torch.manual_seed(trials)
+    batch_rng = np.random.default_rng(trials)
     trial_spec = dict(TRIAL_SPECS[trials % len(TRIAL_SPECS)])
     device = _training_device(cfg, torch)
     model = _make_model(len(FEATURES), len(ds["horizons"]))
@@ -1075,7 +1188,8 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                         else remaining_seconds)
     for epoch in range(max_epochs):
         model.train()
-        for idx in tr[torch.randperm(len(tr))].split(512):
+        for batch in date_grouped_batches(ds["dates"], tr.numpy(), 512, batch_rng):
+            idx = torch.from_numpy(batch)
             xb, yb = X[idx].to(device), Y[idx].to(device)
             yr = Yraw[idx].to(device)
             yb_abs, yr_abs = Y_abs[idx].to(device), Yraw_abs[idx].to(device)
@@ -1199,10 +1313,23 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
                    calibration_source="validation")
     if not symbol:
         metrics["baselines"] = _baseline_metrics(ds, eval_idx)
-        metrics["beats_baselines"] = all(
+        # Forecast-loss comparison is retained as a DIAGNOSTIC only. R6 moved
+        # the permission decision to net OOS policy return: a model that
+        # forecasts more accurately but selects worse baskets earned nothing.
+        metrics["beats_baselines_forecast_loss"] = all(
             metrics["pinball"] < baseline.get("pinball", float("inf")) and
             _selection_score(metrics) > _selection_score(baseline)
             for baseline in metrics["baselines"].values())
+        seeds = int(cfg.get("neural", "bakeoff_seeds", default=3))
+        budget = (None if overall_deadline is None else
+                  max(0.0, overall_deadline - time.monotonic()) * .5)
+        metrics["bakeoff"] = ml_bakeoff.compare(
+            ds, eval_idx,
+            seed_predictions(cfg, ds, eval_idx, winner_trial_spec, seeds, budget))
+        metrics["beats_baselines"] = bool(metrics["bakeoff"]["verdict"])
+        # Diagnostic, not a gate: which feature families actually carry weight.
+        # A family with a ~0 delta is a family to suspect, not to trust.
+        metrics["ablations"] = ml_bakeoff.ablate(ds, eval_idx, "absolute")
     if final_trial:
         metrics["tournament_winner_source"] = tournament_winner_id or "final_trial"
     feature_std = (ds["X"][ds["masks"]["train"]] * ds["std"] + ds["mean"]).std(
@@ -1759,7 +1886,15 @@ def _offline_gate(metrics: dict) -> bool:
         float(absolute.get(str(h), {}).get("correlation", 0)) > 0 and
         float(absolute.get(str(h), {}).get("top_decile_alpha_after_cost", 0)) > 0
         for h in (5, 21))
-    return (bool(metrics.get("beats_baselines")) and fold_gate
+    # R6: complexity must be earned on net OOS POLICY return. The median seed
+    # has to beat every simple control in BOTH families. Requiring the bakeoff
+    # block itself — with its declared basis — makes legacy metrics rows, whose
+    # `beats_baselines` meant "lower pinball", fail closed rather than inherit
+    # a permission they were never measured for.
+    bakeoff = metrics.get("bakeoff") or {}
+    bakeoff_gate = (bakeoff.get("verdict") is True and
+                    bakeoff.get("basis") == "net_oos_policy_return_staggered_cohorts")
+    return (bool(metrics.get("beats_baselines")) and bakeoff_gate and fold_gate
             and excess_gate and absolute_gate)
 
 

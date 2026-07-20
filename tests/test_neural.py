@@ -132,6 +132,9 @@ def test_offline_gate_requires_profitable_folds_and_sealed_test():
     metrics["absolute"] = {str(h): {"correlation": .02,
                                     "top_decile_alpha_after_cost": .005}
                            for h in (5, 21)}
+    # R6: and the model must have won the policy-return bakeoff.
+    metrics["bakeoff"] = {"verdict": True,
+                          "basis": "net_oos_policy_return_staggered_cohorts"}
     assert neural._offline_gate(metrics)
     metrics["absolute"]["21"]["top_decile_alpha_after_cost"] = -.001
     assert not neural._offline_gate(metrics)       # absolute loses → no entry

@@ -200,6 +200,62 @@ def policy_return(prediction, ds, eval_idx, family: str = "absolute",
     return out
 
 
+FEATURE_FAMILIES = {
+    "price": ("r1", "range", "gap", "volume_z", "vol21", "rsi14", "atr14",
+              "breakout60", "sma50_d", "sma200_d"),
+    "market": ("spy_r1", "spy_r21", "sector_relative_r21", "hyg_r21", "tlt_r21"),
+    "volatility": ("vix", "vix9d", "vix3m", "vix6m", "vvix", "vix_curve_9d_3m",
+                   "vix_curve_1m_3m", "implied_realized_spread",
+                   "vol_context_missing"),
+    "valuation": ("valuation", "valuation_missing"),
+    "event": ("event_proximity", "event_missing"),
+    "fundamentals": ("revenue_growth", "revenue_growth_missing", "operating_margin",
+                     "operating_margin_missing", "fcf_margin", "fcf_margin_missing",
+                     "debt_assets", "debt_assets_missing", "dilution",
+                     "dilution_missing", "accruals", "accruals_missing",
+                     "liquidity", "liquidity_missing"),
+    "news": ("news_sentiment", "news_missing"),
+}
+
+
+def ablate(ds, eval_idx, family: str = "absolute", model: str = "ridge",
+           families=None) -> dict:
+    """Policy-return cost of removing each feature family, one at a time.
+
+    Ablation runs on a simple model on purpose — it is fast, deterministic, and
+    the question ("does this family carry signal at all?") does not need a
+    network to answer. A family whose removal does not hurt is not evidence of
+    a subtle deep interaction; it is a family to suspect.
+
+    Returns {family_name: {"policy_utility": .., "delta": ..}} where a NEGATIVE
+    delta means removing the family hurt, i.e. the family was carrying weight.
+    """
+    from .. import neural
+    families = families or FEATURE_FAMILIES
+    full = policy_return(simple_predictions(ds, family, (model,))[model],
+                         ds, eval_idx, family)
+    out = {"_full": {"policy_utility": full["policy_utility"],
+                     "evidence": full["evidence"]}}
+    original = ds["X"]
+    for name, members in families.items():
+        columns = [neural.FEATURES.index(f) for f in members
+                   if f in neural.FEATURES]
+        if not columns:
+            continue
+        knocked = np.array(original, copy=True)
+        knocked[:, :, columns] = 0.0            # normalized space → 0 is the mean
+        trimmed = dict(ds, X=knocked)
+        scored = policy_return(simple_predictions(trimmed, family, (model,))[model],
+                               trimmed, eval_idx, family)
+        out[name] = {
+            "policy_utility": scored["policy_utility"],
+            "evidence": scored["evidence"],
+            "delta": round(scored["policy_utility"] - full["policy_utility"], 5)}
+    out["basis"] = "net_oos_policy_return_staggered_cohorts"
+    out["ablated_model"] = model
+    return out
+
+
 def compare(ds, eval_idx, tcn_predictions: dict[str, np.ndarray] | None = None,
             families=FAMILIES, models=MODELS) -> dict:
     """Full bakeoff table: every simple model and every TCN seed, both families.

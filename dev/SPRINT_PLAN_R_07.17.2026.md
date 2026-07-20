@@ -140,3 +140,49 @@ that currently grants it permission."
   point-in-time membership needs a historical security master (R6 input).
   * Label retargeting to modeled entry price (carried from R2) is NOT done —
     it lands with R6's dataset rebuild rather than bumping the schema twice.
+- 2026-07-20 R6 PARTIAL (368 tests): model laboratory. Exit gate MET as a
+  mechanism; NOT yet exercised on a real model (no trained champion exists).
+  * `ml/portfolio_metrics.py`: the staggered non-overlapping cohort metric
+    moved out of graph.py so the graph, the bakeoff and the promotion gate all
+    score on ONE definition; it now takes R5 per-sample cost arrays.
+  * `ml/bakeoff.py`: zero / momentum / ridge / elastic-net / boosted-stump
+    controls, implemented in numpy (sklearn and lightgbm are not dependencies
+    and ~40 auditable lines beat a new supply-chain edge for a control).
+    Every candidate is fit on identical train rows, scored on identical eval
+    rows, same policy, same costs. Both families scored independently — the
+    R1 tail.
+  * `neural.seed_predictions`: >=3 independent TCN draws. The gate reads the
+    MEDIAN seed; the spread is reported. A lucky seed cannot promote.
+  * `_offline_gate` now requires `bakeoff.verdict is True` AND the declared
+    basis string, so legacy rows whose `beats_baselines` meant "lower pinball"
+    fail closed instead of inheriting a permission they were never measured
+    for. The old forecast-loss comparison survives as
+    `beats_baselines_forecast_loss`, a diagnostic.
+  * `neural.date_grouped_batches`: batches are now whole decision dates. Proof
+    of the defect it fixes: a uniform 512-row batch over a 2500-date x 400-name
+    panel lands ~460 distinct dates and leaves ~52 usable pairs out of 511 —
+    the cross-sectional rank loss, the objective aligned with how the model is
+    actually used, was ~90% discarded. Applied to the main loop AND the folds.
+  * Walk-forward folds migrated to `forward_structured` with the joint
+    dual-family objective and per-sample cost labels (the rest of the R1 tail).
+    Folds no longer train and select on excess-only evidence.
+  * `bakeoff.ablate`: per-feature-family policy-return deltas, reported in
+    metrics. A family whose removal costs nothing is a family to suspect.
+  Two real bugs found while checking the new tests were not vacuous:
+    (a) `policy_return` returned a large POSITIVE utility while its own
+        evidence field said "insufficient" — a model measured at one horizon
+        and not the other read as a win. Now fails closed.
+    (b) `MIN_VALID_OFFSETS=8` is unsatisfiable at horizon 5, which has only 5
+        phases. Inherited from graph.py and latent because graph only ever
+        called the metric at horizon 21. Now requires every phase when fewer
+        than 8 exist.
+  NOT DONE, carried forward — these are capacity/architecture items that do
+  not gate the comparison, and I am not calling R6 complete:
+    * Streaming panel: the 12,000-window cap and `max_windows_per_symbol` are
+      untouched. R5 added delisted names to the panel, so the cap now bites
+      HARDER than before — the bakeoff currently runs on a truncated panel.
+      This is the most important R6 remainder.
+    * Per-holding models are still full fine-tunes of the global champion; the
+      shared-model-plus-small-adapters refactor is not started.
+    * Ablation runs on ridge, not on the TCN — cheap and deterministic, but it
+      cannot see a family that only a network can exploit.
