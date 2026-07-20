@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .ml import bakeoff as ml_bakeoff
+from .ml import facts as ml_facts
 from .ml import lifecycle as ml_lifecycle
 from .ml import targets as ml_targets
 
@@ -207,12 +208,7 @@ def _fundamental_series(store, symbol: str, index) -> dict[str, pd.Series]:
     empty.update({n + "_missing": pd.Series(1.0, index=index) for n in names})
     if not inst or not inst["cik"]:
         return empty
-    tags = ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
-            "OperatingIncomeLoss", "NetCashProvidedByUsedInOperatingActivities",
-            "PaymentsToAcquirePropertyPlantAndEquipment", "LongTermDebtCurrent",
-            "LongTermDebtNoncurrent", "LongTermDebt", "Assets", "NetIncomeLoss",
-            "AssetsCurrent", "LiabilitiesCurrent", "CommonStocksIncludingAdditionalPaidInCapital",
-            "CommonStockSharesOutstanding")
+    tags = ml_facts.REQUIRED_TAGS
     marks = ",".join("?" for _ in tags)
     rows = store.db.execute(
         f"SELECT filed,period_end,tag,value FROM filing_facts WHERE cik=? "
@@ -1396,9 +1392,18 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     feature_std = (ds["X"][ds["masks"]["train"]] * ds["std"] + ds["mean"]).std(
         axis=(0, 1))
     active_features = [name for name, value in zip(FEATURES, feature_std) if value > 1e-8]
+    inactive_features = [name for name in FEATURES if name not in active_features]
+    # A WHOLE family sitting at constant zero is a data-supply failure, not a
+    # weak signal, and it hid for months inside a flat "inactive" list nobody
+    # read. Name the dead families explicitly so the failure is legible.
+    dead_families = sorted(
+        name for name, members in ml_bakeoff.FEATURE_FAMILIES.items()
+        if members and all(f in inactive_features for f in members))
     metrics["feature_diagnostics"] = {
         "active": active_features,
-        "inactive": [name for name in FEATURES if name not in active_features]}
+        "inactive": inactive_features,
+        "dead_families": dead_families,
+        "live_fraction": round(len(active_features) / max(1, len(FEATURES)), 3)}
     for i, h in enumerate(ds["horizons"]):
         metrics[str(h)]["probability_brier"] = round(float(np.mean(
             (probability[:, i] - (ds["Y"][eval_idx, i] > 0)) ** 2)), 5)

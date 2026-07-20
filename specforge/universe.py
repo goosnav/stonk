@@ -234,17 +234,7 @@ def ingest_next_filing_facts(store, client=httpx) -> dict:
         store.kv_set(f"filing_facts_attempted_{row['symbol']}", result)
         store.audit("filing_facts_failed", result)
         return result
-    wanted = {
-        "EarningsPerShareDiluted", "Revenues",
-        "RevenueFromContractWithCustomerExcludingAssessedTax", "GrossProfit",
-        "OperatingIncomeLoss", "NetIncomeLoss", "OperatingExpenses",
-        "Assets", "AssetsCurrent", "Liabilities", "LiabilitiesCurrent",
-        "StockholdersEquity", "CashAndCashEquivalentsAtCarryingValue",
-        "NetCashProvidedByUsedInOperatingActivities",
-        "PaymentsToAcquirePropertyPlantAndEquipment",
-        "LongTermDebtCurrent", "LongTermDebtNoncurrent", "ShortTermBorrowings",
-        "CommonStockSharesOutstanding", "WeightedAverageNumberOfDilutedSharesOutstanding",
-    }
+    from .ml.facts import FETCH_TAGS as wanted
     inserted = 0
     with store.db:
         for tag in wanted & set(facts):

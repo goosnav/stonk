@@ -1404,11 +1404,20 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
         floor = int(cfg.get("research", "min_training_universe", default=500))
         missing = _missing_history(store, int(cfg.get(
             "research", "backfill_batch_size", default=50)))
+        # An issuer counts as covered only when it carries the tags the
+        # FEATURES need. Counting issuers with ANY fact row reported 100%
+        # coverage while 12 of 14 fundamental features sat at constant zero,
+        # because "absent" and "present but uninformative" look identical once
+        # a missing fact becomes a 0.0 with a missing-flag beside it.
+        from .ml import facts as ml_facts
         fact_row = store.db.execute(
-            "SELECT COUNT(DISTINCT f.cik) n FROM filing_facts f JOIN instruments i "
-            "ON i.cik=f.cik JOIN universe_membership u ON u.symbol=i.symbol AND "
-            "u.tier='research' AND u.as_of=(SELECT MAX(as_of) FROM universe_membership "
-            "WHERE tier='research')").fetchone()
+            f"SELECT COUNT(*) n FROM (SELECT f.cik FROM filing_facts f "
+            "JOIN instruments i ON i.cik=f.cik JOIN universe_membership u "
+            "ON u.symbol=i.symbol AND u.tier='research' "
+            "AND u.as_of=(SELECT MAX(as_of) FROM universe_membership "
+            "WHERE tier='research') GROUP BY f.cik "
+            f"HAVING {ml_facts.covered_issuer_sql('f')} >= ?)",
+            (ml_facts.required_tag_floor(),)).fetchone()
         issuer_target = store.db.execute(
             "SELECT COUNT(*) n FROM universe_membership u JOIN instruments i "
             "ON i.symbol=u.symbol WHERE u.tier='research' AND u.as_of=(SELECT MAX(as_of) "

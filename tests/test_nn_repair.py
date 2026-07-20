@@ -2490,3 +2490,92 @@ def test_shipped_config_does_not_pin_the_panel_below_the_budget():
     cfg = load_config("paper")
     assert cfg.get("neural", "max_training_windows", default=None) is None
     assert neural._training_window_limit(cfg) > 100_000
+
+
+# ── SEC fact contract: absence must not look like coverage ───────────────────
+
+def test_every_feature_tag_is_actually_fetched():
+    """The ingester, the feature builder and the gate share ONE tag list.
+
+    They drifted before: the fetch list was widened, issuers only re-fetch
+    weekly, and the store kept the old narrow set while the feature builder
+    asked for 14 tags it would never get.
+    """
+    from specforge.ml import facts as ml_facts
+    assert set(ml_facts.REQUIRED_TAGS) <= ml_facts.FETCH_TAGS
+    assert len(set(ml_facts.REQUIRED_TAGS)) == len(ml_facts.REQUIRED_TAGS)
+    # The feature builder must query the shared list, not a private copy...
+    import inspect
+    import re
+    source = inspect.getsource(neural._fundamental_series)
+    assert "ml_facts.REQUIRED_TAGS" in source
+    # ...and every SEC tag it actually consumes must be one the ingester fetches.
+    # This is the drift that produced 12 constant features: a tag read here but
+    # never requested upstream yields 0.0 forever, indistinguishable from a real
+    # zero. CamelCase keys pulled from `state` are the tags in play.
+    consumed = set(re.findall(r'state\.get\("([A-Z][A-Za-z]+)"', source))
+    assert consumed, "expected to find the tags this feature builder reads"
+    assert consumed <= set(ml_facts.REQUIRED_TAGS), consumed - set(ml_facts.REQUIRED_TAGS)
+
+
+def test_fundamental_coverage_counts_tags_not_bare_rows(cfg, store):
+    """An issuer with one tag is not a covered issuer."""
+    from specforge.ml import facts as ml_facts
+    floor = ml_facts.required_tag_floor()
+    with store.db:
+        store.db.execute(
+            "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+            "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("THIN", "Thin", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+             "2026-01-01", "test", "111", "x"))
+        store.db.execute(
+            "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+            "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("FULL", "Full", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+             "2026-01-01", "test", "222", "y"))
+        for sym, cik in (("THIN", "111"), ("FULL", "222")):
+            store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                             ("2026-07-01", sym, "research", 1, "test", "{}"))
+        # THIN carries one required tag; FULL carries the whole required set.
+        store.db.execute("INSERT INTO filing_facts VALUES(?,?,?,?,?,?,?,?)",
+                         ("111", ml_facts.REQUIRED_TAGS[0], "2025-12-31",
+                          "2026-02-01", 1.0, "USD", "10-K", "a1"))
+        for i, tag in enumerate(ml_facts.REQUIRED_TAGS):
+            store.db.execute("INSERT INTO filing_facts VALUES(?,?,?,?,?,?,?,?)",
+                             ("222", tag, "2025-12-31", "2026-02-01", 1.0,
+                              "USD", "10-K", f"b{i}"))
+
+    def covered():
+        return store.db.execute(
+            f"SELECT COUNT(*) n FROM (SELECT f.cik FROM filing_facts f "
+            "JOIN instruments i ON i.cik=f.cik JOIN universe_membership u "
+            "ON u.symbol=i.symbol AND u.tier='research' "
+            "AND u.as_of=(SELECT MAX(as_of) FROM universe_membership "
+            "WHERE tier='research') GROUP BY f.cik "
+            f"HAVING {ml_facts.covered_issuer_sql('f')} >= ?)",
+            (floor,)).fetchone()["n"]
+
+    # The old count — any fact row at all — saw two covered issuers. Only one is.
+    assert store.db.execute(
+        "SELECT COUNT(DISTINCT cik) n FROM filing_facts").fetchone()["n"] == 2
+    assert covered() == 1
+
+
+def test_dead_feature_families_are_named_not_buried_in_a_flat_list():
+    """The July run had 15/44 features constant and reported it as a flat list.
+
+    Every fundamental and both news features were dead — a data-supply failure
+    that read as an unremarkable diagnostic. Families get named now.
+    """
+    from specforge.ml import bakeoff
+    inactive = list(bakeoff.FEATURE_FAMILIES["news"]) + \
+        list(bakeoff.FEATURE_FAMILIES["fundamentals"]) + ["vol21"]
+    dead = sorted(name for name, members in bakeoff.FEATURE_FAMILIES.items()
+                  if members and all(f in inactive for f in members))
+    assert dead == ["fundamentals", "news"]
+    # A partially-inactive family is NOT dead — one live member is enough.
+    partial = [f for f in bakeoff.FEATURE_FAMILIES["news"]][:1]
+    assert not [name for name, members in bakeoff.FEATURE_FAMILIES.items()
+                if members and all(f in partial for f in members)]
