@@ -115,9 +115,44 @@ def detect(store, symbols=None, since: str = "1900-01-01") -> list[dict]:
                 "close": round(float(closes[index]), 4),
                 "simple_rational": bool(rational), "persists": bool(persists),
                 "extreme": bool(extreme),
-                "kind": "seam" if ((rational and persists) or extreme)
-                        else "suspicious"})
+                # Only an IMPOSSIBLE ratio is called a seam. The split-factor
+                # test cannot carry this on its own: a -33% session lands within
+                # tolerance of 2/3, so "declared split factor + persistent shift"
+                # flagged AMD's 2002 dot-com crash and MCD, and quarantined 93
+                # symbols on what were mostly real drawdowns. Distinguishing a
+                # 3:2 split from a -33% crash needs the issuer's actual split
+                # dates, which this offline detector does not have.
+                "kind": "seam" if extreme else "suspicious"})
     return findings
+
+
+LARGE_MOVES_PER_YEAR = 1.5
+
+
+def unreliable(store, symbols=None, threshold: float = LARGE_MOVES_PER_YEAR) -> dict:
+    """Symbols whose price history is too jumpy to be real, by DENSITY.
+
+    A data-quality test, deliberately not a corporate-action claim. A volatile
+    semiconductor might print three >35% sessions in thirty years; ABVC's series
+    carries 130. Density separates "genuinely wild stock" from "provider cannot
+    represent this security" without needing to know why any single jump exists.
+    """
+    counts: dict[str, dict] = {}
+    for symbol in _symbols(store, symbols):
+        rows = store.db.execute(
+            "SELECT d, close FROM bars WHERE symbol=? ORDER BY d", (symbol,)).fetchall()
+        if len(rows) < 250:
+            continue
+        closes = np.asarray([float(r["close"]) for r in rows], dtype=np.float64)
+        ratios = closes[1:] / np.maximum(closes[:-1], 1e-12)
+        large = int(np.count_nonzero((ratios > UPPER_CANDIDATE)
+                                     | (ratios < LOWER_CANDIDATE)))
+        years = len(rows) / 252.0
+        rate = large / max(years, 1e-9)
+        if rate > threshold:
+            counts[symbol] = {"large_moves": large, "years": round(years, 1),
+                              "per_year": round(rate, 2)}
+    return counts
 
 
 def repair_symbol(store, symbol: str, fetcher=None, min_coverage: float = 0.9,

@@ -16,7 +16,7 @@ from conftest import synth_bars
 from specforge import bars_audit
 
 
-def _seamed(n_days=200, factor=10.0, at=120):
+def _seamed(n_days=200, factor=50.0, at=120):
     """Bars where everything before `at` sits on a pre-reverse-split basis."""
     rows = synth_bars(n_days=n_days, wiggle=0.004)
     for row in rows[:at]:
@@ -50,8 +50,8 @@ def test_black_monday_is_not_mistaken_for_a_corporate_action(cfg, store):
     assert [f for f in found if f["kind"] == "suspicious"]
 
 
-def test_detector_finds_a_reverse_split_seam(cfg, store):
-    rows = _seamed(factor=10.0, at=120)
+def test_detector_finds_an_impossible_jump(cfg, store):
+    rows = _seamed(factor=50.0, at=120)
     store.upsert_bars("SEAM", rows, "test")
     found = bars_audit.detect(store, ["SEAM"])
     seams = [f for f in found if f["kind"] == "seam"]
@@ -59,7 +59,7 @@ def test_detector_finds_a_reverse_split_seam(cfg, store):
     seam = seams[0]
     assert seam["symbol"] == "SEAM"
     assert seam["d"] == rows[120]["d"]
-    assert seam["ratio"] == pytest.approx(10.0, rel=.05)
+    assert seam["ratio"] == pytest.approx(50.0, rel=.05)
 
 
 def test_detector_does_not_flag_a_genuine_spike_that_reverts(cfg, store):
@@ -154,6 +154,18 @@ def test_extreme_ratios_are_seams_even_without_a_simple_split_factor(cfg, store)
     assert len(seams) == 1
     assert seams[0]["simple_rational"] is False      # not a clean split factor...
     assert seams[0]["extreme"] is True               # ...but impossible regardless
+
+
+def test_a_plain_ten_to_one_split_seam_is_reported_not_auto_repaired(cfg, store):
+    """10x is below the impossible threshold, so it needs a human.
+
+    A 1-for-10 reverse split and a genuine 10-bagger session both produce this
+    ratio, and nothing offline separates them. Reported, never rewritten.
+    """
+    store.upsert_bars("TENX", _seamed(factor=10.0, at=120), "test")
+    found = bars_audit.detect(store, ["TENX"])
+    assert not [f for f in found if f["kind"] == "seam"]
+    assert [f for f in found if f["kind"] == "suspicious"]
 
 
 def test_a_large_but_believable_move_still_needs_both_ordinary_tests(cfg, store):
@@ -319,8 +331,8 @@ def test_symbols_still_seamed_after_refetch_are_quarantined(cfg, store):
     ultra-thin names with repeated reverse splits badly, and excluding them is
     more honest than pretending a refetch fixed anything.
     """
-    store.upsert_bars("BROKEN", _seamed(factor=10.0, at=120), "test")
-    still_broken = _seamed(factor=10.0, at=120)      # provider serves it again
+    store.upsert_bars("BROKEN", _seamed(factor=50.0, at=120), "test")
+    still_broken = _seamed(factor=50.0, at=120)      # provider serves it again
     report = bars_audit.audit(store, symbols=["BROKEN"], repair=True,
                               fetcher=lambda sym: still_broken)
     assert report["still_seamed"] == ["BROKEN"]
@@ -359,3 +371,41 @@ def test_build_dataset_excludes_quarantined_symbols(cfg, store):
     assert "error" not in ds
     assert "BBB" not in set(ds["owners"])
     assert ds["pit"]["quarantined_symbols"] == 1
+
+
+def test_a_real_crash_at_a_split_like_ratio_is_never_auto_repaired(cfg, store):
+    """Regression: AMD's 2002 crash (-32%) and MCD were quarantined as splits.
+
+    0.676 sits within tolerance of 2/3, and the drop persisted, so
+    "declared split factor + persistent level shift" flagged it. Ninety-three
+    symbols were excluded on what were mostly real drawdowns. Only an
+    impossible ratio is a seam now.
+    """
+    rows = synth_bars(n_days=300, wiggle=0.004)
+    for row in rows[150:]:                     # permanent -32%, like a bear bottom
+        for key in ("open", "high", "low", "close"):
+            row[key] *= 0.676
+    store.upsert_bars("AMDLIKE", rows, "test")
+    found = bars_audit.detect(store, ["AMDLIKE"])
+    assert not [f for f in found if f["kind"] == "seam"]
+    assert [f for f in found if f["kind"] == "suspicious"]
+
+
+def test_unreliable_flags_by_density_not_by_any_single_jump(cfg, store):
+    """A volatile stock prints a few huge sessions; broken data prints dozens."""
+    import numpy as np
+    volatile = synth_bars(n_days=2600, wiggle=0.004)
+    for i in (300, 900, 1800):                 # three real shocks over ~10 years
+        for key in ("open", "high", "low", "close"):
+            volatile[i][key] *= 1.8
+    store.upsert_bars("VOLATILE", volatile, "test")
+
+    junk = synth_bars(n_days=2600, wiggle=0.004)
+    for i in range(100, 2500, 40):             # a jump every 40 sessions
+        for key in ("open", "high", "low", "close"):
+            junk[i][key] *= 2.2
+    store.upsert_bars("JUNK", junk, "test")
+
+    flagged = bars_audit.unreliable(store, ["VOLATILE", "JUNK"])
+    assert "JUNK" in flagged and "VOLATILE" not in flagged
+    assert flagged["JUNK"]["per_year"] > bars_audit.LARGE_MOVES_PER_YEAR
