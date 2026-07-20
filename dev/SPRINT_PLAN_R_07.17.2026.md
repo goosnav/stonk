@@ -214,3 +214,61 @@ that currently grants it permission."
   Still open from R6: per-holding models remain full fine-tunes (the
   shared-model-plus-adapters refactor is not started), and ablation still runs
   on ridge rather than the TCN.
+- 2026-07-20 LOG FORENSICS: silent SEC fact starvation (375 tests).
+  The 2026-07-17 `tcn_repair` run in logs/worker-live.log carried
+  `feature_diagnostics.inactive` = 15 of 44 features: EVERY fundamental except
+  revenue_growth, plus both news features. Root cause was three components
+  disagreeing about which SEC tags matter:
+    * the ingester's tag list was widened on 2026-07-15 (14f7966), but issuers
+      already marked complete re-fetch only WEEKLY, so five days later not one
+      had refreshed and the store still held the old narrow set;
+    * `_fundamental_series` asked for 14 tags; the store had 6 of them, and a
+      tag that is never fetched yields 0.0 forever — indistinguishable from a
+      real zero once a missing-flag is set beside it;
+    * `min_fundamental_coverage` counted issuers with ANY fact row. Measured
+      against the tags the features actually need, the 213 "covered" issuers
+      are ZERO — not one carries even half the required set. The gate was 100%
+      wrong and the training run sailed through it.
+  Fix: `ml/facts.py` is the single tag contract; ingester, feature builder and
+  coverage gate all import it. A test asserts every tag the feature builder
+  consumes is one the ingester fetches. Metrics now name dead feature FAMILIES
+  and report `live_fraction` instead of burying 15 constant inputs in a flat
+  list nobody read.
+  Also checked and found HISTORICAL, not current: the ConfigError storm (6844
+  in worker-live, 1068 in runtime-live) and the BrokenPipeError storm both stop
+  well before the end of their logs, with successful jobs immediately after —
+  they predate the ad3d871 config fix and are resolved.
+  NOT fixed, and it needs a decision: news covers 2026-02-05 → 2026-07-20 (62
+  days, 52 symbols) against a panel starting 2011. The news feature is ~0 for
+  99% of training history and R5's known_at correction makes it sparser still.
+  It is honest but near-useless as a training input at this coverage.
+- 2026-07-20 R7 PARTIAL (381 tests): regime layer challenger.
+  `ml/regime_hmm.py` — fold-local Gaussian HMM as a CHALLENGER to the existing
+  deterministic `specforge/regime.py` (which already uses exactly the
+  market-level inputs the review specified: trend, VIX level/curve, breadth,
+  HYG-TLT credit proxy).
+  * FILTERED states only. `filter_states` runs the forward recursion alone;
+    the backward pass exists solely to fit parameters on a closed training
+    window and never labels a decision. There is deliberately no public
+    smoothed-posterior function — the usual library call returns
+    P(state_t | x_1..x_T), which labels a 2008 session using 2009 data. The
+    headline test mutates everything after t and asserts labels before t are
+    bit-identical, mirroring the R2 future-bar gate.
+  * Market-level inputs only, asserted by test; no per-stock surface exists.
+  * Output is a scalar deployment multiplier per state, monotone in that
+    state's train-window volatility by construction, so the layer can throttle
+    exposure but can never point at a stock.
+  * `state_agreement` compares partitions under the best relabeling, since HMM
+    state indices are arbitrary.
+  Bug found in my own first draft: `seed_stability` was theater. Initialization
+  was deterministic (quantile slices + 1e-3 jitter), so every seed converged
+  identically and agreement was ~1.0 even on pure noise — a stability check
+  that cannot fail. Switched to genuine random restarts; it now reads 1.00 on
+  planted regimes vs 0.64 on noise.
+  NOT DONE — R7 is not complete: the HMM is not wired into `engine.run_cycle`
+  and nothing consumes its multiplier yet. The retention gate ("retained only
+  if net OOS utility improves") is specified but NOT run, because running it
+  honestly needs the R3 policy backtest driven under both regime sources, and
+  the deterministic baseline has never been measured either. Wiring it in
+  before that measurement exists would grant it influence it has not earned —
+  the exact failure mode R0-R1 were written to prevent.

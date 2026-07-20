@@ -2579,3 +2579,106 @@ def test_dead_feature_families_are_named_not_buried_in_a_flat_list():
     partial = [f for f in bakeoff.FEATURE_FAMILIES["news"]][:1]
     assert not [name for name, members in bakeoff.FEATURE_FAMILIES.items()
                 if members and all(f in partial for f in members)]
+
+
+# ── R7: regime layer — filtered states, market inputs, deployment only ───────
+
+def _regime_panel(n=600, seed=0):
+    """Two genuine regimes: calm/drifting-up, then volatile/flat."""
+    rng = np.random.default_rng(seed)
+    half = n // 2
+    calm = np.column_stack([
+        rng.normal(.0008, .004, half), np.full(half, .008) + rng.normal(0, 1e-4, half),
+        rng.normal(14, 1.0, half), rng.normal(-.02, .01, half),
+        rng.normal(.65, .05, half), rng.normal(.002, .002, half),
+        rng.normal(.010, .002, half)])
+    wild = np.column_stack([
+        rng.normal(-.0005, .020, n - half), np.full(n - half, .030) + rng.normal(0, 1e-3, n - half),
+        rng.normal(31, 4.0, n - half), rng.normal(.06, .02, n - half),
+        rng.normal(.35, .08, n - half), rng.normal(-.006, .004, n - half),
+        rng.normal(.025, .004, n - half)])
+    return np.vstack([calm, wild])
+
+
+def test_filtered_states_cannot_see_the_future():
+    """THE R7 gate: a label at t must not move when data after t changes.
+
+    A smoothed posterior — what a stock HMM call returns — fails this, which is
+    how an HMM regime layer produces a clairvoyant backtest.
+    """
+    from specforge.ml import regime_hmm
+    x = _regime_panel()
+    params = regime_hmm.fit(x[:300], n_states=2, seed=0)
+    boundary = 400
+    early, _ = regime_hmm.filter_states(x[:boundary], params)
+    mutated = np.array(x, copy=True)
+    mutated[boundary:] *= -3.0                     # scramble everything after t
+    mutated[boundary:] += 99.0
+    full, _ = regime_hmm.filter_states(mutated, params)
+    assert np.array_equal(early, full[:boundary])   # bit-identical before t
+    # And there is no smoothed labeler available to reach for by accident.
+    assert not hasattr(regime_hmm, "smooth_states")
+    assert not hasattr(regime_hmm, "predict_proba")
+
+
+def test_hmm_recovers_two_planted_regimes():
+    from specforge.ml import regime_hmm
+    x = _regime_panel()
+    params = regime_hmm.fit(x[:400], n_states=2, seed=0)
+    states, posterior = regime_hmm.filter_states(x, params)
+    assert posterior.shape == (len(x), 2)
+    assert np.allclose(posterior.sum(1), 1.0)
+    # Each planted half should be dominated by one state — allowing a lag for
+    # the filter to react, which a causal filter necessarily has.
+    calm, wild = states[50:280], states[350:]
+    assert (calm == np.bincount(calm).argmax()).mean() > .85
+    assert (wild == np.bincount(wild).argmax()).mean() > .85
+    assert np.bincount(calm).argmax() != np.bincount(wild).argmax()
+
+
+def test_state_agreement_is_invariant_to_label_switching():
+    from specforge.ml import regime_hmm
+    a = np.array([0, 0, 1, 1, 2, 2, 0, 1])
+    relabeled = np.array([1, 1, 2, 2, 0, 0, 1, 2])     # same partition, new names
+    assert regime_hmm.state_agreement(a, relabeled, 3) == 1.0
+    assert regime_hmm.state_agreement(a, a, 3) == 1.0
+    scrambled = np.array([2, 1, 0, 2, 1, 0, 2, 0])
+    assert regime_hmm.state_agreement(a, scrambled, 3) < 1.0
+
+
+def test_seed_stability_flags_states_fitted_to_noise():
+    from specforge.ml import regime_hmm
+    real = _regime_panel()
+    stable = regime_hmm.seed_stability(real[:400], real, n_states=2, seeds=3)
+    assert stable["mean_agreement"] > .9 and not stable["degenerate"]
+    # Pure noise has no regimes; asking for 3 states finds unstable ones.
+    noise = np.random.default_rng(5).normal(size=(600, len(regime_hmm.FEATURES)))
+    unstable = regime_hmm.seed_stability(noise[:400], noise, n_states=3, seeds=3)
+    assert unstable["mean_agreement"] < stable["mean_agreement"]
+
+
+def test_regime_only_throttles_deployment_and_is_monotone_in_volatility():
+    from specforge.ml import regime_hmm
+    x = _regime_panel()
+    params = regime_hmm.fit(x[:400], n_states=2, seed=0)
+    multipliers = regime_hmm.deployment_multipliers(x[:400], params)
+    assert multipliers.shape == (2,)
+    assert ((multipliers >= 0) & (multipliers <= 1)).all()
+    # The calmer state must never be granted LESS deployment than the wilder one.
+    states, _ = regime_hmm.filter_states(x[:400], params)
+    volatility = [x[:400][states == s, regime_hmm.FEATURES.index("bench_vol")].mean()
+                  for s in range(2)]
+    calm, wild = int(np.argmin(volatility)), int(np.argmax(volatility))
+    assert multipliers[calm] > multipliers[wild]
+    # Output is a scalar per state — there is no per-symbol surface at all.
+    assert multipliers.ndim == 1
+
+
+def test_regime_features_are_market_level_only():
+    """No per-stock input may enter the regime layer."""
+    from specforge.ml import regime_hmm
+    forbidden = ("symbol", "ticker", "stock", "position", "holding", "name")
+    assert not any(bad in f for f in regime_hmm.FEATURES for bad in forbidden)
+    assert set(regime_hmm.FEATURES) == {
+        "bench_return", "bench_vol", "vix_level", "vix_slope",
+        "breadth", "credit", "dispersion"}
