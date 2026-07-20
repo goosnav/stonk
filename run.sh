@@ -2,6 +2,10 @@
 # Stonk Terminal launcher: setup → verify → serve. Idempotent.
 set -euo pipefail
 cd "$(dirname "$0")"
+# macOS soft FD limit is 256 — a long-running server (yfinance thread pools,
+# SQLite WAL, sockets) exhausts it in days (2026-07-19: Errno 24 broke quotes,
+# the broker probe, and yfinance's own cache DB). Raise it for this process.
+ulimit -n 4096 2>/dev/null || true
 
 PORT=8420
 URL="http://127.0.0.1:$PORT"

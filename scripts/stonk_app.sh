@@ -4,6 +4,10 @@
 # on the port, it just opens the browser instead of fighting for it.
 set -uo pipefail
 umask 077
+# macOS soft FD limit is 256 — a long-running server (yfinance thread pools,
+# SQLite WAL, sockets) exhausts it in days (2026-07-19: Errno 24 broke quotes,
+# the broker probe, and yfinance's own cache DB). Raise it for this process.
+ulimit -n 4096 2>/dev/null || true
 
 REPO="/Users/jbs/Documents/code/stonk"
 PORT=8420

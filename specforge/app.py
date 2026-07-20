@@ -130,9 +130,14 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
 
     def _process() -> dict:
         now = datetime.now().astimezone()
+        try:                       # FD pressure visibility (2026-07-19 Errno 24)
+            open_fds = len(os.listdir("/dev/fd"))
+        except OSError:
+            open_fds = None
         return {"pid": os.getpid(),
                 "started_at": app.state.started_at.isoformat(timespec="seconds"),
-                "uptime_s": int((now - app.state.started_at).total_seconds())}
+                "uptime_s": int((now - app.state.started_at).total_seconds()),
+                "open_fds": open_fds}
 
     def _scheduler_alive():
         """None = no scheduler in this process (embedded/tests) — unknown, not
