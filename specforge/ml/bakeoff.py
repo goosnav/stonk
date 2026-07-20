@@ -266,6 +266,40 @@ def ablate(ds, eval_idx, family: str = "absolute", model: str = "ridge",
     return out
 
 
+def candidate_cohort_matrix(ds, eval_idx, family: str = "absolute",
+                            tcn_predictions=None, horizon: int | None = None,
+                            models=MODELS):
+    """(n_cohorts, n_candidates) non-overlapping returns, one column per trial.
+
+    This is the input the Probability of Backtest Overfitting needs: it asks
+    whether picking the in-sample best among THESE candidates predicts their
+    out-of-sample ranking. Columns must be the real alternatives that were
+    actually considered, otherwise PBO measures a search nobody performed.
+    """
+    truth = np.asarray(ds["Y_absolute"] if family == "absolute"
+                       else ds["Y_excess"], dtype=np.float64)
+    dates = np.asarray(ds["dates"])[eval_idx]
+    costs = ds.get("sample_cost", ds.get("round_trip_cost", .0016))
+    cost = (np.asarray(costs)[eval_idx]
+            if not np.isscalar(costs) and np.ndim(costs) else costs)
+    horizons = list(ds["horizons"])
+    # Shortest horizon by default: it yields the most independent cohorts, and
+    # a deflated Sharpe on a dozen observations is not worth computing.
+    index = 0 if horizon is None else horizons.index(horizon)
+    candidates = dict(simple_predictions(ds, family, models))
+    candidates.update((tcn_predictions or {}).get(family, {}))
+    columns, names = [], []
+    for name, prediction in candidates.items():
+        series = portfolio_metrics.cohort_returns(
+            np.asarray(prediction)[eval_idx, index], truth[eval_idx, index],
+            dates, int(horizons[index]), cost=cost, offset=0)
+        columns.append(series); names.append(name)
+    width = min((len(c) for c in columns), default=0)
+    if width < 4:
+        return np.empty((0, 0)), names
+    return np.column_stack([c[:width] for c in columns]), names
+
+
 def compare(ds, eval_idx, tcn_predictions: dict[str, np.ndarray] | None = None,
             families=FAMILIES, models=MODELS) -> dict:
     """Full bakeoff table: every simple model and every TCN seed, both families.

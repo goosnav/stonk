@@ -2168,7 +2168,8 @@ def test_dataset_carries_per_sample_cost_and_pit_provenance(cfg, store):
     assert ds["cost_floor"] == pytest.approx(ml_targets.round_trip_cost(cfg))
     pit = ds["pit"]
     assert pit["universe_snapshots"] == 0          # none seeded → uncovered, labeled
-    assert pit["universe_covered_windows"] == 0
+    assert pit["universe_covered_candidates"] == 0
+    assert pit["panel_windows"] == len(ds["dates"])
     assert "news" in pit
 
 
@@ -2194,7 +2195,7 @@ def test_pit_filter_drops_windows_before_membership(cfg, store):
     ccc = ds["dates"][ds["owners"] == "CCC"]
     assert len(ccc) and min(ccc) >= join
     assert ds["pit"]["universe_snapshots"] == 2
-    assert ds["pit"]["universe_dropped_windows"] > 0
+    assert ds["pit"]["universe_dropped_candidates"] > 0
 
 
 # ── R6: model laboratory — earn the complexity or don't trade ─────────────────
@@ -2788,3 +2789,21 @@ def test_sealed_holdout_consumption_is_counted_and_never_reset(cfg, store):
     assert store.db.execute(
         "SELECT COUNT(*) n FROM audit WHERE event_type='holdout_examined'"
     ).fetchone()["n"] == 3
+
+
+def test_candidate_cohort_matrix_columns_are_the_real_alternatives():
+    """PBO is only meaningful if the columns are the choices actually faced."""
+    from specforge.ml import bakeoff
+    ds = _bakeoff_dataset(signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    seeds = {f: {f"tcn_seed_{i}": ds["Y_absolute"] for i in range(3)}
+             for f in bakeoff.FAMILIES}
+    matrix, names = bakeoff.candidate_cohort_matrix(ds, eval_idx, "absolute", seeds)
+    assert names == list(bakeoff.MODELS) + ["tcn_seed_0", "tcn_seed_1", "tcn_seed_2"]
+    assert matrix.shape == (matrix.shape[0], len(names))
+    assert matrix.shape[0] >= 4 and np.isfinite(matrix).all()
+    # Too few cohorts to rank anything → empty, so governance fails closed.
+    thin = _bakeoff_dataset(n_days=25, n_symbols=10, signal=.05)
+    thin_idx = np.flatnonzero(thin["masks"]["test"])
+    empty, _ = bakeoff.candidate_cohort_matrix(thin, thin_idx, "absolute")
+    assert empty.size == 0

@@ -549,10 +549,15 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
             # The scalar survives only as the calibration threshold and as the
             # reported central cost; labels use each sample's own estimate.
             "round_trip_cost": median_cost, "cost_threshold": median_cost,
+            # These count CANDIDATE windows, before the per-symbol cap and the
+            # panel memory budget select the final panel — so they will exceed
+            # len(X). Naming them "windows" invited reading them as panel
+            # composition, which they are not.
             "pit": {"universe_snapshots": len(pit_dates),
-                    "universe_covered_windows": pit_covered,
-                    "universe_dropped_windows": pit_dropped,
-                    "universe_uncovered_windows": pit_uncovered,
+                    "universe_covered_candidates": pit_covered,
+                    "universe_dropped_candidates": pit_dropped,
+                    "universe_uncovered_candidates": pit_uncovered,
+                    "panel_windows": len(X),
                     "news": news_pit_stats(store)},
             "target_schema_hash": ml_targets.TARGET_SCHEMA_HASH,
             "data_as_of": unique[-1], "train_end": train_end,
