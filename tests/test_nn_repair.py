@@ -2853,76 +2853,8 @@ def test_one_brilliant_seed_still_cannot_carry_an_ensemble():
     assert result["verdict"] is False
 
 
-def test_linear_skip_lets_the_network_represent_a_linear_model():
-    """The TCN saw 60x44 and scored +0.172 where ridge on ONE session scored
-    +0.683. A model with strictly more information should not lose to a linear
-    map of a subset of it. The skip makes a linear model representable exactly,
-    so the deep branches only have to learn the residual."""
-    import torch
-    from specforge import neural
-    model = neural._make_model(len(neural.FEATURES), 2)
-    model.eval()          # dropout is stochastic in train mode; isolate the skip
-    x = torch.randn(8, 60, len(neural.FEATURES))
-
-    # Zero-initialized: the skip must start as a no-op, so training begins from
-    # the previous architecture's behaviour rather than a random linear shift.
-    assert torch.allclose(model.skip.weight, torch.zeros_like(model.skip.weight))
-    baseline = model.forward_structured(x).absolute_quantiles.detach().clone()
-
-    # Give the skip a real weight; the median must move by exactly that amount.
-    with torch.no_grad():
-        model.skip.weight.normal_(0, .01)
-        model.skip.bias.normal_(0, .01)
-    shifted = model.forward_structured(x)
-    excess_skip, absolute_skip = model.skips(x)
-    assert torch.allclose(shifted.absolute_quantiles[..., 1],
-                          baseline[..., 1] + absolute_skip, atol=1e-5)
-    # Quantile ordering must survive the shift.
-    q = shifted.absolute_quantiles.detach().numpy()
-    assert (q[..., 0] <= q[..., 1]).all() and (q[..., 1] <= q[..., 2]).all()
-    # Each family gets its own offset — the skip is not shared between them.
-    assert not torch.allclose(excess_skip, absolute_skip)
 
 
-def test_architecture_hash_changed_with_the_skip():
-    """A silent architecture change would load old weights into a new model."""
-    from specforge import neural
-    stale = "8bd6be6dbb6f5b1e"          # v8, pre-skip
-    assert neural.ARCHITECTURE_HASH != stale
-
-
-def test_feature_dropout_removes_whole_features_and_is_training_only():
-    """L1 beat L2 by a wide margin, so the network needs sparsity pressure.
-
-    Ordinary dropout scatters zeros across cells; this must remove an entire
-    feature for a sample, which is what forces redundancy across inputs.
-    """
-    import torch
-    from specforge import neural
-    model = neural._make_model(len(neural.FEATURES), 2, feature_dropout=.5)
-    x = torch.randn(64, 60, len(neural.FEATURES))
-
-    model.train()
-    dropped = model.feature_dropout(x.transpose(1, 2)).transpose(1, 2)
-    fully_zero = (dropped.abs().sum(dim=1) == 0).float().mean()
-    assert .35 < float(fully_zero) < .65          # whole columns, ~p of them
-    # Where a feature survives it is scaled, never partially zeroed.
-    survivors = dropped[0][:, (dropped[0].abs().sum(0) != 0)]
-    assert (survivors.abs().sum(0) != 0).all()
-
-    model.eval()                                   # inference must be untouched
-    assert torch.allclose(
-        model.feature_dropout(x.transpose(1, 2)).transpose(1, 2), x)
-
-
-def test_trial_grid_reaches_the_regularization_the_evidence_asks_for():
-    from specforge import neural
-    decays = [t["weight_decay"] for t in neural.TRIAL_SPECS]
-    assert max(decays) >= 1e-2          # an order of magnitude past the old grid
-    assert any(t.get("feature_dropout", 0) > 0 for t in neural.TRIAL_SPECS)
-    assert any(t.get("feature_dropout", 0) == 0 for t in neural.TRIAL_SPECS)
-    for spec in neural.TRIAL_SPECS:     # every spec is fully specified
-        assert set(spec) == {"lr", "weight_decay", "rank_weight", "feature_dropout"}
 
 
 def test_ablation_uses_the_strongest_control_not_a_hardcoded_one():
@@ -2941,46 +2873,5 @@ def test_ablation_uses_the_strongest_control_not_a_hardcoded_one():
         == "ridge"
 
 
-def test_seed_predictions_ablation_flags_actually_disable_the_features():
-    """Attribution needs the flags to really turn things off.
-
-    A zeroed-but-trainable skip would be learned straight back, and the
-    ablation would silently measure the same model twice.
-    """
-    from specforge import neural
-    ds = _bakeoff_dataset(n_days=120, n_symbols=12, signal=.05)
-    eval_idx = np.flatnonzero(ds["masks"]["test"])
-    off = neural.seed_predictions(cfg=_cfg_for_ablation(), ds=ds,
-                                  eval_idx=eval_idx, seeds=1, epochs=1,
-                                  linear_skip=False)
-    on = neural.seed_predictions(cfg=_cfg_for_ablation(), ds=ds,
-                                 eval_idx=eval_idx, seeds=1, epochs=1,
-                                 linear_skip=True)
-    for family in ("absolute", "excess"):
-        assert set(off[family]) == {"tcn_seed_0"}
-        assert np.isfinite(list(off[family].values())[0]).all()
-        assert np.isfinite(list(on[family].values())[0]).all()
 
 
-def _cfg_for_ablation():
-    from specforge.config import load_config
-    return load_config("paper")
-
-
-def test_frozen_skip_stays_zero_through_training():
-    """The mechanism the ablation depends on, checked directly."""
-    import torch
-    from specforge import neural
-    model = neural._make_model(len(neural.FEATURES), 2)
-    with torch.no_grad():
-        model.skip.weight.zero_(); model.skip.bias.zero_()
-    model.skip.weight.requires_grad_(False)
-    model.skip.bias.requires_grad_(False)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
-    x = torch.randn(16, 60, len(neural.FEATURES))
-    for _ in range(3):
-        opt.zero_grad()
-        model.forward_structured(x).absolute_quantiles.pow(2).mean().backward()
-        opt.step()
-    assert torch.count_nonzero(model.skip.weight) == 0
-    assert torch.count_nonzero(model.skip.bias) == 0

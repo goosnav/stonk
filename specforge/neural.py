@@ -78,28 +78,22 @@ FEATURE_HASH = hashlib.sha256("|".join(FEATURES).encode()).hexdigest()[:16]
 ARCHITECTURE_HASH = hashlib.sha256(
     b"tcn-v9:temporal(24)conv32:k3:d1,2,4,8,16:gelu:dropout.1:context(20)mlp16:"
     b"dual-heads(absolute+excess):qheads:probheads:rank-loss:calibrated:"
-    b"linear-skip-to-median:feature-dropout"     # v10: + whole-column dropout
+    b"measured-v11:no-skip:no-feature-dropout"   # v9/v10 reverted, see plan doc
 ).hexdigest()[:16]
 
-# The first clean bakeoff said two things about this data, and both argue for
-# heavier regularization than the original grid explored:
-#   * elastic-net (sparse L1) beat ridge (dense L2) in BOTH families
-#     (+0.805 vs +0.683 absolute, +0.583 vs +0.452 excess) — most of the 44
-#     features are noise and shrinking them to zero generalizes better;
-#   * boosted stumps (nonlinear) LOST to elastic-net (linear), +0.492 vs +0.805
-#     — nonlinearity is not paying here.
-# So the grid now reaches weight decay an order of magnitude higher, and
-# `feature_dropout` zeroes whole feature columns during training, which is the
-# closest a network gets to the sparsity L1 buys.
+# Kept deliberately small. Every extra grid point is an extra TRIAL, and the
+# deflated-Sharpe bar rises with the trial count (see ml/governance), so an
+# unjustified search dimension actively costs credibility. Two specs with
+# feature_dropout were added on 2026-07-20 and reverted the same day when the
+# evidence for them (elastic-net beating ridge) turned out to be an artifact of
+# a microcap-heavy panel.
 TRIAL_SPECS = (
-    {"lr": 1e-3, "weight_decay": 1e-4, "rank_weight": .03, "feature_dropout": .0},
-    {"lr": 5e-4, "weight_decay": 1e-4, "rank_weight": .05, "feature_dropout": .1},
-    {"lr": 3e-4, "weight_decay": 3e-4, "rank_weight": .08, "feature_dropout": .0},
-    {"lr": 1e-3, "weight_decay": 1e-3, "rank_weight": .05, "feature_dropout": .2},
-    {"lr": 2e-4, "weight_decay": 1e-4, "rank_weight": .10, "feature_dropout": .0},
-    {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08, "feature_dropout": .1},
-    {"lr": 5e-4, "weight_decay": 3e-3, "rank_weight": .05, "feature_dropout": .2},
-    {"lr": 3e-4, "weight_decay": 1e-2, "rank_weight": .05, "feature_dropout": .3},
+    {"lr": 1e-3, "weight_decay": 1e-4, "rank_weight": .03},
+    {"lr": 5e-4, "weight_decay": 1e-4, "rank_weight": .05},
+    {"lr": 3e-4, "weight_decay": 3e-4, "rank_weight": .08},
+    {"lr": 1e-3, "weight_decay": 1e-3, "rank_weight": .05},
+    {"lr": 2e-4, "weight_decay": 1e-4, "rank_weight": .10},
+    {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08},
 )
 
 # The panel is the largest array in the process, so its size is a memory
@@ -587,7 +581,7 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
 
 
 def _make_model(n_features: int, n_horizons: int,
-                temporal_idx=None, context_idx=None, feature_dropout: float = 0.0):
+                temporal_idx=None, context_idx=None):
     import torch
     import torch.nn as nn
     temporal_idx = list(TEMPORAL_IDX if temporal_idx is None else temporal_idx)
@@ -621,28 +615,7 @@ def _make_model(n_features: int, n_horizons: int,
                                         CausalBlock(32, 32, 16))
             self.context = nn.Sequential(nn.Linear(len(context_idx), 16), nn.GELU(),
                                          nn.Dropout(.1))
-            # Linear skip: the latest session's FULL feature row goes straight
-            # to the median of every head, bypassing both branches.
-            #
-            # The measured failure this addresses: given 60 sessions x 44
-            # features the network scored +0.172 net OOS policy utility while
-            # ridge on ONE session scored +0.683. A model with strictly more
-            # information should not lose to a linear map of a subset of it.
-            # With this path the network can reproduce a linear model exactly
-            # (zero out the deep branches) and has to learn only the RESIDUAL,
-            # so nonlinearity is added where it helps instead of having to be
-            # rediscovered from scratch. Initialized at zero so training starts
-            # from the deep model's behaviour and grows the linear term only if
-            # it reduces loss.
-            self.skip = nn.Linear(len(FEATURES), 2 * n_horizons)
-            nn.init.zeros_(self.skip.weight); nn.init.zeros_(self.skip.bias)
             self.n_horizons = n_horizons
-            # Zeroes whole FEATURE columns (not individual elements) during
-            # training, so the model cannot lean on any single input. Ordinary
-            # dropout perturbs; this forces redundancy across features, which is
-            # the closest a network gets to the sparsity L1 buys — and L1 beat
-            # L2 on this data by a wide margin.
-            self.feature_dropout = nn.Dropout1d(feature_dropout)
             # Dual return families, one quantile + one probability head per
             # horizon each. Absolute and excess are separate heads so the node
             # can read a genuine absolute forecast, not excess reinterpreted.
@@ -658,27 +631,17 @@ def _make_model(n_features: int, n_horizons: int,
         def encoded(self, x):
             # Temporal branch: only sequence-varying features, all sessions.
             # Context branch: only point-in-time features, latest session.
-            # Dropout1d wants (N, C, L), so features must be the channel axis —
-            # that is what makes it drop a whole feature rather than scattered
-            # cells.
-            x = self.feature_dropout(x.transpose(1, 2)).transpose(1, 2)
             temporal_in = x[:, :, self.temporal_idx].transpose(1, 2)
             temporal = self.blocks(temporal_in)[..., -1]
             return torch.cat((temporal, self.context(x[:, -1, self.context_idx])), dim=1)
 
-        def _quantiles(self, z, heads, offset=None):
+        @staticmethod
+        def _quantiles(z, heads):
             raw = torch.stack([head(z) for head in heads], dim=1)
             q50 = raw[..., 1]
-            if offset is not None:
-                q50 = q50 + offset        # linear skip shifts the median only
             q10 = q50 - torch.nn.functional.softplus(raw[..., 0])
             q90 = q50 + torch.nn.functional.softplus(raw[..., 2])
             return torch.stack((q10, q50, q90), dim=-1)
-
-        def skips(self, x):
-            """(excess_offset, absolute_offset), one per horizon each."""
-            linear = self.skip(x[:, -1, :])
-            return linear[:, :self.n_horizons], linear[:, self.n_horizons:]
 
         @staticmethod
         def _probs(z, heads):
@@ -687,12 +650,9 @@ def _make_model(n_features: int, n_horizons: int,
         def forward_structured(self, x):
             """Full dual-family output from one encoder pass."""
             z = self.encoded(x)
-            excess_skip, absolute_skip = self.skips(x)
             return NeuralModelOutput(
-                absolute_quantiles=self._quantiles(
-                    z, self.absolute_quantile_heads, absolute_skip),
-                excess_quantiles=self._quantiles(
-                    z, self.excess_quantile_heads, excess_skip),
+                absolute_quantiles=self._quantiles(z, self.absolute_quantile_heads),
+                excess_quantiles=self._quantiles(z, self.excess_quantile_heads),
                 probability_absolute_edge_positive=self._probs(
                     z, self.absolute_probability_heads),
                 probability_excess_positive=self._probs(
@@ -703,17 +663,14 @@ def _make_model(n_features: int, n_horizons: int,
             unmigrated consumers (inference, calibration, metrics) read this
             until B4C migrates them to forward_structured."""
             z = self.encoded(x)
-            return (self._quantiles(z, self.excess_quantile_heads,
-                                    self.skips(x)[0]),
+            return (self._quantiles(z, self.excess_quantile_heads),
                     self._probs(z, self.excess_probability_heads))
 
         def forward_legacy_excess(self, x):
-            return self._quantiles(self.encoded(x), self.excess_quantile_heads,
-                                   self.skips(x)[0])
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
 
         def forward(self, x):
-            return self._quantiles(self.encoded(x), self.excess_quantile_heads,
-                                   self.skips(x)[0])
+            return self._quantiles(self.encoded(x), self.excess_quantile_heads)
 
         def probability(self, x):
             return self._probs(self.encoded(x), self.excess_probability_heads)
@@ -1012,8 +969,8 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
 
 def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
                      seeds: int = 3, max_seconds: float | None = None,
-                     epochs: int | None = None, early_stop: bool = True,
-                     linear_skip: bool = True) -> dict[str, dict[str, np.ndarray]]:
+                     epochs: int | None = None,
+                     early_stop: bool = True) -> dict[str, dict[str, np.ndarray]]:
     """Train `seeds` independent TCNs and return each one's eval-row medians.
 
     One training run is one draw from a stochastic process — initialization,
@@ -1056,17 +1013,7 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
             break                     # partial seeds → bakeoff fails closed below
         torch.manual_seed(1000 + seed)
         rng = np.random.default_rng(1000 + seed)
-        model = _make_model(len(FEATURES), len(horizons),
-                            feature_dropout=float(trial_spec.get(
-                                "feature_dropout", 0.0))).to(device)
-        if not linear_skip:
-            # Ablation only: freeze the skip at zero so the architecture reduces
-            # to the pre-v9 model. Zeroing without freezing would let the
-            # optimizer learn it straight back.
-            with torch.no_grad():
-                model.skip.weight.zero_(); model.skip.bias.zero_()
-            model.skip.weight.requires_grad_(False)
-            model.skip.bias.requires_grad_(False)
+        model = _make_model(len(FEATURES), len(horizons)).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         bce = torch.nn.functional.binary_cross_entropy
@@ -1184,9 +1131,7 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
             dtype=np.float32)).unsqueeze(1)
         tr = torch.from_numpy(np.flatnonzero(train_mask))
         te = np.flatnonzero(test_mask)
-        model = _make_model(len(FEATURES), len(ds["horizons"]),
-                            feature_dropout=float(trial_spec.get(
-                                "feature_dropout", 0.0))).to(device)
+        model = _make_model(len(FEATURES), len(ds["horizons"])).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         remaining_folds = max(1, len(windows) - fold)
@@ -1298,8 +1243,7 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     batch_rng = np.random.default_rng(trials)
     trial_spec = dict(TRIAL_SPECS[trials % len(TRIAL_SPECS)])
     device = _training_device(cfg, torch)
-    model = _make_model(len(FEATURES), len(ds["horizons"]),
-                        feature_dropout=float(trial_spec.get("feature_dropout", 0.0)))
+    model = _make_model(len(FEATURES), len(ds["horizons"]))
     # Holding nets are complete trainable clones of the global champion.
     parent_row = parent = None
     if symbol:

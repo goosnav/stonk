@@ -584,3 +584,51 @@ again - from "measured on fabricated returns", to "measured on clean but
 unrepresentative data", to **"measured properly and the TCN loses to ridge and
 elastic-net on both families"**. That is the first version of this statement
 that rests on a defensible sample.
+
+## 2026-07-20 - ATTRIBUTION: which model changes actually paid
+
+One frozen panel (200 symbols, 203,200 windows, 31,036 sealed rows; best
+controls 0.727 absolute / 0.626 excess - identical to the previous run, so
+differences are purely model). Three seeds per variant, one factor at a time.
+
+| variant | absolute decisive | excess decisive | absolute spread |
+|---|---|---|---|
+| baseline (pre-v9: 6 epochs, no skip) | 0.476 | 0.281 | 0.407 |
+| + convergence (early stopping) | **0.567** (+0.091) | **0.387** (+0.106) | 0.412 |
+| + linear skip | 0.555 (**-0.011**) | 0.334 (**-0.053**) | 0.538 |
+
+### The headline: the DATA was the story
+The pre-v9 baseline scores 0.476 on the good panel against 0.172 on the
+corrupted one. Of the 0.32 improvement reported earlier, roughly **0.28 was the
+data repair and breadth work, and only ~0.04 the model**. Claiming the model
+changes caused that jump would have been wrong, which is exactly why the
+ablation was run before claiming anything.
+
+### What paid, and stays
+- **Convergence training: +0.091 absolute, +0.106 excess.** The fixed-6-epoch
+  harness genuinely was undertraining the network and understating it - a real
+  defect in the comparison, not a theoretical one.
+- **Ensembling: beats the median seed in every cell measured** (+0.02/+0.11 at
+  baseline, +0.08/+0.18 with convergence), largest in excess where seed
+  variance is worst. Cheapest improvement available.
+
+### What did NOT pay, and was reverted
+- **Linear skip (arch v9): -0.011 absolute, -0.053 excess, and spread grew
+  0.41 -> 0.54.** The reasoning was plausible - let the network represent a
+  linear model exactly and learn only the residual - and it was simply wrong on
+  this data. Reverted.
+- **Feature dropout + heavier regularization (arch v10)**: the evidence cited
+  for it (elastic-net beating ridge) did not survive the representative panel,
+  where ridge and elastic-net are near-tied and ridge WINS excess. Reverted.
+  Note the specific cost of leaving it in: every extra grid point is an extra
+  TRIAL, and the deflated-Sharpe bar rises with the trial count, so an
+  unjustified search dimension actively costs credibility.
+
+Architecture is back to the v8 topology (hash relabelled v11 to mark that the
+detour happened and was measured, not silently undone). `early_stop` survives
+as an ablation flag; `linear_skip` is gone with the feature.
+
+### Standing conclusion, unchanged
+Best TCN configuration measured is 0.567 against elastic-net 0.727. No
+champion, learned influence hard-zero. The honest summary of this whole session
+is that the model work was worth about a tenth of the data work.
