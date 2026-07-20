@@ -83,10 +83,20 @@ def test_kill_switch_blocks_buys_not_sells(gov, store):
 
 
 def test_single_position_cap(gov):
-    # 8% of 1000 = $80 cap; existing $70 held → only $10 room
+    # R4: the cap binds at MARKED value. 0.7 sh at $100 cost is ~$133 at the
+    # fixture's ~$190 close — over the $80 cap — so an appreciated position
+    # can no longer hide behind stale cost basis: adding more is rejected.
     held = [Position(symbol="AAA", asset_type="equity", qty=0.7, avg_cost=100,
                      opened_at="2026-01-01")]
     c = make_candidate("AAA", notional=50)
+    d = gov.review(make_intent(c), c, acct(positions=held), CycleState(1000), 1)
+    assert d.verdict == "REJECTED"
+    assert any("single-position" in r for r in d.reasons)
+    # size-reduction path still works when mark == cost (no bars → fallback):
+    # $70 of the $80 cap held → reduced to the $10 of room.
+    held = [Position(symbol="ZZZ", asset_type="equity", qty=0.7, avg_cost=100,
+                     opened_at="2026-01-01")]
+    c = make_candidate("ZZZ", notional=50)
     d = gov.review(make_intent(c), c, acct(positions=held), CycleState(1000), 1)
     assert d.verdict == "APPROVED_WITH_SIZE_REDUCTION"
     assert d.approved_notional == pytest.approx(10, abs=0.5)

@@ -90,3 +90,16 @@ that currently grants it permission."
   ledgers, blend audits engage in the blend book and stay silent in the
   deterministic book. Honest note: graph-policy book still N/A (no graph
   champion exists; graph events are not synthesized offline).
+- 2026-07-19 R4 DONE (350 tests): governor exposure is MARKED value (not cost
+  basis) + open-order reservation; max_sector_exposure enforced (unknown
+  sector exempt-but-audited-once until R5 classifies; instruments.sector
+  column added); max_total_options_premium_risk aggregate cap binds; loss
+  switches flow-normalized (deposit can't mask a loss, withdrawal can't fake
+  one; drawdown peak stays gross — noted); slippage-breach halt (3/day).
+  RH adapter: structural equity-only invariant (review refuses, place
+  RAISES); fractional⇒market orders pass a quote guard (fresh, aged ≤120s,
+  spread ≤ max, deviation ≤1% of approved reference) + post-fill slippage
+  monitor. Per-launch X-Session-Token required on every mutating /api route
+  (dashboard fetches it from /api/session behind loopback+origin checks).
+  Every new limit has a failing property test. R0-R4 milestone reached —
+  merge policy per review applies.

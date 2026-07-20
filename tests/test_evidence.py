@@ -9,6 +9,12 @@ from specforge.evidence import latest_dossier, persist_dossier
 from specforge.models import SignalEvent, signed_alpha
 
 
+def _tokenized_client(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, headers={
+        "X-Session-Token": app.state.session_token})
+
+
 def event(node, direction, magnitude, confidence=1.0):
     return SignalEvent("AAA", direction, magnitude, confidence, 21, .05, .1, -.1,
                        [node], datetime.now(), node)
@@ -65,7 +71,7 @@ def test_verified_dossier_is_consumed_by_live_node_and_api(cfg, store):
     assert source in emitted[0].evidence[0]
 
     from specforge.app import create_app
-    body = TestClient(create_app(cfg, store, with_scheduler=False)).get(
+    body = _tokenized_client(create_app(cfg, store, with_scheduler=False)).get(
         "/api/evidence/AAA").json()
     assert body["available"] is True
     assert body["dossier"]["fundamental_memo"]["stance"] == "attractive"

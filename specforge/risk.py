@@ -120,6 +120,38 @@ class Governor:
                 # the human's reset is silently undone until midnight
                 self.store.kv_set("rejected_orders_reset_ts", self.now_iso)
 
+    def _mark(self, symbol: str) -> float | None:
+        """Latest settled close — marked exposure, not stale cost basis."""
+        row = self.store.db.execute(
+            "SELECT close FROM bars WHERE symbol=? ORDER BY d DESC LIMIT 1",
+            (symbol,)).fetchone()
+        return float(row["close"]) if row and row["close"] else None
+
+    def _marked_value(self, p) -> float:
+        """Position exposure at MARKET (R4): an appreciated position must not
+        slip past its cap at cost. Options fall back to premium cost basis
+        (no reliable mark source here)."""
+        if p.asset_type == "option":
+            return p.cost_basis
+        mark = self._mark(p.symbol)
+        return p.qty * (mark if mark else p.avg_cost)
+
+    def _pending_buy_notional(self, symbol: str | None = None) -> float:
+        """Open buy orders reserve exposure BEFORE cash/positions update —
+        without this, several same-cycle orders could each see full room."""
+        q = ("SELECT COALESCE(SUM(notional),0) n FROM orders WHERE side='buy' "
+             "AND mode=? AND status IN ('reviewed','placed','pending_approval')")
+        args: list = [self.mode]
+        if symbol:
+            q += " AND symbol=?"
+            args.append(symbol)
+        return float(self.store.db.execute(q, args).fetchone()["n"])
+
+    def _sector(self, symbol: str) -> str | None:
+        row = self.store.db.execute(
+            "SELECT sector FROM instruments WHERE symbol=?", (symbol,)).fetchone()
+        return row["sector"] if row and row["sector"] else None
+
     def check_kill_switches(self, account: AccountState, source: str) -> dict:
         """Run at cycle start. Evaluates loss/drawdown limits against the equity
         curve and trips switches. Returns the active set."""
@@ -127,16 +159,32 @@ class Governor:
         today = self._today_dt()
         y_eq = self.store.equity_on(source, (today - timedelta(days=1)).isoformat())
         w_eq = self.store.equity_on(source, (today - timedelta(days=7)).isoformat())
+        # R4: deposits/withdrawals are not P&L. Comparing equity NET of flows
+        # since each baseline means a deposit cannot mask a real loss and a
+        # withdrawal cannot trip a false one. (Drawdown peak stays gross —
+        # normalizing multi-month peaks needs the full flow ledger; noted.)
+        eq_d = eq - self.store.external_flows_since(
+            (today - timedelta(days=1)).isoformat())
+        eq_w = eq - self.store.external_flows_since(
+            (today - timedelta(days=7)).isoformat())
         # high-water mark since the last drawdown-baseline reset (D17)
         reset_d = self.store.kv_get("dd_peak_reset_d", "") or ""
         peak = max(self.store.peak_equity(source, since_d=reset_d), eq)
 
-        if y_eq and eq < y_eq * (1 - self.r.get("max_daily_loss", 0.02)):
-            self.trip("daily_loss", f"equity {eq:.2f} < {1-self.r['max_daily_loss']:.0%} "
+        if y_eq and eq_d < y_eq * (1 - self.r.get("max_daily_loss", 0.02)):
+            self.trip("daily_loss", f"flow-adjusted equity {eq_d:.2f} < "
+                                    f"{1-self.r['max_daily_loss']:.0%} "
                                     f"of yesterday {y_eq:.2f}", auto_clear_days=1)
-        if w_eq and eq < w_eq * (1 - self.r.get("max_weekly_loss", 0.05)):
-            self.trip("weekly_loss", f"equity {eq:.2f} breaches weekly loss vs {w_eq:.2f}",
+        if w_eq and eq_w < w_eq * (1 - self.r.get("max_weekly_loss", 0.05)):
+            self.trip("weekly_loss", f"flow-adjusted equity {eq_w:.2f} breaches "
+                                     f"weekly loss vs {w_eq:.2f}",
                       auto_clear_days=7)
+        # R4: repeated fractional-fill slippage breaches (recorded by the
+        # broker adapter) halt new entries for the day.
+        slip = int(self.store.kv_get(f"slippage_breaches:{self.today}", 0) or 0)
+        if slip >= self.r.get("max_slippage_breaches_per_day", 3):
+            self.trip("slippage", f"{slip} fractional fills breached slippage "
+                                  "tolerance today", auto_clear_days=1)
         if peak > 0 and eq < peak * (1 - self.r.get("kill_switch_drawdown", 0.15)):
             # cooldown then auto-resume (D15): a permanent halt turned the 2022
             # bear into 3 years of dead cash in backtest v1. null = manual-only.
@@ -228,6 +276,15 @@ class Governor:
             flags = self.validate_option(candidate.option_details or {})
             if flags:
                 return rj(*[f"option:{f}" for f in flags])
+            # R4: the AGGREGATE premium-at-risk cap finally binds — the sum of
+            # every open option premium plus this one stays inside the budget.
+            total_premium = sum(p.cost_basis for p in account.positions
+                                if p.asset_type == "option") + intent.notional
+            opt_cap = account.equity * self.r.get(
+                "max_total_options_premium_risk", 0.06)
+            if total_premium > opt_cap:
+                return rj(f"options aggregate premium cap: ${total_premium:.2f} "
+                          f"> ${opt_cap:.2f}")
 
         # sells (exits) skip entry-side caps — reducing risk is always allowed
         if intent.side == "sell":
@@ -256,9 +313,11 @@ class Governor:
             notional = cycle.budget_left
             reasons.append(f"reduced to fit time-step budget (${cycle.budget_left:.2f} left)")
 
-        # single-position cap (cost_basis handles the option ×100 multiplier)
+        # single-position cap at MARKED value + open-order reservation (R4)
         pos_cap = account.equity * self.r.get("max_single_equity_position", 0.08)
-        held = sum(p.cost_basis for p in account.positions if p.symbol == intent.symbol)
+        held = sum(self._marked_value(p) for p in account.positions
+                   if p.symbol == intent.symbol)
+        held += self._pending_buy_notional(intent.symbol)
         if held + notional > pos_cap:
             room = pos_cap - held
             if room < MIN_ORDER_NOTIONAL:
@@ -266,10 +325,31 @@ class Governor:
             notional = min(notional, room)
             reasons.append(f"reduced to single-position cap room ${room:.2f}")
 
+        # sector concentration cap (R4): finally enforced. Unknown sector =
+        # exempt but audited once per symbol — visible gap until R5 classifies.
+        sector = self._sector(intent.symbol)
+        if sector:
+            sector_cap = account.equity * self.r.get("max_sector_exposure", 0.25)
+            sector_held = sum(self._marked_value(p) for p in account.positions
+                              if p.qty > 0 and self._sector(p.symbol) == sector)
+            if sector_held + notional > sector_cap:
+                room = sector_cap - sector_held
+                if room < MIN_ORDER_NOTIONAL:
+                    return rj(f"sector cap ({sector}): ${sector_held:.2f} of "
+                              f"${sector_cap:.2f} held")
+                notional = min(notional, room)
+                reasons.append(f"reduced to sector cap room ${room:.2f} ({sector})")
+        elif not self.store.kv_get(f"sector_unknown:{intent.symbol}"):
+            self.store.kv_set(f"sector_unknown:{intent.symbol}", self.today)
+            self.store.audit("sector_unknown", {
+                "symbol": intent.symbol,
+                "note": "exempt from max_sector_exposure until classified (R5)"})
+
         # total deployment / cash reserve. Two knobs express the same limit
         # from opposite ends (deploy ≤ X  vs  keep ≥ Y cash); honor whichever
-        # is stricter so neither is a silent no-op.
-        deployed = sum(p.cost_basis for p in account.positions)
+        # is stricter so neither is a silent no-op. MARKED + reserved (R4).
+        deployed = sum(self._marked_value(p) for p in account.positions)
+        deployed += self._pending_buy_notional()
         deploy_frac = min(self.r.get("max_account_deployment", 0.70),
                           1.0 - self.r.get("min_cash_reserve", 0.0))
         max_deploy = account.equity * deploy_frac

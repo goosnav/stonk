@@ -54,7 +54,7 @@ def sync_catalog(store, client=httpx) -> dict:
         for item in items.values():
             raw_hash = hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()[:16]
             store.db.execute(
-                "INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,exchange=excluded.exchange,"
                 "security_type=excluded.security_type,is_etf=excluded.is_etf,is_adr=excluded.is_adr,"
                 "active=1,last_seen=excluded.last_seen,source=excluded.source,cik=excluded.cik,"

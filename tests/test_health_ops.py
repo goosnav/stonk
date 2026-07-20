@@ -29,6 +29,12 @@ from specforge.health import _redact, rollup, system_health, write_heartbeat
 from specforge.risk import Governor
 from specforge.store import Store
 
+
+def _tokenized_client(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, headers={
+        "X-Session-Token": app.state.session_token})
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -52,7 +58,7 @@ def _fresh_spy(store):
 
 @pytest.fixture()
 def client(cfg, store):
-    return TestClient(create_app(cfg, store, with_scheduler=False))
+    return _tokenized_client(create_app(cfg, store, with_scheduler=False))
 
 
 # ---------------- rollup: the app-health verdict ----------------
@@ -99,7 +105,7 @@ def test_status_account_snapshot_is_single_flight_and_stale_tolerant(
 
     monkeypatch.setattr(PaperBroker, "get_account", counted)
     app = create_app(cfg, store, with_scheduler=False)
-    with TestClient(app) as c:
+    with TestClient(app, headers={"X-Session-Token": app.state.session_token}) as c:
         assert c.get("/api/status").status_code == 200
         assert c.get("/api/status").json()["account_source"] == "cache"
         assert calls["n"] == 1
@@ -118,7 +124,7 @@ def test_status_account_snapshot_is_single_flight_and_stale_tolerant(
 def test_status_account_snapshot_survives_service_restart(cfg, store, monkeypatch):
     from specforge.broker.paper import PaperBroker
     first = create_app(cfg, store, with_scheduler=False)
-    with TestClient(first) as c:
+    with TestClient(first, headers={"X-Session-Token": first.state.session_token}) as c:
         baseline = c.get("/api/status")
         assert baseline.status_code == 200
     assert store.kv_get("account_snapshot_cache")
@@ -128,7 +134,7 @@ def test_status_account_snapshot_survives_service_restart(cfg, store, monkeypatc
 
     monkeypatch.setattr(PaperBroker, "get_account", unavailable)
     restarted = create_app(cfg, store, with_scheduler=False)
-    with TestClient(restarted) as c:
+    with TestClient(restarted, headers={"X-Session-Token": restarted.state.session_token}) as c:
         status = c.get("/api/status")
     assert status.status_code == 200
     assert status.json()["account_stale"] is True

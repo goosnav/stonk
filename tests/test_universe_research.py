@@ -15,6 +15,12 @@ from specforge.store import Store
 from specforge.universe import parse_directory, refresh_membership, symbols
 
 
+def _tokenized_client(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, headers={
+        "X-Session-Token": app.state.session_token})
+
+
 def test_official_directory_parser_filters_non_companies():
     text = "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\n" \
            "AAA|Alpha Corp Common Stock|Q|N|N|100|N|N\n" \
@@ -34,7 +40,7 @@ def test_tier_snapshot_uses_liquidity_and_history(cfg, store):
     today = date.today().isoformat()
     with store.db:
         for sym in ("AAA", "BBB", "CCC"):
-            store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            store.db.execute("INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                              (sym, sym, "NASDAQ", "common", 0, 0, 1, today,
                               today, "test", None, sym))
     cfg.data["universe"].update({"research_min_dollar_volume": 1,
@@ -78,7 +84,7 @@ def test_block_bootstrap_is_deterministic_and_preserves_cash():
 
 def test_research_model_and_universe_apis_expose_real_state(cfg, store):
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     graph = client.get("/api/model/graph?symbol=AAA&horizon=5").json()
     assert graph["symbol"] == "AAA"
     assert graph["horizon"] == 5
@@ -96,7 +102,7 @@ def test_model_api_rejects_snapshot_from_removed_topology(cfg, store):
     store.kv_set("graph_last_activations", {"symbols": {"AAA": {
         "activations": {"removed_legacy_node": {"value": -.4}},
         "node_states": {"removed_legacy_node": "running"}}}})
-    graph = TestClient(create_app(cfg, store, with_scheduler=False)).get(
+    graph = _tokenized_client(create_app(cfg, store, with_scheduler=False)).get(
         "/api/model/graph?symbol=AAA&horizon=21").json()
     assert graph["snapshot"] is None
     assert graph["activation_completeness"] is False
@@ -144,7 +150,7 @@ def test_restart_requeues_job_and_clears_dead_worker_lease(store):
 
 def test_research_job_api_contract(cfg, store):
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     created = client.post("/api/research/jobs", json={"kind": "train_holdings"})
     assert created.status_code == 200 and created.json()["status"] == "queued"
     assert client.get("/api/research/jobs").json()[0]["kind"] == "train_holdings"
@@ -160,7 +166,7 @@ def test_discovery_persists_exactly_25_without_ai(cfg, store):
     with store.db:
         for i in range(30):
             sym = f"T{i:02d}"
-            store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            store.db.execute("INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                              (sym, sym, "NASDAQ", "common", 0, 0, 1, as_of,
                               as_of, "test", None, sym))
             store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
@@ -254,7 +260,7 @@ def test_company_facts_ingestion_is_point_in_time_and_durable(store):
     from specforge.universe import ingest_next_filing_facts
     today = date.today().isoformat()
     with store.db:
-        store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        store.db.execute("INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                          ("FACT", "Facts Co", "NASDAQ", "common", 0, 0, 1,
                           today, today, "test", "123", "x"))
         store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",

@@ -165,7 +165,7 @@ def test_sec_facts_activate_valuation_and_event_features(cfg, store):
     bars = neural._bars(store, "AAA", "1900-01-01")
     filed = bars.index[10]
     with store.db:
-        store.db.execute("INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        store.db.execute("INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                          ("AAA", "Alpha", "NASDAQ", "common", 0, 0, 1,
                           "2020-01-01", "2026-01-01", "test", "123", "x"))
         store.db.execute("INSERT INTO filing_facts VALUES(?,?,?,?,?,?,?,?)",

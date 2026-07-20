@@ -1544,7 +1544,7 @@ def test_health_reports_config_error_instead_of_500(cfg, store, monkeypatch):
         raise ConfigError("Dangerous config rejected: test breakage")
 
     monkeypatch.setattr(app_mod, "current_config", broken_config)
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Session-Token": app.state.session_token}) as client:
         r = client.get("/api/health")
     assert r.status_code == 200                      # never a retry-loop 500
     body = r.json()
@@ -1769,16 +1769,22 @@ def test_backtest_doubling_costs_cannot_improve_results(cfg, store, tmp_path):
     b, d = base.get("overall") or {}, doubled.get("overall") or {}
     assert "total_return" in b and "total_return" in d
     assert d["total_return"] <= b["total_return"] + 1e-9
-    # and the costs actually BIND: doubled offset must worsen average entry
+    # and the costs actually BIND: for every (symbol, day) bought in BOTH
+    # runs, the doubled-cost run pays at least as much per share. (Averaging
+    # across runs is invalid — costs change WHICH fills happen.)
     import sqlite3 as _sq
-    px = []
+    books = []
     for tag in ("r2cost1", "r2cost2"):
         con = _sq.connect(tmp_path / f"backtest_{tag}_research.db")
         con.row_factory = _sq.Row
-        rows = [r["price"] for r in con.execute(
-            "SELECT price FROM fills WHERE side='buy'")]
-        px.append(sum(rows) / len(rows) if rows else 0.0)
-    assert px[1] >= px[0]                      # pays more per share, never less
+        books.append({(r["symbol"], r["filled_at"][:10]): r["price"]
+                      for r in con.execute(
+                          "SELECT symbol, filled_at, price FROM fills "
+                          "WHERE side='buy'")})
+    common = set(books[0]) & set(books[1])
+    assert common, "no common fills — the binding check would be vacuous"
+    for key in common:
+        assert books[1][key] >= books[0][key] - 1e-9
 
 
 def test_backtest_report_declares_decision_convention(cfg, store, tmp_path):
@@ -1881,3 +1887,195 @@ def test_injected_forecasts_cause_policy_divergence(cfg, store, tmp_path):
     # every policy keeps an independent ledger
     assert (tmp_path / "backtest_policy_deterministic_research.db").exists()
     assert (tmp_path / "backtest_policy_fixed_blend_research.db").exists()
+
+
+# ── R4: governor + broker completion — every limit must FAIL closed ──────────
+
+def _gov(cfg, store):
+    from specforge.risk import Governor
+    return Governor(cfg, store)
+
+
+def _acct(equity=1000.0, cash=1000.0, positions=None):
+    from specforge.models import AccountState
+    return AccountState(equity=equity, cash=cash, buying_power=cash,
+                        positions=positions or [], as_of="2026-07-19")
+
+
+def _buy(symbol="BBB", notional=50.0):
+    from specforge.models import OrderIntent
+    c = _candidate(symbol, 0.5)
+    c.target_notional = notional
+    intent = OrderIntent.make(c, qty=notional / 100.0, limit_price=100.0)
+    intent.notional = notional
+    return intent, c
+
+
+def test_sector_cap_rejects_and_reduces(cfg, store):
+    from specforge.models import Position
+    from specforge.risk import CycleState
+    for sym in ("AAA", "BBB"):
+        store.db.execute("INSERT INTO instruments(symbol, sector) VALUES(?,?) "
+                         "ON CONFLICT(symbol) DO UPDATE SET sector=excluded.sector",
+                         (sym, "tech"))
+    store.db.commit()
+    cfg.data["risk"]["max_single_equity_position"] = 0.5   # so SECTOR binds first
+    gov = _gov(cfg, store)
+    # AAA marked ~0.7×190 ≈ $133 of tech already held; cap = 25% × 1000 = $250
+    held = [Position(symbol="AAA", asset_type="equity", qty=0.7, avg_cost=100,
+                     opened_at="2026-01-01")]
+    intent, c = _buy("BBB", notional=200.0)     # 133 + 200 > 250 → reduce
+    d = gov.review(intent, c, _acct(positions=held), CycleState(1000), 1)
+    assert d.verdict == "APPROVED_WITH_SIZE_REDUCTION"
+    assert any("sector cap" in r for r in d.reasons)
+    # a second tech name with the sector already full → outright reject
+    held2 = held + [Position(symbol="BBB", asset_type="equity", qty=0.65,
+                             avg_cost=100, opened_at="2026-01-01")]
+    intent2, c2 = _buy("BBB", notional=50.0)
+    d2 = gov.review(intent2, c2, _acct(positions=held2), CycleState(1000), 1,
+                    skip_duplicate=True)
+    assert d2.verdict == "REJECTED" and any("cap" in r for r in d2.reasons)
+
+
+def test_unknown_sector_exempt_but_audited_once(cfg, store):
+    from specforge.risk import CycleState
+    gov = _gov(cfg, store)
+    intent, c = _buy("CCC", notional=20.0)
+    gov.review(intent, c, _acct(), CycleState(1000), 1)
+    gov.review(intent, c, _acct(), CycleState(1000), 1, skip_duplicate=True)
+    n = store.db.execute("SELECT COUNT(*) n FROM audit WHERE "
+                         "event_type='sector_unknown'").fetchone()["n"]
+    assert n == 1
+
+
+def test_options_aggregate_premium_cap(cfg, store):
+    from specforge.models import OrderIntent, Position
+    from specforge.risk import CycleState
+    cfg.data["risk"]["options_enabled"] = True          # test-local unlock
+    gov = _gov(cfg, store)
+    held = [Position(symbol="QQQ", asset_type="option", qty=1, avg_cost=0.5,
+                     opened_at="2026-01-01", option_symbol="QQQ_C")]   # $50 premium
+    c = _candidate("QQQ", 0.5)
+    c.asset_type = "option"
+    c.option_details = {"dte": 45, "delta": 0.5, "spread_pct": 0.05,
+                        "open_interest": 500}
+    c.target_notional = 30.0
+    intent = OrderIntent.make(c, qty=1, limit_price=0.3)
+    intent.asset_type = "option"
+    intent.notional = 30.0
+    # cap = 6% × 1000 = $60; held $50 + $30 = $80 > $60 → reject
+    d = gov.review(intent, c, _acct(equity=10000, cash=10000, positions=held),
+                   CycleState(1000), 1)
+    # equity 10k → cap $600: passes. Drop equity so the cap binds:
+    d = gov.review(intent, c, _acct(equity=1000, cash=1000, positions=held),
+                   CycleState(1000), 1, skip_duplicate=True)
+    assert d.verdict == "REJECTED"
+    assert any("aggregate premium cap" in r for r in d.reasons)
+
+
+def test_pending_orders_reserve_exposure(cfg, store):
+    from specforge.models import OrderIntent
+    from specforge.risk import CycleState
+    cfg.data["risk"]["max_single_equity_position"] = 0.5   # deployment binds
+    gov = _gov(cfg, store)
+    # an open (placed, unfilled) buy already reserves $600 of the $700 room
+    resting, _ = _buy("ZZZ", notional=600.0)
+    resting.status = "placed"
+    store.record_order(resting, mode="paper")
+    intent, c = _buy("YYY", notional=300.0)
+    d = gov.review(intent, c, _acct(), CycleState(1000), 1)
+    assert d.verdict == "APPROVED_WITH_SIZE_REDUCTION"
+    assert any("deployment cap" in r for r in d.reasons)
+    assert d.approved_notional <= 100.0 + 1e-6
+
+
+def test_loss_switches_are_flow_normalized(cfg, store):
+    gov = _gov(cfg, store)
+    day = gov.today
+    store.db.execute("INSERT OR REPLACE INTO equity_curve VALUES(?,?,?,?,?)",
+                     ((gov._today_dt() - __import__("datetime").timedelta(days=1)
+                       ).isoformat(), "t", 1000.0, 500.0, "paper"))
+    store.db.commit()
+    # a $500 DEPOSIT must not mask a real 5% trading loss (equity 1450 gross)
+    store.record_external_flow(500.0, d=day)
+    gov.check_kill_switches(_acct(equity=1450.0), "paper")
+    assert "daily_loss" in gov.active_switches()
+    store.kv_set("kill_switches", {})                    # reset
+    # a $500 WITHDRAWAL must not fake a loss (equity 510 gross = flat trading)
+    store.kv_set("external_flows", [{"d": day, "amount": -500.0}])
+    gov.check_kill_switches(_acct(equity=510.0), "paper")
+    assert "daily_loss" not in gov.active_switches()
+
+
+def test_slippage_breaches_trip_halt(cfg, store):
+    gov = _gov(cfg, store)
+    store.kv_set(f"slippage_breaches:{gov.today}", 3)
+    gov.check_kill_switches(_acct(), "paper")
+    assert "slippage" in gov.active_switches()
+
+
+def _adapter(cfg, store):
+    from specforge.broker.robinhood_mcp import RobinhoodMCPBroker
+    a = RobinhoodMCPBroker.__new__(RobinhoodMCPBroker)
+    a.cfg, a.store = cfg, store
+    a._live_ok, a._live_why = True, ""
+    return a
+
+
+def test_wrong_asset_submission_is_impossible(cfg, store):
+    from specforge.broker.robinhood_mcp import BrokerOrderRejected
+    from specforge.models import OrderIntent
+    a = _adapter(cfg, store)
+    c = _candidate("QQQ", 0.5)
+    c.asset_type = "option"
+    intent = OrderIntent.make(c, qty=1, limit_price=0.5)
+    intent.asset_type = "option"
+    review = a.review_order(intent)
+    assert not review.ok and any("equity-only" in w for w in review.warnings)
+    with pytest.raises(BrokerOrderRejected, match="equity-only"):
+        a.place_order(intent)
+
+
+def test_fractional_market_guard_refuses_unsafe_quotes(cfg, store, monkeypatch):
+    from specforge.broker.robinhood_mcp import BrokerOrderRejected
+    a = _adapter(cfg, store)
+    intent, _ = _buy("BBB", notional=50.0)      # qty 0.5 → fractional → market
+
+    def guard_with(quote):
+        monkeypatch.setattr(type(a), "_fresh_quote", lambda self, s: quote)
+        return lambda: a._guard_fractional_market(intent)
+
+    with pytest.raises(BrokerOrderRejected, match="no executable quote"):
+        guard_with({})()
+    with pytest.raises(BrokerOrderRejected, match="old"):
+        guard_with({"price": 100.0, "age_s": 999})()
+    with pytest.raises(BrokerOrderRejected, match="spread"):
+        guard_with({"price": 100.0, "bid": 98.0, "ask": 100.0})()
+    with pytest.raises(BrokerOrderRejected, match="deviates"):
+        guard_with({"price": 103.0, "bid": 102.9, "ask": 103.0})()
+    guard_with({"price": 100.2, "bid": 100.1, "ask": 100.25, "age_s": 5})()
+
+
+def test_slippage_monitor_records_breach(cfg, store):
+    a = _adapter(cfg, store)
+    intent, _ = _buy("BBB", notional=50.0)      # limit 100
+    a._monitor_slippage(intent, fill_price=102.0)        # 2% > 1% tolerance
+    import datetime as _dt
+    day = _dt.datetime.now().astimezone().date().isoformat()
+    assert int(store.kv_get(f"slippage_breaches:{day}", 0)) == 1
+    assert store.db.execute("SELECT 1 FROM audit WHERE "
+                            "event_type='fractional_slippage_breach'").fetchone()
+
+
+def test_api_mutations_require_session_token(cfg, store):
+    from fastapi.testclient import TestClient
+    from specforge.app import create_app
+    app = create_app(cfg, store, with_scheduler=False)
+    bare = TestClient(app)
+    assert bare.get("/api/health").status_code == 200          # reads open
+    r = bare.post("/api/research/jobs", json={"kind": "discover"})
+    assert r.status_code == 401 and "X-Session-Token" in r.text
+    token = bare.get("/api/session").json()["token"]
+    ok = TestClient(app, headers={"X-Session-Token": token})
+    assert ok.post("/api/research/jobs",
+                   json={"kind": "discover"}).status_code in (200, 202, 409)

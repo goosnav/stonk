@@ -6,6 +6,12 @@ from specforge.engine import run_cycle
 from specforge.nodes.base import build_registry
 
 
+def _tokenized_client(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, headers={
+        "X-Session-Token": app.state.session_token})
+
+
 def test_market_context_never_exposes_future(cfg, store):
     all_dates = [r["d"] for r in store.get_bars("AAA", "9999-12-31", 10000)]
     as_of = all_dates[len(all_dates) // 2]          # pick a mid-history date
@@ -369,7 +375,7 @@ def test_health_endpoint(cfg, store):
     heartbeat tracked; never throws."""
     from fastapi.testclient import TestClient
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     body = client.get("/api/health").json()
     assert body["mode"] == "paper"
     assert body["broker"]["adapter"] == "paper" and body["broker"]["connected"]
@@ -431,7 +437,7 @@ def test_ai_provider_endpoint_never_leaks_key(cfg, store, tmp_path, monkeypatch)
     monkeypatch.delenv("AI_BASE_URL", raising=False)
     from fastapi.testclient import TestClient
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
 
     r = client.post("/api/ai/provider",
                     json={"provider": "anthropic", "api_key": "sk-secret-123456"})
@@ -464,7 +470,7 @@ def test_portfolio_value_and_steering_endpoints(cfg, store):
 
     from specforge import steering
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
 
     from datetime import date, timedelta as td
     store.record_equity(1000.0, 500.0, "paper",
@@ -517,7 +523,7 @@ def test_today_digest_endpoint(cfg, store):
     from fastapi.testclient import TestClient
 
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     run_cycle(cfg, store, refresh_data=False)
     store.kv_set("news_synopsis", {"ts": "2026-07-09T10:00:00-07:00", "items": [
         {"symbol": "AAA", "sentiment": 0.6, "catalyst": "earnings",
@@ -536,7 +542,7 @@ def test_pnl_series_is_deposit_independent(cfg, store):
     from fastapi.testclient import TestClient
 
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     y = (date.today() - td(days=1)).isoformat()
     store.record_trade({"symbol": "AAA", "entry_date": y, "exit_date": y,
                         "entry_price": 100, "exit_price": 105, "qty": 1,
@@ -555,7 +561,7 @@ def test_decisions_endpoint(cfg, store):
     from fastapi.testclient import TestClient
 
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     run_cycle(cfg, store, refresh_data=False)
     d = client.get("/api/decisions").json()
     assert d["cycle"]["regime"]
@@ -571,7 +577,7 @@ def test_model_endpoint(cfg, store):
     from fastapi.testclient import TestClient
 
     from specforge.app import create_app
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     store.set_weight_multiplier("momentum", 1.5, note="test")
     m = client.get("/api/model").json()
     by = {n["id"]: n for n in m["nodes"]}

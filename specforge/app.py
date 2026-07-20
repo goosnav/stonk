@@ -110,6 +110,29 @@ def create_app(cfg, store: Store, with_scheduler: bool = True) -> FastAPI:
     app.state.account_cache_lock = threading.Lock()
     app.state.broker_connect_lock = threading.Lock()
 
+    # R4: per-launch session token. Loopback binding + Origin checks are not
+    # authorization — any local process can omit Origin. Mutating /api routes
+    # now require the token; the dashboard fetches it once from /api/session
+    # (which itself sits behind the loopback/origin protections below).
+    import secrets as _secrets
+    app.state.session_token = _secrets.token_urlsafe(32)
+
+    @app.get("/api/session")
+    def session_token():
+        return {"token": app.state.session_token}
+
+    @app.middleware("http")
+    async def _session_token_gate(request, call_next):
+        if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+                and request.url.path.startswith("/api")):
+            supplied = request.headers.get("x-session-token")
+            if supplied != app.state.session_token:
+                return JSONResponse(
+                    {"error": "missing or invalid X-Session-Token; "
+                              "fetch it from GET /api/session"},
+                    status_code=401)
+        return await call_next(request)
+
     @app.middleware("http")
     async def same_origin_mutations(request: Request, call_next):
         """Block browser cross-site writes to the loopback control plane.

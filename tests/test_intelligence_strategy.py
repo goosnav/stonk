@@ -12,6 +12,12 @@ from specforge import intelligence, strategy
 from specforge.app import create_app
 
 
+def _tokenized_client(app):
+    from fastapi.testclient import TestClient
+    return TestClient(app, headers={
+        "X-Session-Token": app.state.session_token})
+
+
 def test_expired_orphan_intelligence_job_recovers_on_regular_poll(cfg, store, monkeypatch):
     job = intelligence.enqueue(store, "news_refresh")
     with store.db:
@@ -139,7 +145,7 @@ def test_news_job_is_durable_deduplicated_and_aggregated(cfg, store):
 
 
 def test_routing_and_strategy_public_interfaces_persist_without_restart(cfg, store):
-    client = TestClient(create_app(cfg, store, with_scheduler=False))
+    client = _tokenized_client(create_app(cfg, store, with_scheduler=False))
     update = client.put("/api/ai/routing", json={
         "enabled": True, "default_provider": "claude",
         "default_models": {"cheap": "haiku", "advanced": "opus"},

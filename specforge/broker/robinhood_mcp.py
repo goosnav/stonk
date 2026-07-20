@@ -389,6 +389,78 @@ class RobinhoodMCPBroker:
                     out[sym] = px
         return out
 
+    def _fresh_quote(self, symbol: str) -> dict:
+        """One symbol's executable quote with bid/ask and age when available."""
+        res = self._call("get_equity_quotes", {"symbols": [symbol]})
+        for row in _first(res, "results", "quotes", default=[]) or []:
+            q = row.get("quote", row) if isinstance(row, dict) else {}
+            if _first(q, "symbol", "ticker") != symbol:
+                continue
+            age_s = None
+            ts = _first(q, "updated_at", "timestamp", "quote_time")
+            if ts:
+                try:
+                    at = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    age_s = max(0.0, (datetime.now(at.tzinfo) - at).total_seconds())
+                except ValueError:
+                    pass
+            return {"price": _f(_first(q, "last_trade_price", "last", "price",
+                                       "mark_price"), 0.0) or None,
+                    "bid": _f(_first(q, "bid_price", "bid"), 0.0) or None,
+                    "ask": _f(_first(q, "ask_price", "ask"), 0.0) or None,
+                    "age_s": age_s}
+        return {}
+
+    def _guard_fractional_market(self, intent: OrderIntent) -> None:
+        """R4: fractional market orders execute at whatever the market says —
+        so the market must first say something fresh, tight, and close to the
+        limit the governor approved. Any doubt refuses the order (the engine
+        already treats BrokerOrderRejected as a clean broker rejection)."""
+        max_age = float(self.cfg.get("execution",
+                                     "fractional_quote_max_age_s", default=120))
+        max_dev = float(self.cfg.get("execution",
+                                     "fractional_max_deviation_pct", default=0.01))
+        max_spread = float(self.cfg.get("universe", "max_spread_pct", default=0.005))
+        q = self._fresh_quote(intent.symbol)
+        if not q or not q.get("price"):
+            raise BrokerOrderRejected(
+                f"{intent.symbol}: fractional market order refused — "
+                "no executable quote")
+        if q.get("age_s") is not None and q["age_s"] > max_age:
+            raise BrokerOrderRejected(
+                f"{intent.symbol}: fractional market order refused — quote is "
+                f"{q['age_s']:.0f}s old (max {max_age:.0f}s)")
+        bid, ask = q.get("bid"), q.get("ask")
+        if bid and ask and ask > 0 and (ask - bid) / ask > max_spread:
+            raise BrokerOrderRejected(
+                f"{intent.symbol}: fractional market order refused — spread "
+                f"{(ask - bid) / ask:.2%} > {max_spread:.2%}")
+        ref = intent.limit_price
+        if ref and abs(q["price"] - ref) / ref > max_dev:
+            raise BrokerOrderRejected(
+                f"{intent.symbol}: fractional market order refused — quote "
+                f"{q['price']:.4f} deviates {abs(q['price'] - ref) / ref:.2%} "
+                f"from approved reference {ref:.4f} (max {max_dev:.2%})")
+
+    def _monitor_slippage(self, intent: OrderIntent, fill_price: float) -> None:
+        """Post-fill: a market fill far from the approved reference counts as a
+        slippage breach; the governor halts new entries after N in a day."""
+        ref = intent.limit_price
+        if not ref:
+            return
+        max_dev = float(self.cfg.get("execution",
+                                     "fractional_max_deviation_pct", default=0.01))
+        slip = (fill_price - ref) / ref if intent.side == "buy" else                (ref - fill_price) / ref
+        if slip > max_dev:
+            day = datetime.now().astimezone().date().isoformat()
+            key = f"slippage_breaches:{day}"
+            n = int(self.store.kv_get(key, 0) or 0) + 1
+            self.store.kv_set(key, n)
+            self.store.audit("fractional_slippage_breach", {
+                "symbol": intent.symbol, "reference": ref,
+                "fill": fill_price, "slippage": round(slip, 5),
+                "breaches_today": n})
+
     def _order_args(self, intent: OrderIntent) -> dict:
         """RH constraint: fractional qty ⇒ market order in regular hours;
         whole shares ⇒ limit order at our computed limit price."""
@@ -410,6 +482,11 @@ class RobinhoodMCPBroker:
         return args
 
     def review_order(self, intent: OrderIntent) -> OrderReview:
+        if intent.asset_type != "equity":
+            # R4 structural invariant: this adapter speaks ONLY equity tools.
+            # An option/other intent here is a wiring bug, not a market call.
+            return OrderReview(ok=False, warnings=[
+                f"equity-only adapter: refusing {intent.asset_type} order"])
         if not self._live_ok:
             return OrderReview(ok=False, warnings=[f"live gate: {self._live_why}"])
         res = self._call("review_equity_order", self._order_args(intent))
@@ -436,9 +513,17 @@ class RobinhoodMCPBroker:
         return OrderReview(ok=not warnings, warnings=warnings, raw=res)
 
     def place_order(self, intent: OrderIntent) -> Fill | None:
+        if intent.asset_type != "equity":
+            raise BrokerOrderRejected(
+                f"equity-only adapter: {intent.asset_type} order for "
+                f"{intent.symbol} can never be submitted here (R4)")
         if not self._live_ok:
             raise BrokerAuthError(f"live trading blocked: {self._live_why}")
         args = self._order_args(intent)
+        if args["type"] == "market":
+            # RH forces fractional ⇒ MARKET: without a fresh, tight executable
+            # quote near our reference this is unpriced risk — refuse it.
+            self._guard_fractional_market(intent)
         import uuid as _uuid
         args["ref_id"] = str(_uuid.uuid5(_uuid.NAMESPACE_URL, intent.idempotency_key))
         res = self._call("place_equity_order", args)
@@ -458,9 +543,12 @@ class RobinhoodMCPBroker:
         self.store.update_order(intent.id, broker_order_id=broker_id)
         state = str(_first(order, "state", "status", default="")).lower()
         if state == "filled":
+            fill_price = _f(_first(order, "average_price", "price"), intent.limit_price)
+            if args["type"] == "market":
+                self._monitor_slippage(intent, fill_price)
             return Fill(order_id=intent.id, symbol=intent.symbol, side=intent.side,
                         qty=_f(_first(order, "filled_quantity", "quantity"), intent.qty),
-                        price=_f(_first(order, "average_price", "price"), intent.limit_price),
+                        price=fill_price,
                         filled_at=datetime.now().astimezone().isoformat())
         return None                        # resting — reconciled next cycle
 

@@ -278,6 +278,13 @@ class Store:
             self.db.commit()
         except sqlite3.OperationalError:
             pass    # column already there
+        # R4: sector classification lives on the instrument row (R5 populates
+        # it point-in-time; until then NULL = exempt-but-audited from the cap)
+        try:
+            self.db.execute("ALTER TABLE instruments ADD COLUMN sector TEXT")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass
         # migration for DBs created before positions.entry_mode existed (C2:
         # durable probe identity — never inferred through audit joins)
         try:
@@ -600,6 +607,25 @@ class Store:
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (key, json.dumps(value, default=str)))
         self.db.commit()
+
+    # ---------- external cash flows (R4) ----------
+    # Deposits/withdrawals are NOT trading P&L: loss switches compare equity
+    # net of these, so a deposit can't mask a real loss and a withdrawal
+    # can't fake one.
+    def record_external_flow(self, amount: float, d: str | None = None,
+                             note: str = "") -> None:
+        flows = self.kv_get("external_flows", []) or []
+        flows.append({"d": d or date.today().isoformat(),
+                      "amount": float(amount), "note": note})
+        self.kv_set("external_flows", flows)
+        self.audit("external_flow_recorded",
+                   {"amount": amount, "d": d, "note": note})
+
+    def external_flows_since(self, d: str) -> float:
+        """Net signed external flow recorded strictly after date d."""
+        return sum(float(f.get("amount", 0))
+                   for f in (self.kv_get("external_flows", []) or [])
+                   if str(f.get("d", "")) > d)
 
     # ---------- cross-process leases (Sprint E1) ----------
     # The generic mechanism for any resource that must never run twice across

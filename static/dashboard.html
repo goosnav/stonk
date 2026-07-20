@@ -452,8 +452,16 @@ const progressHtml = (fraction,label) => {
 };
 function toast(m){const t=$('toast');t.textContent=m;t.style.display='block';
   setTimeout(()=>t.style.display='none',4500);}
+let SESSION_TOKEN=null;
+async function ensureToken(){
+  if(SESSION_TOKEN) return SESSION_TOKEN;
+  try{SESSION_TOKEN=(await (await fetch('/api/session')).json()).token;}catch(e){}
+  return SESSION_TOKEN;
+}
 async function api(p,o={}){
   const method=(o.method||'GET').toUpperCase(), attempts=method==='GET'?2:1;
+  if(method!=='GET') await ensureToken();               // R4 session token
+  o.headers={...(o.headers||{}), ...(SESSION_TOKEN?{'X-Session-Token':SESSION_TOKEN}:{})};
   let last;
   for(let i=0;i<attempts;i++){
     const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),20000);
