@@ -577,7 +577,22 @@ def latest_sec_filing(cik: str, client=None) -> dict | None:
 
 
 def _company_news(symbol: str, limit: int = 12) -> list[dict]:
-    """Current company-specific news metadata; no article body is invented."""
+    """Current company news. Delegates to the RSS sources; yfinance is a fallback.
+
+    `yfinance.Ticker.news` returns Yahoo's internal JSON, whose shape drifts
+    without notice, and there is only one of it. news_sources reads plain RSS
+    from several independent feeds instead — no keys, no quotas, nothing to
+    expire. This wrapper keeps the old signature (swallowing failure) for
+    callers that treat news as optional decoration; `intelligence._ingest` uses
+    news_sources.company_news directly so it can tell dark from quiet.
+    """
+    try:
+        from .news_sources import company_news
+        articles = company_news(symbol, limit=limit)
+        if articles:
+            return articles
+    except Exception:                       # noqa: BLE001 — fall through to Yahoo
+        pass
     try:
         import yfinance as yf
         out = []

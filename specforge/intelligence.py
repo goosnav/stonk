@@ -91,11 +91,22 @@ def _symbols(store) -> list[str]:
 
 def _ingest(store, fetcher=None) -> int:
     if fetcher is None:
-        from .research import _company_news
-        fetcher = _company_news
+        from .news_sources import company_news
+        fetcher = company_news
     inserted = 0
+    dark = []
     for symbol in _symbols(store):
-        for article in fetcher(symbol, limit=12):
+        try:
+            articles = fetcher(symbol, limit=12)
+        except Exception as exc:            # noqa: BLE001 — per-symbol isolation
+            # Every source failed for this symbol. Record it: a dark feed and a
+            # quiet news day are not the same fact, and the old bare-except
+            # could not tell them apart.
+            dark.append(symbol)
+            store.audit("news_sources_unavailable",
+                        {"symbol": symbol, "error": str(exc)[:200]})
+            continue
+        for article in articles:
             aid = str(article.get("id") or hashlib.sha256(json.dumps(
                 article, sort_keys=True).encode()).hexdigest()[:16])
             content_hash = hashlib.sha256(
@@ -108,6 +119,8 @@ def _ingest(store, fetcher=None) -> int:
                      str(article.get("title", ""))[:1000], str(article.get("summary", ""))[:4000],
                      str(article.get("url", ""))[:2000], str(article.get("provider", ""))[:200],
                      content_hash, None, None, None, None, None, None, None, None)).rowcount
+    if dark:
+        store.kv_set("news_dark_symbols", dark)
     return inserted
 
 
