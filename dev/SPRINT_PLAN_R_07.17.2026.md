@@ -272,3 +272,84 @@ that currently grants it permission."
   the deterministic baseline has never been measured either. Wiring it in
   before that measurement exists would grant it influence it has not earned —
   the exact failure mode R0-R1 were written to prevent.
+
+- 2026-07-20 R8 DONE (388 tests): experiment governance.
+  `ml/governance.py` - deflated_sharpe (Bailey & Lopez de Prado: discount the
+  observed Sharpe by the expected MAXIMUM under the null given the trial count,
+  corrected for skew/kurtosis; returns a PROBABILITY), CSCV
+  probability_of_backtest_overfitting (how often the IS winner lands below the
+  OOS median; ~0.5 means selection is uninformative), block_bootstrap_ci
+  (contiguous blocks - an i.i.d. bootstrap on autocorrelated returns invents
+  precision), and trial_adjusted_summary which fails closed on any missing
+  dimension. Acklam normal-inverse + erf CDF locally; no scipy.
+  `Store.record_holdout_use` / `holdout_uses` - append-only sealed-block
+  consumption ledger, so an eroded holdout cannot present itself as fresh.
+  `bakeoff.candidate_cohort_matrix` builds the PBO input from the alternatives
+  actually considered (controls + every TCN seed).
+  Test correction worth recording: my first trial-adjustment test asserted a
+  strong edge should FAIL at 100k trials. It does not, and should not - a ~3.0
+  annualized Sharpe survives that deflation correctly. Rewrote it around a
+  MARGINAL edge, which is where search cost actually decides.
+
+## 2026-07-20 - THE STANDING CAVEAT, MEASURED
+
+First honest end-to-end run on real data. 200 symbols with >=1500 sessions,
+203,200 windows over 3,285 distinct sessions; train <= 2022-03-07, val from
+2022-04-08, sealed test from 2024-05-03 (29,761 sealed windows).
+
+Net OOS policy utility on the sealed block (higher is better):
+
+| candidate                 | absolute   | excess   |
+|---------------------------|------------|----------|
+| zero                      | -0.311     | -0.604   |
+| momentum                  | -0.771     | -1.023   |
+| ridge                     | -0.176     | -0.330   |
+| elastic_net               | **-0.145** | -0.349   |
+| boosted_tree              | -0.464     | -0.727   |
+| **TCN, median of 3 seeds**| **-0.556** | **-0.548** |
+
+**BAKEOFF VERDICT: False.** The TCN loses to every control in the absolute
+family and to ridge in excess, and is worse than predicting ZERO. Seed spread
+is 0.18-0.24 - wider than most gaps between candidates, so the TCN's own
+number is unstable. The R6 gate refuses it. That is the gate working.
+
+R8 governance on the same run (178 registry trials + 8 candidates):
+
+| family   | best candidate | observed Sharpe | bar under null | deflated | PBO    |
+|----------|----------------|-----------------|----------------|----------|--------|
+| absolute | ridge          | 0.0239          | 0.3803         | 0.0039   | 0.3175 |
+| excess   | ridge          | -0.0645         | 0.3806         | 0.0019   | 0.6905 |
+
+After declaring the search honestly, a candidate needs a per-cohort Sharpe of
+~0.38 just to match the best of random search. The best we have is 0.024.
+Deflated Sharpe 0.004 means there is essentially no evidence of skill. In the
+excess family PBO = 0.69: the in-sample winner lands BELOW the OOS median more
+often than not, i.e. selecting on this backtest is worse than not selecting.
+
+Read the LEVELS with care: utility = median annualized - 0.5 * max drawdown
+over staggered cohorts, and for a losing series the drawdown term dominates
+and approaches 1. These rank candidates honestly; they are not returns.
+
+Three things this measurement does NOT license concluding:
+1. **Every candidate is negative, controls included.** This is not "the TCN is
+   bad, ridge is good". At the R5 median round-trip cost of 43.5 bps (vs the
+   old flat 16) nothing in the current feature set shows cross-sectional edge
+   over 2024-2026. Weak features, a cost model now correctly killing marginal
+   strategies, or both.
+2. **The model trained WITHOUT fundamentals or news.** The SEC fact starvation
+   fix landed the same day; the store still holds the old narrow tag set and
+   refills at one issuer per research task. The panel was effectively
+   price/volatility/market-context only.
+3. **Survivor bias is present and labeled, not fixed.** Only 5 universe
+   snapshots exist, all recent, so essentially every candidate window predates
+   point-in-time coverage.
+
+The caveat is no longer an assertion, it is a measurement. There is still no
+champion and learned influence remains hard-zero - now because that is the
+correct answer, not merely the safe default.
+
+## Next
+R9 (shadow + tiny-live probation) CANNOT start: it requires positive
+incremental evidence vs deterministic, and the evidence is negative. The real
+next step is R6/R5 remediation - refill SEC facts, backfill news or drop the
+feature, build historical universe membership - then re-run this measurement.
