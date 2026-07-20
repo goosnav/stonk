@@ -1012,7 +1012,8 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
 
 def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
                      seeds: int = 3, max_seconds: float | None = None,
-                     epochs: int | None = None) -> dict[str, dict[str, np.ndarray]]:
+                     epochs: int | None = None, early_stop: bool = True,
+                     linear_skip: bool = True) -> dict[str, dict[str, np.ndarray]]:
     """Train `seeds` independent TCNs and return each one's eval-row medians.
 
     One training run is one draw from a stochastic process — initialization,
@@ -1058,6 +1059,14 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
         model = _make_model(len(FEATURES), len(horizons),
                             feature_dropout=float(trial_spec.get(
                                 "feature_dropout", 0.0))).to(device)
+        if not linear_skip:
+            # Ablation only: freeze the skip at zero so the architecture reduces
+            # to the pre-v9 model. Zeroing without freezing would let the
+            # optimizer learn it straight back.
+            with torch.no_grad():
+                model.skip.weight.zero_(); model.skip.bias.zero_()
+            model.skip.weight.requires_grad_(False)
+            model.skip.bias.requires_grad_(False)
         opt = torch.optim.AdamW(model.parameters(), lr=trial_spec["lr"],
                                 weight_decay=trial_spec["weight_decay"])
         bce = torch.nn.functional.binary_cross_entropy
@@ -1089,6 +1098,8 @@ def seed_predictions(cfg, ds, eval_idx, trial_spec: dict | None = None,
                         X[chunk].to(device)))
                     total += float(value) * len(chunk); rows_seen += len(chunk)
             current = total / max(1, rows_seen)
+            if not early_stop:
+                continue                  # ablation: run the full epoch budget
             if current < best_loss - 1e-5:
                 best_loss, stale = current, 0
                 best_state = {k: v.detach().clone()

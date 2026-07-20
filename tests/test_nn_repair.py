@@ -2939,3 +2939,48 @@ def test_ablation_uses_the_strongest_control_not_a_hardcoded_one():
     # An explicit choice is still honoured.
     assert bakeoff.ablate(ds, eval_idx, "absolute", model="ridge")["ablated_model"] \
         == "ridge"
+
+
+def test_seed_predictions_ablation_flags_actually_disable_the_features():
+    """Attribution needs the flags to really turn things off.
+
+    A zeroed-but-trainable skip would be learned straight back, and the
+    ablation would silently measure the same model twice.
+    """
+    from specforge import neural
+    ds = _bakeoff_dataset(n_days=120, n_symbols=12, signal=.05)
+    eval_idx = np.flatnonzero(ds["masks"]["test"])
+    off = neural.seed_predictions(cfg=_cfg_for_ablation(), ds=ds,
+                                  eval_idx=eval_idx, seeds=1, epochs=1,
+                                  linear_skip=False)
+    on = neural.seed_predictions(cfg=_cfg_for_ablation(), ds=ds,
+                                 eval_idx=eval_idx, seeds=1, epochs=1,
+                                 linear_skip=True)
+    for family in ("absolute", "excess"):
+        assert set(off[family]) == {"tcn_seed_0"}
+        assert np.isfinite(list(off[family].values())[0]).all()
+        assert np.isfinite(list(on[family].values())[0]).all()
+
+
+def _cfg_for_ablation():
+    from specforge.config import load_config
+    return load_config("paper")
+
+
+def test_frozen_skip_stays_zero_through_training():
+    """The mechanism the ablation depends on, checked directly."""
+    import torch
+    from specforge import neural
+    model = neural._make_model(len(neural.FEATURES), 2)
+    with torch.no_grad():
+        model.skip.weight.zero_(); model.skip.bias.zero_()
+    model.skip.weight.requires_grad_(False)
+    model.skip.bias.requires_grad_(False)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    x = torch.randn(16, 60, len(neural.FEATURES))
+    for _ in range(3):
+        opt.zero_grad()
+        model.forward_structured(x).absolute_quantiles.pow(2).mean().backward()
+        opt.step()
+    assert torch.count_nonzero(model.skip.weight) == 0
+    assert torch.count_nonzero(model.skip.bias) == 0
