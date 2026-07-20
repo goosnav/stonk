@@ -414,3 +414,62 @@ was not the model.
 Survivorship: per user decision, accepted and labeled rather than pursued.
 Only 5 universe snapshots exist and they cannot be reconstructed backwards, so
 every result stays survivorship-biased in writing.
+
+## 2026-07-20 - RE-MEASURED ON CLEAN DATA
+
+Panel: 195 symbols, 203,190 windows over 3,507 sessions, zero adjustment seams
+(the script refuses to run otherwise); train <= 2022-03-07, sealed test from
+2024-05-10, 34,499 sealed windows. 83 symbols quarantined.
+
+Net OOS policy utility, sealed block. Corrupted run in brackets:
+
+| candidate                 | absolute            | excess             |
+|---------------------------|---------------------|--------------------|
+| zero                      | +0.144  [-0.311]    | -0.013  [-0.604]   |
+| momentum                  | +0.266  [-0.771]    | +0.063  [-1.023]   |
+| ridge                     | +0.683  [-0.176]    | +0.452  [-0.330]   |
+| elastic_net               | **+0.805** [-0.145] | **+0.583** [-0.349]|
+| boosted_tree              | +0.492  [-0.464]    | +0.279  [-0.727]   |
+| **TCN, median of 3 seeds**| **+0.172** [-0.556] | **+0.042** [-0.548]|
+
+**Every candidate changed sign.** The corruption, not the model and not the
+feature set, produced the previous result. Momentum swinging from worst
+(-0.771) to +0.266 is the clearest signature: r1 was reading fabricated
+sessions directly.
+
+### What is now true
+- **The TCN still loses, and loses badly.** elastic_net +0.805 vs TCN +0.172 in
+  absolute; +0.583 vs +0.042 in excess. Seed spread (0.276) EXCEEDS the TCN's
+  own median utility, so the network is not merely worse than a linear model on
+  the last session - it is not stable across seeds. BAKEOFF VERDICT: False. The
+  R6 gate refuses it, correctly.
+- **The simple linear models do show something.** Block bootstrap on the best
+  candidate excludes zero in both families (absolute mean_ci
+  [0.0041, 0.0366], p(mean>0)=0.995; excess [0.0003, 0.0262], p=0.979), and
+  PBO is LOW - 0.024 absolute, 0.25 excess - meaning selection among these
+  eight candidates carries real information rather than being a coin flip.
+
+### What is NOT established, and why the verdict is still False
+Deflated Sharpe: **0.442 absolute, 0.204 excess** - both far below the 0.95
+bar. Ridge's observed per-cohort Sharpe of 0.2596 sits just UNDER the 0.2733
+expected maximum from 186 declared trials. So the honest reading is: the best
+candidate is not distinguishable from the best of the search that produced it.
+The bootstrap CI excluding zero is not a counter-argument - it is computed on
+the SELECTED winner, which is exactly the bias deflation exists to correct.
+
+Three limits that keep this from being a market claim:
+1. **The panel is still 87% "A" names.** The backfill ordering fix only changes
+   what gets fetched going FORWARD; it cannot retroactively create history for
+   the ~5,000 symbols the alphabetical walk never reached. This is clean data,
+   not a representative sample.
+2. **Survivorship remains, labeled**: 644,660 uncovered candidate windows
+   against 0 covered - essentially all history predates PIT membership.
+3. **Still no fundamentals or news in the panel** - the SEC refill needs to run.
+
+### Bottom line
+The standing caveat is unchanged in its conclusion and completely changed in
+its basis: there is still no champion and learned influence stays hard-zero,
+but now because the TCN measurably loses to elastic-net on clean data, not
+because it was measured on fabricated returns. The next honest step is breadth
+(run the backfill and SEC refill across the universe), then re-measure - not
+model work.
