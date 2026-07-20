@@ -473,3 +473,57 @@ but now because the TCN measurably loses to elastic-net on clean data, not
 because it was measured on fabricated returns. The next honest step is breadth
 (run the backfill and SEC refill across the universe), then re-measure - not
 model work.
+
+## 2026-07-20 - BREADTH: the panel is finally a market sample
+
+Two backfill bugs found and fixed before the run:
+1. **Ranking was circular.** Liquidity rank is computed FROM stored bars, so a
+   symbol with no bars can never be ranked. All 251 ranked symbols already had
+   bars, so the "order by importance" fix contributed zero new candidates and
+   everything fell through to the alphabetical tiebreak it was meant to
+   replace. The unranked tail now orders by a stable hash of the symbol: still
+   arbitrary, but UNBIASED, so after N fetches the store holds a uniform random
+   sample rather than the first N letters.
+2. **The backfill was spinning.** `_missing_history` selects symbols with fewer
+   than 260 sessions; a recent listing has fewer and never will have more
+   today, so it stayed a candidate forever. Batches re-fetched the same ~50
+   short-history names every round - five new symbols in two minutes while
+   5,300 catalog symbols had none. `backfill_batch` compares row counts before
+   and after and marks anything still short as exhausted, ageing out after 30
+   days since a young listing does accumulate history.
+
+Result of a 78-minute run:
+
+| | before | after |
+|---|---|---|
+| symbols with bars | 578 | **3,669** |
+| "A" share | 91% | **16%** |
+| symbols with >=1500 sessions | 380 | **2,370** |
+| research tier | 251 (all already had bars) | **1,500** ranked by dollar volume |
+
+Re-audited the 3,091 new symbols: 52 impossible-ratio, 588 implausible-density,
+598 quarantined (16% of the panel). Measurement panel: 200 symbols, 18% "A",
+ZERO adjustment seams.
+
+## 2026-07-20 - MODEL CHANGES (measured together with the breadth)
+
+- **A defect in my own harness**: `seed_predictions` trained a fixed 6 epochs
+  with no early stopping while every control it is compared against is fit to
+  convergence. "The TCN loses to a linear model" was partly measuring
+  undertraining and reporting it as architecture. Seeds now early-stop on
+  validation against the same joint objective and restore the best epoch.
+- **The gate scored the median seed**; the deployable artifact is the ENSEMBLE,
+  and seed spread (0.276) exceeded the median seed's own utility. compare() now
+  scores the mean of the seed predictions. Never the best seed.
+- **Linear skip path (arch v9)**: zero-initialized linear map from the latest
+  session to each head's median, so a linear model is exactly representable and
+  the deep branches learn only the residual.
+- **Heavier regularization + feature dropout (arch v10)**.
+
+**Honest correction to the rationale for that last one.** It was motivated by
+elastic-net beating ridge on the OLD panel (+0.805 vs +0.683 absolute). On the
+representative panel they are nearly tied and ridge actually WINS the excess
+family (0.626 vs 0.597). The "signal is sparse" reading was an artifact of the
+microcap-heavy sample. The change is not harmful - it adds grid points without
+removing any - but the evidence I cited for it does not survive the better
+panel, and the grid should be re-justified rather than assumed.
