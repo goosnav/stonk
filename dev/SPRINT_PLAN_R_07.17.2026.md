@@ -353,3 +353,64 @@ R9 (shadow + tiny-live probation) CANNOT start: it requires positive
 incremental evidence vs deterministic, and the evidence is negative. The real
 next step is R6/R5 remediation - refill SEC facts, backfill news or drop the
 feature, build historical universe membership - then re-run this measurement.
+
+## 2026-07-20 - RETRACTION: the measurement above was taken on broken data
+
+Forensics on the panel that produced the numbers in "THE STANDING CAVEAT,
+MEASURED" found two defects that invalidate the interpretation. **The
+conclusion "the TCN has no edge" and "nothing in the feature set shows
+cross-sectional edge" is retracted.** The numbers were real; what they measured
+was not the model.
+
+1. **Split-adjustment corruption.** `data.refresh()` took an incremental window
+   when bars were recent, and `upsert_bars` overwrites per (symbol, d) with no
+   re-adjustment. Providers serve retroactively adjusted series, so after a
+   corporate action the old rows kept the stale basis while the trailing window
+   arrived on the new one. 1,834 impossible single-session moves across 578
+   symbols; **62 of the 200 panel symbols (31%) carried 499 seam events**, worst
+   a +416,566% "return" (ABVC 2015-09-17, 0.34 -> 1433.12) sitting directly in
+   the forward-return targets and the r1 momentum feature. Momentum scoring
+   worst of all controls (-0.771) is exactly what a poisoned r1 predicts.
+2. **The panel was not a market sample.** `_missing_history` ordered by
+   `n DESC, symbol`; almost every candidate has n=0, so the tiebreak decided
+   everything and the backfill walked the alphabet. Of 578 symbols holding bars,
+   **530 begin with "A"**. The "top 200 by history" was 162 A-names, largely
+   junk microcaps.
+
+### Fixes shipped (416 tests green)
+- `specforge/bars_audit.py`: detector classifies a candidate as a repairable
+  seam only when it is a declared split factor whose level shift persists, OR
+  when the ratio is physically impossible (>=20x, which stacked reverse splits
+  produce). Everything else is reported, never rewritten.
+  **Caught in review:** the first version used "any fraction with terms under
+  20" as the split test. That accepts 0.7 - and Black Monday moved MSFT by
+  exactly that, with a persistent drop, so both tests passed and 1987-10-19 was
+  classified as a corporate action. Repairing a real crash out of the record
+  would be worse than the bug being fixed. The test is now a closed list of
+  ratios issuers actually declare, with a regression test pinning Black Monday
+  as `suspicious`.
+- `repair_symbol` fetches and validates BEFORE touching storage (an empty or
+  truncated fetch leaves history untouched) and replaces delete-then-insert in
+  one transaction so no row survives on the stale basis.
+- Prevention: `refresh()` fetches a 3-month overlap window and compares it
+  against stored rows, escalating to a full re-fetch when the basis moved.
+  Stateless; catches splits, dividends and restatements uniformly.
+- `_missing_history` now orders by configured universe + open positions, then
+  research-tier rank (dollar-volume sorted), then the alphabetical tail.
+- SEC facts made bulk-capable: candidate query and due-marker check hoisted out
+  of the per-issuer function (a 1,500-issuer batch cost ~1.1M kv reads for 1,500
+  fetches), `LIMIT 2000` removed, configurable `research.sec_user_agent` with a
+  bulk run refusing the "contact=local-user" placeholder, ~5 req/s politeness.
+- News refactored off `yfinance.Ticker.news` onto plain multi-source RSS
+  (Google News / Yahoo / Nasdaq): no keys, no quotas, nothing to expire. One
+  dead source costs coverage, not the feature; only total failure raises, and
+  dark symbols are recorded rather than swallowed. Verified live, all three
+  feeds HTTP 200. This does NOT create history - news stays unusable as a
+  training feature before collection began, per the user decision to keep it a
+  live-path signal and label it.
+- New CLI: `bars-audit [--repair]` (report-only by default, since a repair
+  rewrites price history) and `sec-facts --limit N`.
+
+Survivorship: per user decision, accepted and labeled rather than pursued.
+Only 5 universe snapshots exist and they cannot be reconstructed backwards, so
+every result stays survivorship-biased in writing.
