@@ -186,3 +186,31 @@ that currently grants it permission."
       shared-model-plus-small-adapters refactor is not started.
     * Ablation runs on ridge, not on the TCN — cheap and deterministic, but it
       cannot see a family that only a network can exploit.
+- 2026-07-20 R6c DONE (372 tests): the panel stops copying itself; the window
+  cap becomes a memory budget. This closes the streaming-panel remainder.
+  * The training path de-normalized the whole 60-session panel THREE times to
+    read data it then mostly discarded. `_baseline_metrics` and
+    `bakeoff.context_design` wanted only each window's last session — both now
+    slice first and scale after (`neural.context_rows`). Walk-forward folds
+    materialized `raw` plus a renormalized copy PER FOLD — `NormalizedPanel`
+    applies fold statistics lazily per batch, with the fold mean/std derived
+    algebraically from the stored panel. A test pins the lazy and eager paths
+    as numerically identical rather than trusting the algebra.
+  * `bakeoff.ablate` copied the entire panel once per feature family; it now
+    knocks columns out on the (n, n_features) context matrix, pinned to the
+    TRAIN MEAN rather than zero — zero injects a fictitious value once the
+    matrix is in de-normalized units.
+  * With the copies gone the ceiling can be the thing that actually binds: a
+    memory budget re-derived from the real window and feature count, instead
+    of a hand-set 12,000 that rots whenever either changes (R5 grew both).
+    12,000 -> 203,360 windows at a 2 GB budget; SAFE_PANEL_MEMORY_GB = 8 is
+    the process ceiling config may only lower.
+  * Trap worth recording: removing the hard-coded ceiling in code changed
+    NOTHING, because configs/default.yaml still pinned max_training_windows to
+    12000 and capped the result downward. The win was invisible until both
+    went. A regression test now asserts the shipped config does not re-pin it.
+    Same shape as the R5 "grep every caller" lesson: a limit expressed in two
+    places is only lifted when both are.
+  Still open from R6: per-holding models remain full fine-tunes (the
+  shared-model-plus-adapters refactor is not started), and ablation still runs
+  on ridge rather than the TCN.
