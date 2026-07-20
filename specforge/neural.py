@@ -431,6 +431,13 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
         {s for s in cfg.get("universe", "symbols", default=[]) if not s.startswith("^")}
         | set(_universe.historical_symbols(store)))
     pit_dates = sorted(pit_history := _universe.membership_history(store))
+    # Symbols whose price history stays discontinuous after a clean refetch are
+    # excluded outright. Training on a series with a fabricated 400,000% session
+    # is worse than training on less data.
+    from . import bars_audit as _bars_audit
+    excluded = _bars_audit.quarantined(store)
+    symbols = [s for s in symbols if s not in excluded]
+    excluded_used = sorted(excluded)
     bench = cfg.get("universe", "benchmark", default="SPY")
     spy, vix = _bars(store, bench, since), _bars(
         store, cfg.get("universe", "vix_symbol", default="^VIX"), since)
@@ -558,6 +565,7 @@ def build_dataset(cfg, store, symbols: list[str] | None = None, progress=None,
                     "universe_dropped_candidates": pit_dropped,
                     "universe_uncovered_candidates": pit_uncovered,
                     "panel_windows": len(X),
+                    "quarantined_symbols": len(excluded_used),
                     "news": news_pit_stats(store)},
             "target_schema_hash": ml_targets.TARGET_SCHEMA_HASH,
             "data_as_of": unique[-1], "train_end": train_end,

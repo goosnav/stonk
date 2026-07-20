@@ -154,6 +154,36 @@ def repair_symbol(store, symbol: str, fetcher=None, min_coverage: float = 0.9,
             "replaced": existing, "seams_remaining": len(remaining)}
 
 
+QUARANTINE_KEY = "bars_quarantine"
+
+
+def quarantine(store, symbols: list[str], reason: str = "unrepairable_seams") -> list[str]:
+    """Mark symbols whose history survives a clean refetch still seamed.
+
+    A repair that cannot repair is not a failure of the repair — it means the
+    PROVIDER serves a discontinuous series and no amount of refetching will
+    change that. Free sources handle ultra-thin names with repeated reverse
+    splits badly; back-adjustment compounds into absurd historical prices and
+    genuine microcap noise becomes indistinguishable from an artifact.
+
+    Excluding them is more honest than pretending they were fixed. Persisted so
+    the exclusion is durable and auditable rather than re-derived per run.
+    """
+    existing = set(store.kv_get(QUARANTINE_KEY, []) or [])
+    merged = sorted(existing | set(symbols))
+    store.kv_set(QUARANTINE_KEY, merged)
+    if set(symbols) - existing:
+        store.audit("bars_quarantined",
+                    {"added": sorted(set(symbols) - existing), "reason": reason,
+                     "total": len(merged)})
+    return merged
+
+
+def quarantined(store) -> set[str]:
+    """Symbols excluded from training panels for unrepairable price history."""
+    return set(store.kv_get(QUARANTINE_KEY, []) or [])
+
+
 def audit(store, symbols=None, repair: bool = False, fetcher=None,
           limit: int | None = None) -> dict:
     """Report seams; repair only when explicitly asked.
@@ -169,8 +199,13 @@ def audit(store, symbols=None, repair: bool = False, fetcher=None,
     if repair:
         for symbol in affected[:limit] if limit else affected:
             repaired.append(repair_symbol(store, symbol, fetcher=fetcher))
+    still_seamed = [r["symbol"] for r in repaired if r.get("seams_remaining")]
+    if still_seamed:
+        # The refetch produced the same discontinuity, so the provider's own
+        # series is broken. Quarantine rather than retry forever.
+        quarantine(store, still_seamed)
     return {"seams": len(seams), "suspicious": len(suspicious),
             "symbols_affected": affected, "symbols_scanned": len(_symbols(store, symbols)),
             "findings": findings, "repaired": repaired,
-            "still_seamed": [r["symbol"] for r in repaired
-                             if r.get("seams_remaining")]}
+            "still_seamed": still_seamed,
+            "quarantined": sorted(quarantined(store))}

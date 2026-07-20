@@ -308,3 +308,54 @@ def test_batch_rate_limits_between_issuers(cfg, store, monkeypatch):
     universe.ingest_filing_facts_batch(store, 5, cfg=cfg, client=Client())
     assert len(slept) == 5
     assert all(s >= 1.0 / universe.SEC_MAX_REQUESTS_PER_SECOND for s in slept)
+
+
+# ── quarantine: a repair that cannot repair means the provider is broken ─────
+
+def test_symbols_still_seamed_after_refetch_are_quarantined(cfg, store):
+    """All 101 live symbols came back seamed after a clean refetch.
+
+    That is not a broken repair — it is a broken provider. Free sources handle
+    ultra-thin names with repeated reverse splits badly, and excluding them is
+    more honest than pretending a refetch fixed anything.
+    """
+    store.upsert_bars("BROKEN", _seamed(factor=10.0, at=120), "test")
+    still_broken = _seamed(factor=10.0, at=120)      # provider serves it again
+    report = bars_audit.audit(store, symbols=["BROKEN"], repair=True,
+                              fetcher=lambda sym: still_broken)
+    assert report["still_seamed"] == ["BROKEN"]
+    assert "BROKEN" in report["quarantined"]
+    assert bars_audit.quarantined(store) == {"BROKEN"}
+    assert store.db.execute("SELECT 1 FROM audit WHERE "
+                            "event_type='bars_quarantined'").fetchone()
+
+
+def test_quarantine_is_durable_and_additive(cfg, store):
+    bars_audit.quarantine(store, ["AAA"])
+    bars_audit.quarantine(store, ["BBB"])
+    assert bars_audit.quarantined(store) == {"AAA", "BBB"}
+    bars_audit.quarantine(store, ["AAA"])            # idempotent
+    assert bars_audit.quarantined(store) == {"AAA", "BBB"}
+
+
+def test_a_successful_repair_does_not_quarantine(cfg, store):
+    store.upsert_bars("FIXABLE", _seamed(), "test")
+    clean = synth_bars(n_days=200, wiggle=0.004)
+    report = bars_audit.audit(store, symbols=["FIXABLE"], repair=True,
+                              fetcher=lambda sym: clean)
+    assert report["still_seamed"] == []
+    assert bars_audit.quarantined(store) == set()
+
+
+def test_build_dataset_excludes_quarantined_symbols(cfg, store):
+    from specforge import neural
+    for sym in ("AAA", "BBB", "CCC", "SPY"):
+        store.upsert_bars(sym, synth_bars(n_days=700, daily_drift=.001), "test")
+    store.upsert_bars("^VIX", [{**r, "open": 15, "high": 16, "low": 14, "close": 15}
+                               for r in synth_bars(n_days=700)], "test")
+    bars_audit.quarantine(store, ["BBB"])
+    cfg.data["neural"]["input_sessions"] = 40
+    ds = neural.build_dataset(cfg, store, symbols=["AAA", "BBB", "CCC"])
+    assert "error" not in ds
+    assert "BBB" not in set(ds["owners"])
+    assert ds["pit"]["quarantined_symbols"] == 1
