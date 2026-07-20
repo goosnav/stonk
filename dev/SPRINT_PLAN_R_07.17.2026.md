@@ -527,3 +527,60 @@ family (0.626 vs 0.597). The "signal is sparse" reading was an artifact of the
 microcap-heavy sample. The change is not harmful - it adds grid points without
 removing any - but the evidence I cited for it does not survive the better
 panel, and the grid should be re-justified rather than assumed.
+
+## 2026-07-20 - MEASUREMENT ON CLEAN, REPRESENTATIVE DATA
+
+Panel: 200 symbols, 18% "A", zero seams, 203,200 windows over 3,441 sessions,
+sealed test from 2024-05-23 (31,036 windows). Cost median 0.00221 (down from
+0.00357 - the panel is genuinely more liquid now).
+
+Net OOS policy utility. [brackets] = the A-heavy panel:
+
+| candidate                 | absolute          | excess            |
+|---------------------------|-------------------|-------------------|
+| zero                      | 0.352  [0.144]    | 0.241  [-0.013]   |
+| momentum                  | 0.380  [0.266]    | 0.195  [0.063]    |
+| ridge                     | 0.702  [0.683]    | **0.626** [0.452] |
+| elastic_net               | **0.727** [0.805] | 0.597  [0.583]    |
+| boosted_tree              | 0.459  [0.492]    | 0.542  [0.279]    |
+| **TCN, median of 3 seeds**| **0.497** [0.172] | **0.156** [0.042] |
+
+**BAKEOFF VERDICT: False.** The TCN still loses - 0.497 vs 0.727 absolute,
+0.156 vs 0.626 excess - and its seed spread GREW to 0.538 (absolute) from
+0.276. Training to convergence made it better on average and LESS stable.
+
+R8 governance (178 registry trials + 8 candidates, 98 cohorts):
+
+| family   | best candidate  | Sharpe | bar   | deflated | PBO       |
+|----------|-----------------|--------|-------|----------|-----------|
+| absolute | **tcn_seed_2**  | 0.299  | 0.284 | 0.559    | 0.318     |
+| excess   | elastic_net     | 0.163  | 0.280 | 0.120    | **0.917** |
+
+Two things changed qualitatively:
+- In the ABSOLUTE family the best candidate's observed Sharpe (0.299) exceeds
+  the expected-maximum-under-null bar (0.284) for the FIRST time, and a TCN
+  seed is that candidate. Deflated Sharpe rose 0.442 -> 0.559. Still far from
+  0.95, but the sign of (observed - bar) flipped.
+- In the EXCESS family PBO is **0.917**: the in-sample winner lands below the
+  OOS median in 92% of splits. Selecting on excess-family backtests is not
+  merely uninformative, it is actively misleading. Nothing should be chosen on
+  excess evidence.
+
+### The confound, stated plainly
+The panel AND the model changed between these two runs. The TCN's absolute
+utility went 0.172 -> 0.497, but I cannot attribute that to the convergence
+fix, the ensemble, the linear skip, the regularization, or simply to better
+data - all five moved at once. Claiming the model improvements caused it would
+be exactly the kind of unearned inference this whole sprint series exists to
+prevent. Isolating them needs one-factor-at-a-time runs on a FIXED panel.
+
+Reporting gap to fix: the measurement script prints `tcn_median_utility`, but
+the gate now reads `decisive_utility` (the ensemble). The ensemble's own number
+was not captured in this run.
+
+### Standing conclusion
+Still no champion; learned influence stays hard-zero. But the reason has moved
+again - from "measured on fabricated returns", to "measured on clean but
+unrepresentative data", to **"measured properly and the TCN loses to ridge and
+elastic-net on both families"**. That is the first version of this statement
+that rests on a defensible sample.
