@@ -242,11 +242,14 @@ neural:
   max_epochs: 50
   patience: 5
   max_trials_per_snapshot: 6
-  max_windows_per_symbol: 500
-  # Process-safety ceiling also enforced in code. 12k multivariate windows are
-  # sampled evenly across symbols/history; larger research uses more snapshots,
-  # not a multi-gigabyte in-memory tensor inside the operator service.
-  max_training_windows: 12000
+  max_windows_per_symbol: 2000
+  # R6c: the panel ceiling is a MEMORY budget, re-derived from the actual
+  # window and feature count (see neural._training_window_limit), not a
+  # hand-set window count that rots when either changes. The training path no
+  # longer copies the panel to de-normalize it, so the budget is what binds.
+  # SAFE_PANEL_MEMORY_GB in code is the hard ceiling; this may only lower it.
+  # Leave max_training_windows unset so the budget decides.
+  panel_memory_gb: 2.0
   min_fundamental_coverage: 0.80
   walk_forward_folds: 5
   holding_min_bars: 1250

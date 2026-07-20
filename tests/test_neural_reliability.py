@@ -20,15 +20,20 @@ def _history(store, symbols=("AAA", "SPY")):
 def test_dataset_enforces_process_safety_cap_despite_large_config(
         cfg, store, monkeypatch):
     _history(store)
-    monkeypatch.setattr(neural, "SAFE_MAX_TRAINING_WINDOWS", 240)
-    cfg.data["neural"].update({"input_sessions": 40, "horizons": [5, 21],
+    # R6c: the ceiling is a memory budget now, so pin the budget rather than a
+    # window count. Config asking for 250k windows still cannot exceed it.
+    window, cap = 40, 240
+    budget_gb = cap * window * len(neural.FEATURES) * 4 / 1024 ** 3
+    monkeypatch.setattr(neural, "SAFE_PANEL_MEMORY_GB", budget_gb)
+    cfg.data["neural"].update({"input_sessions": window, "horizons": [5, 21],
+                                "panel_memory_gb": 1000.0,
                                 "max_training_windows": 250_000,
                                 "max_windows_per_symbol": 250_000})
 
     dataset = neural.build_dataset(cfg, store, symbols=["AAA"])
 
     assert "error" not in dataset
-    assert len(dataset["X"]) <= 240
+    assert len(dataset["X"]) <= cap
     assert dataset["X"].dtype == np.float32
 
 

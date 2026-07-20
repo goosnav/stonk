@@ -135,19 +135,23 @@ def context_design(ds) -> np.ndarray:
     purpose: that IS the control. If a linear model on the last session matches
     the TCN, the sequence model bought nothing.
     """
-    raw = ds["X"] * ds["std"] + ds["mean"]
-    return raw[:, -1, :].astype(np.float64)
+    from .. import neural
+    return neural.context_rows(ds)
 
 
-def simple_predictions(ds, family: str = "absolute",
-                       models=MODELS) -> dict[str, np.ndarray]:
-    """{model: (n_windows, n_horizons) median prediction} for every simple model."""
+def simple_predictions(ds, family: str = "absolute", models=MODELS,
+                       context=None) -> dict[str, np.ndarray]:
+    """{model: (n_windows, n_horizons) median prediction} for every simple model.
+
+    `context` overrides the derived (n, n_features) context matrix — that is
+    how ablation knocks a feature family out without copying the panel.
+    """
     from .. import neural
     y = ds["Y_absolute"] if family == "absolute" else ds["Y_excess"]
     y = np.asarray(y, dtype=np.float64)
     horizons = list(ds["horizons"])
     train = ds["masks"]["train"]
-    x = context_design(ds)
+    x = context_design(ds) if context is None else np.asarray(context, dtype=np.float64)
     mean, std = x[train].mean(0), x[train].std(0) + 1e-6
     xn = (x - mean) / std
     out: dict[str, np.ndarray] = {}
@@ -232,21 +236,27 @@ def ablate(ds, eval_idx, family: str = "absolute", model: str = "ridge",
     """
     from .. import neural
     families = families or FEATURE_FAMILIES
-    full = policy_return(simple_predictions(ds, family, (model,))[model],
+    context = context_design(ds)
+    train_mean = context[ds["masks"]["train"]].mean(0)
+    full = policy_return(simple_predictions(ds, family, (model,), context)[model],
                          ds, eval_idx, family)
     out = {"_full": {"policy_utility": full["policy_utility"],
                      "evidence": full["evidence"]}}
-    original = ds["X"]
     for name, members in families.items():
         columns = [neural.FEATURES.index(f) for f in members
                    if f in neural.FEATURES]
         if not columns:
             continue
-        knocked = np.array(original, copy=True)
-        knocked[:, :, columns] = 0.0            # normalized space → 0 is the mean
-        trimmed = dict(ds, X=knocked)
-        scored = policy_return(simple_predictions(trimmed, family, (model,))[model],
-                               trimmed, eval_idx, family)
+        # Knock the family out on the (n, n_features) context matrix, not on the
+        # full panel — copying the panel once per family was the largest
+        # allocation in the diagnostic. Ablated columns are pinned to the TRAIN
+        # mean, which is what "this feature tells us nothing" actually means;
+        # zero would inject a fictitious value in de-normalized units.
+        knocked = np.array(context, copy=True)
+        knocked[:, columns] = train_mean[columns]
+        scored = policy_return(
+            simple_predictions(ds, family, (model,), knocked)[model],
+            ds, eval_idx, family)
         out[name] = {
             "policy_utility": scored["policy_utility"],
             "evidence": scored["evidence"],

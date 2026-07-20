@@ -2419,3 +2419,74 @@ def test_feature_family_ablation_detects_the_carrying_family():
         v["delta"] for k, v in result.items()
         if isinstance(v, dict) and "delta" in v)
     assert abs(result["news"]["delta"]) < abs(result["price"]["delta"])
+
+
+# ── R6c: the panel stops copying itself ──────────────────────────────────────
+
+def test_normalized_panel_matches_eager_renormalization():
+    """The lazy fold view must be numerically identical to the copy it replaced."""
+    rng = np.random.default_rng(0)
+    raw = rng.normal(loc=3.0, scale=2.0, size=(200, 8, 5)).astype(np.float32)
+    base_mean = raw.mean((0, 1), keepdims=True)
+    base_std = raw.std((0, 1), keepdims=True) + 1e-6
+    stored = ((raw - base_mean) / base_std).astype(np.float32)
+    train = np.zeros(200, dtype=bool); train[:120] = True
+
+    # What the old code did: de-normalize everything, then renormalize on fold.
+    eager_mean = raw[train].mean((0, 1), keepdims=True)
+    eager_std = raw[train].std((0, 1), keepdims=True) + 1e-6
+    eager = (raw - eager_mean) / eager_std
+
+    # What the new code does: fold statistics derived from the stored panel.
+    rows = stored[train]
+    mean = rows.mean((0, 1), keepdims=True) * base_std + base_mean
+    std = rows.std((0, 1), keepdims=True) * base_std + 1e-6
+    panel = neural.NormalizedPanel(stored, base_mean, base_std, mean, std)
+    idx = np.array([0, 7, 55, 199])
+    assert np.allclose(panel[idx].numpy(), eager[idx], atol=1e-4)
+    assert len(panel) == 200 and panel.shape == stored.shape
+
+
+def test_context_rows_avoids_denormalizing_the_whole_panel():
+    rng = np.random.default_rng(1)
+    ds = {"X": rng.normal(size=(50, 6, 4)).astype(np.float32),
+          "std": np.full((1, 1, 4), 2.0), "mean": np.full((1, 1, 4), 1.0)}
+    expected = (ds["X"] * ds["std"] + ds["mean"])[:, -1, :]
+    assert np.allclose(neural.context_rows(ds), expected)
+    assert neural.context_rows(ds).shape == (50, 4)
+    subset = neural.context_rows(ds, np.array([3, 9]))
+    assert np.allclose(subset, expected[[3, 9]])
+
+
+def test_training_window_limit_scales_with_window_size(cfg):
+    """The cap is a memory budget, not a magic constant that rots as features grow."""
+    cfg.data["neural"]["input_sessions"] = 60
+    cfg.data["neural"]["max_training_windows"] = 10_000_000
+    cfg.data["neural"]["panel_memory_gb"] = 2.0
+    wide = neural._training_window_limit(cfg)
+    cfg.data["neural"]["input_sessions"] = 240          # 4x the window, 4x the bytes
+    narrow = neural._training_window_limit(cfg)
+    assert narrow == pytest.approx(wide / 4, rel=.05)
+    # A bigger budget buys proportionally more windows...
+    cfg.data["neural"]["input_sessions"] = 60
+    cfg.data["neural"]["panel_memory_gb"] = 4.0
+    assert neural._training_window_limit(cfg) == pytest.approx(2 * wide, rel=.05)
+    # ...and an explicit configured request still caps it downward.
+    cfg.data["neural"]["max_training_windows"] = 500
+    assert neural._training_window_limit(cfg) == 500
+    # The R5 panel must clear the old hard-coded 12k ceiling.
+    cfg.data["neural"]["max_training_windows"] = 10_000_000
+    assert neural._training_window_limit(cfg) > 12_000
+
+
+def test_shipped_config_does_not_pin_the_panel_below_the_budget():
+    """Regression: the memory budget is pointless if the yaml re-pins a count.
+
+    Removing the hard-coded 12k ceiling in code changed nothing until the
+    configured max_training_windows was removed too — it capped the result
+    downward and the win was invisible.
+    """
+    from specforge.config import load_config
+    cfg = load_config("paper")
+    assert cfg.get("neural", "max_training_windows", default=None) is None
+    assert neural._training_window_limit(cfg) > 100_000

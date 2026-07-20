@@ -88,12 +88,16 @@ TRIAL_SPECS = (
     {"lr": 7e-4, "weight_decay": 5e-4, "rank_weight": .08},
 )
 
-# A 60 x 44 float32 window is roughly 10 KiB before targets, masks, and
-# framework tensors.  Accepting the historical 250k-window setting can
-# therefore consume several GiB while the live service is still resident.
-# This is a process-safety ceiling, not a tuning knob: configuration may lower
-# it, but cannot raise it without a reviewed code change.
-SAFE_MAX_TRAINING_WINDOWS = 12_000
+# The panel is the largest array in the process, so its size is a memory
+# budget rather than a window count. The old fixed 12,000 ceiling was derived
+# by hand from a 60 x 44 float32 window (~10 KiB) AND from the fact that the
+# training path used to materialize the panel three more times over. With
+# those copies removed (context_rows, NormalizedPanel) the budget is what
+# actually binds, and it re-derives itself when the window or feature count
+# changes instead of silently rotting. R5 added delisted names to the panel,
+# so a stale hand-set ceiling truncates it.
+DEFAULT_PANEL_MEMORY_GB = 2.0
+SAFE_PANEL_MEMORY_GB = 8.0          # process-safety ceiling; config may lower only
 
 
 def _now() -> str:
@@ -398,8 +402,19 @@ def _features(b: pd.DataFrame, spy: pd.DataFrame, vix: pd.DataFrame,
 
 
 def _training_window_limit(cfg) -> int:
-    requested = int(cfg.get("neural", "max_training_windows", default=12_000))
-    return max(100, min(requested, SAFE_MAX_TRAINING_WINDOWS))
+    """How many windows fit the configured panel memory budget.
+
+    Config may lower the budget but never raise it past SAFE_PANEL_MEMORY_GB,
+    and an explicit max_training_windows still caps the result downward.
+    """
+    budget_gb = min(float(cfg.get("neural", "panel_memory_gb",
+                                  default=DEFAULT_PANEL_MEMORY_GB)),
+                    SAFE_PANEL_MEMORY_GB)
+    window = int(cfg.get("neural", "input_sessions", default=60))
+    bytes_per_window = max(1, window * len(FEATURES) * 4)     # float32
+    affordable = int(budget_gb * 1024 ** 3 / bytes_per_window)
+    requested = int(cfg.get("neural", "max_training_windows", default=affordable))
+    return max(100, min(requested, affordable))
 
 
 def _dataset_should_yield(deadline: float | None, cancelled) -> bool:
@@ -711,6 +726,46 @@ def _training_device(cfg, torch) -> str:
     return "cpu"
 
 
+def context_rows(ds, indices=None) -> np.ndarray:
+    """The LAST session of each window, de-normalized, as (n, n_features).
+
+    Simple models, baselines and ablations only ever look at this row. Writing
+    `ds["X"] * ds["std"] + ds["mean"]` to get it de-normalizes the entire
+    60-session panel — a full second copy of the largest array in the process —
+    and then throws 59/60 of it away. Slice first, scale after.
+    """
+    panel = ds["X"] if indices is None else ds["X"][indices]
+    return (np.asarray(panel[:, -1, :], dtype=np.float64)
+            * np.asarray(ds["std"]).reshape(1, -1)[:, :panel.shape[-1]]
+            + np.asarray(ds["mean"]).reshape(1, -1)[:, :panel.shape[-1]])
+
+
+class NormalizedPanel:
+    """Fold-local re-normalization applied lazily, one batch at a time.
+
+    A walk-forward fold re-centres the panel on its own training window. Doing
+    that eagerly costs two more full-panel copies per fold on top of the panel
+    itself, which is what forced the training-window cap down to a level that
+    now truncates the R5 panel. Only the rows a batch actually asks for are
+    ever materialized.
+    """
+
+    def __init__(self, base, base_mean, base_std, mean, std):
+        self.base, self.base_mean, self.base_std = base, base_mean, base_std
+        self.mean, self.std = mean, std
+        self.shape = base.shape
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, index):
+        import torch
+        if hasattr(index, "numpy"):
+            index = index.numpy()
+        raw = np.asarray(self.base[index], dtype=np.float32) * self.base_std + self.base_mean
+        return torch.from_numpy(((raw - self.mean) / self.std).astype(np.float32))
+
+
 def _predict_batches(model, X, indices, scale, device: str, batch_size: int = 2048):
     import torch
     predictions, probabilities = [], []
@@ -861,7 +916,7 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
     y = ds["Y"][eval_idx]
     horizons = ds["horizons"]
     dates = ds["dates"][eval_idx]
-    raw = ds["X"] * ds["std"] + ds["mean"]
+    raw_last = context_rows(ds)
     train = ds["masks"]["train"]
 
     def bands(median, residual_source):
@@ -875,14 +930,14 @@ def _baseline_metrics(ds: dict, eval_idx: np.ndarray) -> dict:
 
     zero_median = np.zeros_like(y)
     zero = bands(zero_median, ds["Y"][train])
-    last_r1 = raw[:, -1, FEATURES.index("r1")]
+    last_r1 = raw_last[:, FEATURES.index("r1")]
     momentum_all = np.column_stack(
         [last_r1 * math.sqrt(max(1, h)) for h in horizons]).astype(np.float32)
     momentum = bands(momentum_all[eval_idx], ds["Y"][train] - momentum_all[train])
 
     # Closed-form ridge on the latest context row. It is deliberately simple
     # and deterministic; a TCN that cannot beat it has not earned complexity.
-    x = raw[:, -1, :].astype(np.float64)
+    x = raw_last
     mean, std = x[train].mean(0), x[train].std(0) + 1e-6
     xn = (x - mean) / std
     design = np.column_stack((np.ones(train.sum()), xn[train]))
@@ -994,7 +1049,6 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
     folds = int(cfg.get("neural", "walk_forward_folds", default=5))
     embargo = max(ds["horizons"])
     windows = _fold_windows(len(unique), folds, embargo)
-    raw = ds["X"] * ds["std"] + ds["mean"]
     results, oos = [], []
     started = time.time()
     for fold, (train_pos, test_start_pos, test_end_pos) in enumerate(windows):
@@ -1002,9 +1056,16 @@ def _walk_forward_metrics(cfg, ds: dict, trial_spec: dict | None = None,
         # Half-open test range [test_start_pos, test_end_pos): adjacent folds
         # share no session and the last fold never reaches the sealed block.
         test_mask = (dates >= unique[test_start_pos]) & (dates < unique[test_end_pos])
-        mean = raw[train_mask].mean((0, 1), keepdims=True)
-        std = raw[train_mask].std((0, 1), keepdims=True) + 1e-6
-        X = torch.from_numpy(((raw - mean) / std).astype(np.float32))
+        # Fold statistics from the TRAIN rows only, computed on the stored
+        # (already globally normalized) panel and shifted back — algebraically
+        # identical to de-normalizing the whole panel first, without the copy.
+        base_mean = np.asarray(ds["mean"], dtype=np.float32)
+        base_std = np.asarray(ds["std"], dtype=np.float32)
+        train_rows = np.asarray(ds["X"][train_mask], dtype=np.float32)
+        mean = (train_rows.mean((0, 1), keepdims=True) * base_std + base_mean)
+        std = train_rows.std((0, 1), keepdims=True) * base_std + 1e-6
+        del train_rows
+        X = NormalizedPanel(ds["X"], base_mean, base_std, mean, std)
         scale_np = np.maximum(ds["Y"][train_mask].std(axis=0), .005).astype(np.float32)
         scale = torch.from_numpy(scale_np)
         Yraw = torch.from_numpy(ds["Y"])
@@ -1365,11 +1426,12 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         try:
             baseline_model = _make_model(len(parent["features"]), len(parent["horizons"]))
             baseline_model.load_state_dict(parent["model"]); baseline_model.eval()
-            raw = ds["X"] * ds["std"] + ds["mean"]
-            bx = (raw - parent["mean"]) / parent["std"]
+            raw_eval = (np.asarray(ds["X"][eval_idx], dtype=np.float32)
+                        * ds["std"] + ds["mean"])
+            bx = (raw_eval - parent["mean"]) / parent["std"]
             with torch.no_grad():
                 baseline_pred, baseline_probability = baseline_model.forward_all(
-                    torch.from_numpy(bx[eval_idx].astype(np.float32)))
+                    torch.from_numpy(bx.astype(np.float32)))
                 baseline_pred = baseline_pred.numpy() * \
                     np.asarray(parent["target_scale"]).reshape(1, -1, 1)
                 baseline_probability = baseline_probability.numpy()
