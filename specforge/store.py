@@ -156,6 +156,10 @@ CREATE TABLE IF NOT EXISTS graph_versions(          -- immutable champion/challe
   id TEXT PRIMARY KEY, created_at TEXT, data_as_of TEXT, status TEXT,
   parent_id TEXT, topology TEXT, metrics TEXT, checkpoint TEXT
 );
+CREATE TABLE IF NOT EXISTS holdout_uses(            -- sealed-block consumption (R8)
+  id TEXT PRIMARY KEY, holdout_key TEXT NOT NULL, model_id TEXT,
+  purpose TEXT NOT NULL, detail TEXT, at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS model_transitions(       -- lifecycle audit (Sprint D)
   id TEXT PRIMARY KEY, model_id TEXT NOT NULL, model_table TEXT NOT NULL,
   prior_state TEXT, new_state TEXT NOT NULL, reason TEXT NOT NULL,
@@ -612,6 +616,34 @@ class Store:
     # Deposits/withdrawals are NOT trading P&L: loss switches compare equity
     # net of these, so a deposit can't mask a real loss and a withdrawal
     # can't fake one.
+    def record_holdout_use(self, holdout_key: str, purpose: str,
+                           model_id: str | None = None, detail: str = "") -> int:
+        """Record one look at a sealed evaluation block; return the new count.
+
+        A holdout is only a holdout while it is untouched. Every time it is
+        examined it leaks a little into the next decision, and the leak is
+        invisible unless somebody counts. This is that counter — append-only,
+        never reset, so an eroded holdout cannot silently present itself as
+        fresh.
+        """
+        import uuid
+        with self.db:
+            self.db.execute(
+                "INSERT INTO holdout_uses(id,holdout_key,model_id,purpose,detail,at) "
+                "VALUES(?,?,?,?,?,?)",
+                (uuid.uuid4().hex[:12], holdout_key, model_id, purpose,
+                 detail, _now()))
+        count = self.holdout_uses(holdout_key)
+        self.audit("holdout_examined", {"holdout_key": holdout_key,
+                                        "purpose": purpose, "model_id": model_id,
+                                        "uses": count})
+        return count
+
+    def holdout_uses(self, holdout_key: str) -> int:
+        return int(self.db.execute(
+            "SELECT COUNT(*) n FROM holdout_uses WHERE holdout_key=?",
+            (holdout_key,)).fetchone()["n"])
+
     def record_external_flow(self, amount: float, d: str | None = None,
                              note: str = "") -> None:
         flows = self.kv_get("external_flows", []) or []

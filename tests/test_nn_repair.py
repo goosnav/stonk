@@ -2682,3 +2682,109 @@ def test_regime_features_are_market_level_only():
     assert set(regime_hmm.FEATURES) == {
         "bench_return", "bench_vol", "vix_level", "vix_slope",
         "breadth", "credit", "dispersion"}
+
+
+# ── R8: experiment governance — what is this number actually worth? ──────────
+
+def test_expected_max_sharpe_grows_with_the_number_of_trials():
+    from specforge.ml import governance as gov
+    variance = 0.01
+    bars = [gov.expected_max_sharpe(n, variance) for n in (1, 10, 100, 1000)]
+    assert bars[0] == 0.0                      # one trial: nothing to deflate
+    assert bars[1] < bars[2] < bars[3]          # search harder, clear a higher bar
+
+
+def test_deflated_sharpe_punishes_a_lucky_winner_from_many_trials():
+    """The core R8 claim: the same track record means less if you searched more."""
+    from specforge.ml import governance as gov
+    rng = np.random.default_rng(0)
+    # A genuinely good series: consistent positive drift.
+    good = rng.normal(0.0015, 0.008, 1200)
+    honest = gov.deflated_sharpe(good, n_trials=1)
+    searched = gov.deflated_sharpe(good, n_trials=5000)
+    assert honest["observed_sharpe"] == searched["observed_sharpe"]   # same returns
+    assert searched["deflated_sharpe"] < honest["deflated_sharpe"]    # less credible
+    assert searched["expected_max_sharpe_under_null"] > \
+        honest["expected_max_sharpe_under_null"]
+    # Pure noise should not clear the bar even when only one trial is claimed.
+    noise = rng.normal(0.0, 0.01, 1200)
+    assert gov.deflated_sharpe(noise, n_trials=1)["deflated_sharpe"] < .95
+    # Too little data fails closed rather than reporting a confident number.
+    assert gov.deflated_sharpe([0.01, 0.02], n_trials=1)["evidence"] == "insufficient"
+
+
+def test_pbo_detects_selection_that_carries_no_information():
+    from specforge.ml import governance as gov
+    rng = np.random.default_rng(1)
+    # 40 strategies of pure noise: the in-sample winner is a coin flip OOS.
+    noise = rng.normal(0, .01, size=(600, 40))
+    overfit = gov.probability_of_backtest_overfitting(noise)
+    assert overfit["evidence"] == "ok"
+    assert overfit["pbo"] > .35            # near-chance selection
+
+    # One strategy with real, persistent edge: selection is informative.
+    real = rng.normal(0, .01, size=(600, 40))
+    real[:, 7] += .004
+    genuine = gov.probability_of_backtest_overfitting(real)
+    assert genuine["pbo"] < overfit["pbo"]
+    assert genuine["pbo"] < .1
+    # A single column cannot be "selected" at all — fail closed.
+    assert gov.probability_of_backtest_overfitting(
+        noise[:, :1])["evidence"] == "insufficient"
+
+
+def test_block_bootstrap_is_wider_than_iid_on_autocorrelated_returns():
+    from specforge.ml import governance as gov
+    rng = np.random.default_rng(2)
+    shocks = rng.normal(0, .01, 1500)
+    series = np.zeros(1500)
+    for i in range(1, 1500):                      # strong positive autocorrelation
+        series[i] = .85 * series[i - 1] + shocks[i]
+    wide = gov.block_bootstrap_ci(series, block_size=42, samples=400)
+    narrow = gov.block_bootstrap_ci(series, block_size=1, samples=400)
+    width = lambda d: d["mean_ci"][1] - d["mean_ci"][0]
+    # Ignoring serial correlation manufactures precision that is not there.
+    assert width(wide) > width(narrow)
+    assert gov.block_bootstrap_ci([0.1] * 5)["evidence"] == "insufficient"
+
+
+def test_trial_adjusted_summary_fails_closed_on_every_missing_dimension():
+    from specforge.ml import governance as gov
+    rng = np.random.default_rng(3)
+    good = rng.normal(0.0015, 0.008, 1200)
+    matrix = rng.normal(0, .01, size=(600, 20)); matrix[:, 3] += .004
+    # Without a performance matrix, PBO is uncomputed — which is not a pass.
+    assert gov.trial_adjusted_summary(good, n_trials=1)["verdict"] is False
+    passing = gov.trial_adjusted_summary(good, n_trials=1, performance=matrix)
+    assert passing["verdict"] is True
+    # A MARGINAL edge is where search cost decides. The same returns pass when
+    # found on the first try and fail once the search is honestly declared —
+    # a genuinely strong edge (like `good`) rightly survives either way.
+    marginal = rng.normal(0.0006, 0.008, 1200)
+    assert gov.trial_adjusted_summary(
+        marginal, n_trials=1, performance=matrix)["verdict"] is True
+    assert gov.trial_adjusted_summary(
+        marginal, n_trials=100_000, performance=matrix)["verdict"] is False
+    # Noise never passes.
+    assert gov.trial_adjusted_summary(
+        rng.normal(0, .01, 1200), n_trials=1, performance=matrix)["verdict"] is False
+
+
+def test_sealed_holdout_consumption_is_counted_and_never_reset(cfg, store):
+    """A holdout examined ten times is not a holdout; the count makes that visible."""
+    key = "sealed_2026-07_schema6"
+    assert store.holdout_uses(key) == 0
+    assert store.record_holdout_use(key, "tournament_eval", model_id="m1") == 1
+    assert store.record_holdout_use(key, "tournament_eval", model_id="m2") == 2
+    assert store.record_holdout_use(key, "promotion_check", model_id="m1") == 3
+    assert store.holdout_uses(key) == 3
+    assert store.holdout_uses("a_different_block") == 0     # keys are independent
+    # Append-only: every look is individually recoverable and auditable.
+    rows = store.db.execute(
+        "SELECT purpose, model_id FROM holdout_uses WHERE holdout_key=? "
+        "ORDER BY at, id", (key,)).fetchall()
+    assert len(rows) == 3
+    assert {r["purpose"] for r in rows} == {"tournament_eval", "promotion_check"}
+    assert store.db.execute(
+        "SELECT COUNT(*) n FROM audit WHERE event_type='holdout_examined'"
+    ).fetchone()["n"] == 3
