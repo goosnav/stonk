@@ -409,3 +409,40 @@ def test_unreliable_flags_by_density_not_by_any_single_jump(cfg, store):
     flagged = bars_audit.unreliable(store, ["VOLATILE", "JUNK"])
     assert "JUNK" in flagged and "VOLATILE" not in flagged
     assert flagged["JUNK"]["per_year"] > bars_audit.LARGE_MOVES_PER_YEAR
+
+
+def test_unranked_tail_is_unbiased_not_alphabetical(cfg, store):
+    """Liquidity rank comes FROM stored bars, so unfetched symbols can never
+    be ranked — the backfill cannot use the ordering it is meant to produce.
+
+    Alphabetical was the old tiebreak and it produced a systematically biased
+    store: 530 of 578 symbols with bars began with "A". A stable hash is still
+    arbitrary, but the sample it builds is representative.
+    """
+    from specforge import research
+    import string
+    with store.db:
+        for letter in string.ascii_uppercase:
+            for i in range(4):
+                store.db.execute(
+                    "INSERT INTO instruments(symbol,name,exchange,security_type,"
+                    "is_etf,is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"{letter}{i:03d}", "n", "NASDAQ", "common", 0, 0, 1,
+                     "2020-01-01", "2026-01-01", "test", None, "h"))
+    first_50 = research._missing_history(store, 50)
+    letters = {s[0] for s in first_50}
+    # An alphabetical walk would return only A and B here.
+    assert len(letters) > 12, sorted(letters)
+    # Stable across calls, so progress is monotonic rather than reshuffled.
+    assert research._missing_history(store, 50) == first_50
+
+
+def test_sec_user_agent_prefers_env_over_tracked_config(cfg, monkeypatch):
+    """A contact address is personal data and configs/ is tracked and pushed."""
+    from specforge import universe
+    cfg.data.setdefault("research", {})["sec_user_agent"] = "from-config"
+    monkeypatch.delenv(universe.SEC_USER_AGENT_ENV, raising=False)
+    assert universe.sec_user_agent(cfg) == "from-config"
+    monkeypatch.setenv(universe.SEC_USER_AGENT_ENV, "from-env me@example.com")
+    assert universe.sec_user_agent(cfg) == "from-env me@example.com"

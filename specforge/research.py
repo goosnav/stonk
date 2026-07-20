@@ -189,16 +189,30 @@ def _missing_history(store, limit: int, cfg=None) -> list[str]:
         mandatory = list(dict.fromkeys(
             list(cfg.get("universe", "symbols", default=[]))
             + [p["symbol"] for p in store.open_positions(mode=cfg.mode)]))
-    marks = ",".join("?" for _ in mandatory) or "NULL"
-    return [r["symbol"] for r in store.db.execute(
-        f"SELECT i.symbol,COUNT(b.d) n,MIN(u.rank) rank FROM instruments i "
+    rank_of = {sym: i for i, sym in enumerate(mandatory)}
+    rows = store.db.execute(
+        "SELECT i.symbol,COUNT(b.d) n,MIN(u.rank) rank FROM instruments i "
         "LEFT JOIN bars b ON b.symbol=i.symbol "
         "LEFT JOIN universe_membership u ON u.symbol=i.symbol AND u.tier='research' "
         "AND u.as_of=(SELECT MAX(as_of) FROM universe_membership WHERE tier='research') "
-        "WHERE i.active=1 GROUP BY i.symbol HAVING n<260 "
-        f"ORDER BY CASE WHEN i.symbol IN ({marks}) THEN 0 ELSE 1 END,"
-        " CASE WHEN MIN(u.rank) IS NULL THEN 1 ELSE 0 END, MIN(u.rank),"
-        " n DESC, i.symbol LIMIT ?", (*mandatory, limit))]
+        "WHERE i.active=1 GROUP BY i.symbol HAVING n<260").fetchall()
+
+    def key(row):
+        symbol = row["symbol"]
+        if symbol in rank_of:                    # configured universe / holdings
+            return (0, rank_of[symbol], symbol)
+        if row["rank"] is not None:              # research tier, dollar-volume order
+            return (1, int(row["rank"]), symbol)
+        # Unranked tail. Liquidity rank is computed FROM stored bars, so a
+        # symbol with no bars can never be ranked — the backfill cannot use the
+        # ordering it is supposed to produce. Alphabetical was the old tiebreak
+        # and it gave a systematically biased sample (530 of 578 symbols with
+        # bars began with "A"). A stable hash is still arbitrary, but it is
+        # UNBIASED: after N symbols the store holds a uniform random sample of
+        # the market rather than the first N letters of the alphabet.
+        return (2, hashlib.sha256(symbol.encode()).hexdigest(), symbol)
+
+    return [row["symbol"] for row in sorted(rows, key=key)[:limit]]
 
 
 def enqueue_job(store, kind: str, payload: dict | None = None,

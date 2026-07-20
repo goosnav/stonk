@@ -201,16 +201,25 @@ def status(store) -> dict:
 SEC_MAX_REQUESTS_PER_SECOND = 5.0     # SEC asks for <=10/s; stay well under
 
 
+SEC_USER_AGENT_ENV = "SPECFORGE_SEC_USER_AGENT"
+
+
 def sec_user_agent(cfg=None) -> str:
     """SEC requires a real contact in the User-Agent; refuse to pretend.
 
     The old constant was "Stonk Terminal research contact=local-user", which is
     not a contact. It survives single trickled requests but is exactly what gets
     a bulk backfill 403'd, so bulk callers must configure a real one.
+
+    The environment variable wins over config on purpose: a contact address is
+    personal data, and configs/ is tracked in git and pushed. Set
+    SPECFORGE_SEC_USER_AGENT rather than committing an email address.
     """
-    configured = (cfg.get("research", "sec_user_agent", default=None)
-                  if cfg is not None else None)
-    return configured or "Stonk Terminal research contact=local-user"
+    from os import environ
+    return (environ.get(SEC_USER_AGENT_ENV)
+            or (cfg.get("research", "sec_user_agent", default=None)
+                if cfg is not None else None)
+            or "Stonk Terminal research contact=local-user")
 
 
 def _fact_candidates(store) -> list:
