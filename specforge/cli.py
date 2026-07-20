@@ -104,6 +104,22 @@ def cmd_research(args, cfg, store):
                          indent=2, default=str))
 
 
+def cmd_sec_facts(args, cfg, store):
+    """Bulk-ingest SEC facts, rate limited, one candidate pass."""
+    from .universe import ingest_filing_facts_batch
+    result = ingest_filing_facts_batch(
+        store, args.limit, cfg=cfg, require_contact=not args.allow_default_agent,
+        progress=lambda i, total: print(f"  {i}/{total}", end="\r", flush=True))
+    if result["status"] == "refused":
+        print(f"refused: {result['reason']}")
+        return None
+    print(f"attempted {result['attempted']} of {result['candidates']} candidates, "
+          f"inserted {result['inserted']} facts")
+    for failure in result["failures"][:10]:
+        print(f"    FAILED {failure['symbol']}: {failure.get('error', '')}")
+    return None
+
+
 def cmd_bars_audit(args, cfg, store):
     """Report — and optionally repair — adjustment seams in the bars table.
 
@@ -675,6 +691,14 @@ def main(argv=None):
     sub.add_parser("bridge-dump")
     s = sub.add_parser("bridge-report")
     s.add_argument("--file", default="-", help="results JSON path, or - for stdin")
+
+    s = sub.add_parser("sec-facts",
+                       help="bulk-ingest point-in-time SEC facts")
+    s.add_argument("--limit", type=int, default=200,
+                   help="issuers to ingest this run")
+    s.add_argument("--allow-default-agent", action="store_true",
+                   help="proceed without a configured research.sec_user_agent "
+                        "(SEC policy wants a real contact; only for small runs)")
 
     s = sub.add_parser("bars-audit",
                        help="find split-adjustment seams in stored bars")

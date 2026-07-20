@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import re
+import time
 from datetime import date, datetime
 
 import httpx
@@ -197,35 +198,63 @@ def status(store) -> dict:
             "active_symbols": symbols(store, "active")}
 
 
-def ingest_next_filing_facts(store, client=httpx) -> dict:
-    """Fetch one issuer's point-in-time SEC facts per research task."""
-    candidates = store.db.execute(
+SEC_MAX_REQUESTS_PER_SECOND = 5.0     # SEC asks for <=10/s; stay well under
+
+
+def sec_user_agent(cfg=None) -> str:
+    """SEC requires a real contact in the User-Agent; refuse to pretend.
+
+    The old constant was "Stonk Terminal research contact=local-user", which is
+    not a contact. It survives single trickled requests but is exactly what gets
+    a bulk backfill 403'd, so bulk callers must configure a real one.
+    """
+    configured = (cfg.get("research", "sec_user_agent", default=None)
+                  if cfg is not None else None)
+    return configured or "Stonk Terminal research contact=local-user"
+
+
+def _fact_candidates(store) -> list:
+    """Issuers to consider, best first. Hoisted so a batch runs it ONCE.
+
+    This query plus the per-candidate marker lookup used to live inside the
+    per-issuer function, which re-ran both from index 0 on every call: a
+    1,500-issuer batch cost roughly 1.1M kv reads for 1,500 fetches.
+    """
+    return store.db.execute(
         "SELECT i.symbol,i.cik FROM instruments i LEFT JOIN universe_membership u "
         "ON u.symbol=i.symbol AND u.tier='research' AND u.as_of=(SELECT MAX(as_of) "
         "FROM universe_membership WHERE tier='research') WHERE i.active=1 AND "
         "i.cik IS NOT NULL "
-        "ORDER BY CASE WHEN u.rank IS NULL THEN 1 ELSE 0 END,u.rank,i.symbol LIMIT 2000").fetchall()
+        "ORDER BY CASE WHEN u.rank IS NULL THEN 1 ELSE 0 END,u.rank,i.symbol").fetchall()
+
+
+def _fact_due(store, symbol: str, today: str) -> bool:
+    """Facts change when issuers file. Refresh completed issuers weekly;
+    provider failures retry on a later day rather than poisoning forever."""
+    attempt = store.kv_get(f"filing_facts_attempted_{symbol}") or {}
+    attempted = attempt.get("attempted_on")
+    if attempt.get("status") == "completed" and attempted:
+        try:
+            return (datetime.fromisoformat(today).date() -
+                    datetime.fromisoformat(attempted).date()).days >= 7
+        except ValueError:
+            pass
+    return attempted != today
+
+
+def ingest_next_filing_facts(store, client=httpx, cfg=None, row=None) -> dict:
+    """Fetch one issuer's point-in-time SEC facts per research task."""
     today = datetime.now().astimezone().date().isoformat()
-    def due(candidate) -> bool:
-        attempt = store.kv_get(f"filing_facts_attempted_{candidate['symbol']}") or {}
-        # Facts change when issuers file. Refresh completed issuers weekly;
-        # provider failures retry on a later day rather than poisoning forever.
-        attempted = attempt.get("attempted_on")
-        if attempt.get("status") == "completed" and attempted:
-            try:
-                return (datetime.fromisoformat(today).date() -
-                        datetime.fromisoformat(attempted).date()).days >= 7
-            except ValueError:
-                pass
-        return attempted != today
-    row = next((r for r in candidates if due(r)), None)
+    if row is None:
+        row = next((r for r in _fact_candidates(store)
+                    if _fact_due(store, r["symbol"], today)), None)
     if not row:
         return {"status": "caught_up", "kind": "filing_facts"}
     cik = str(row["cik"]).zfill(10)
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     try:
         r = client.get(url, timeout=30,
-                       headers={"User-Agent": "Stonk Terminal research contact=local-user"})
+                       headers={"User-Agent": sec_user_agent(cfg)})
         r.raise_for_status(); facts = r.json().get("facts", {}).get("us-gaap", {})
     except Exception as exc:
         result = {"status": "failed", "symbol": row["symbol"],
@@ -254,15 +283,32 @@ def ingest_next_filing_facts(store, client=httpx) -> dict:
     return result
 
 
-def ingest_filing_facts_batch(store, limit: int = 10, progress=None) -> dict:
-    results = []
-    for index in range(limit):
-        if progress:
-            progress(index, limit)
-        result = ingest_next_filing_facts(store)
-        if result.get("status") == "caught_up":
+def ingest_filing_facts_batch(store, limit: int = 10, progress=None, cfg=None,
+                              client=httpx, require_contact: bool = False) -> dict:
+    """Ingest up to `limit` issuers, walking ONE candidate list.
+
+    `require_contact` is for bulk runs: thousands of requests under a
+    placeholder User-Agent is how an IP gets blocked, so a bulk caller must
+    configure a real contact rather than inherit the default.
+    """
+    agent = sec_user_agent(cfg)
+    if require_contact and "local-user" in agent:
+        return {"status": "refused", "kind": "filing_facts",
+                "reason": "set research.sec_user_agent to a real contact "
+                          "(SEC policy) before a bulk ingest"}
+    today = datetime.now().astimezone().date().isoformat()
+    candidates = _fact_candidates(store)
+    results, delay = [], 1.0 / SEC_MAX_REQUESTS_PER_SECOND
+    for row in candidates:
+        if len(results) >= limit:
             break
-        results.append(result)
+        if not _fact_due(store, row["symbol"], today):
+            continue
+        if progress:
+            progress(len(results), limit)
+        results.append(ingest_next_filing_facts(store, client=client, cfg=cfg, row=row))
+        time.sleep(delay)             # politeness: SEC asks for <=10 req/s
     return {"status": "completed", "attempted": len(results),
+            "candidates": len(candidates),
             "inserted": sum(r.get("inserted", 0) for r in results),
             "failures": [r for r in results if r.get("status") == "failed"]}

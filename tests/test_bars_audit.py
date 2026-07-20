@@ -199,3 +199,112 @@ def test_basis_check_fails_safe_without_enough_overlap(cfg, store):
     future = synth_bars(n_days=100, wiggle=0.004)[60:]     # no shared sessions
     assert data._basis_changed(store, "THIN", future) is False
     assert data._basis_changed(store, "UNKNOWN", rows) is False
+
+
+# ── backfill ordering: importance, not alphabet ─────────────────────────────
+
+def test_backfill_prioritizes_importance_over_alphabet(cfg, store):
+    """Regression: 530 of 578 symbols that acquired bars began with 'A'."""
+    from specforge import research
+
+    def instrument(sym):
+        store.db.execute(
+            "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+            "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sym, sym, "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+             "2026-01-01", "test", None, "h"))
+
+    with store.db:
+        for sym in ("AAAA", "AAAB", "AAAC", "ZBIG", "ZMID", "MANDATE"):
+            instrument(sym)
+        # ZBIG/ZMID are the liquid names; alphabetically they are last.
+        for rank, sym in enumerate(("ZBIG", "ZMID"), 1):
+            store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                             ("2026-07-01", sym, "research", rank, "liquidity", "{}"))
+    cfg.data.setdefault("universe", {})["symbols"] = ["MANDATE"]
+
+    order = research._missing_history(store, 10, cfg)
+    assert order[0] == "MANDATE"              # configured universe is never starved
+    assert order[1:3] == ["ZBIG", "ZMID"]     # then research rank (dollar volume)
+    assert set(order[3:]) == {"AAAA", "AAAB", "AAAC"}   # tail still drains
+
+
+def test_backfill_without_cfg_still_orders_by_membership_rank(cfg, store):
+    from specforge import research
+    with store.db:
+        for sym in ("AAAA", "ZBIG"):
+            store.db.execute(
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+                "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sym, sym, "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+                 "2026-01-01", "test", None, "h"))
+        store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                         ("2026-07-01", "ZBIG", "research", 1, "liquidity", "{}"))
+    assert research._missing_history(store, 10)[0] == "ZBIG"
+
+
+# ── SEC fact ingestion: one candidate pass, real contact, rate limited ───────
+
+def test_bulk_ingest_refuses_the_placeholder_user_agent(cfg, store):
+    """Thousands of requests under a fake contact is how an IP gets blocked."""
+    from specforge import universe
+    assert "local-user" in universe.sec_user_agent(None)
+    result = universe.ingest_filing_facts_batch(store, 10, cfg=cfg,
+                                                require_contact=True)
+    assert result["status"] == "refused" and "sec_user_agent" in result["reason"]
+    cfg.data.setdefault("research", {})["sec_user_agent"] = "Stonk me@example.com"
+    assert universe.sec_user_agent(cfg) == "Stonk me@example.com"
+
+
+def test_batch_walks_one_candidate_pass_not_one_per_issuer(cfg, store, monkeypatch):
+    """The marker scan used to restart from index 0 for every single issuer.
+
+    A 1,500-issuer batch cost ~1.1M kv reads for 1,500 fetches; the candidate
+    query and the due-check are now hoisted out of the per-issuer function.
+    """
+    from specforge import universe
+    with store.db:
+        for i in range(30):
+            store.db.execute(
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+                "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"S{i:03d}", "n", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+                 "2026-01-01", "test", str(1000 + i), "h"))
+    queries = {"candidates": 0}
+    real = universe._fact_candidates
+    monkeypatch.setattr(universe, "_fact_candidates",
+                        lambda s: (queries.__setitem__("candidates",
+                                                       queries["candidates"] + 1)
+                                   or real(s)))
+    monkeypatch.setattr(universe.time, "sleep", lambda *_: None)
+
+    class Client:
+        def get(self, url, **kw):
+            raise RuntimeError("no network in tests")
+    result = universe.ingest_filing_facts_batch(store, 10, cfg=cfg, client=Client())
+    assert result["attempted"] == 10
+    assert queries["candidates"] == 1          # ONE pass, not one per issuer
+
+
+def test_batch_rate_limits_between_issuers(cfg, store, monkeypatch):
+    from specforge import universe
+    with store.db:
+        for i in range(5):
+            store.db.execute(
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+                "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"R{i}", "n", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+                 "2026-01-01", "test", str(2000 + i), "h"))
+    slept = []
+    monkeypatch.setattr(universe.time, "sleep", lambda s: slept.append(s))
+
+    class Client:
+        def get(self, url, **kw):
+            raise RuntimeError("offline")
+    universe.ingest_filing_facts_batch(store, 5, cfg=cfg, client=Client())
+    assert len(slept) == 5
+    assert all(s >= 1.0 / universe.SEC_MAX_REQUESTS_PER_SECOND for s in slept)

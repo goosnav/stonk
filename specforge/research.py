@@ -170,11 +170,35 @@ def _stamp(store, phase: str, detail: str, **extra) -> dict:
     return state
 
 
-def _missing_history(store, limit: int) -> list[str]:
+def _missing_history(store, limit: int, cfg=None) -> list[str]:
+    """Symbols needing bar history, most important first.
+
+    The previous ordering was `n DESC, symbol`. Almost every candidate has
+    n = 0, so the tiebreak decided everything and the backfill walked the
+    alphabet: of 578 symbols that acquired bars, 530 began with "A". The
+    training panel was therefore not a market sample but the first slice of an
+    alphabetical list, heavy with microcaps.
+
+    Order now: symbols the system must hold an opinion on (configured universe
+    plus current positions), then research-tier rank — which
+    `universe.refresh_membership` already sorts by dollar volume — then the
+    alphabetical tail, so nothing starves permanently.
+    """
+    mandatory = []
+    if cfg is not None:
+        mandatory = list(dict.fromkeys(
+            list(cfg.get("universe", "symbols", default=[]))
+            + [p["symbol"] for p in store.open_positions(mode=cfg.mode)]))
+    marks = ",".join("?" for _ in mandatory) or "NULL"
     return [r["symbol"] for r in store.db.execute(
-        "SELECT i.symbol,COUNT(b.d) n FROM instruments i LEFT JOIN bars b "
-        "ON b.symbol=i.symbol WHERE i.active=1 GROUP BY i.symbol HAVING n<260 "
-        "ORDER BY n DESC,i.symbol LIMIT ?", (limit,))]
+        f"SELECT i.symbol,COUNT(b.d) n,MIN(u.rank) rank FROM instruments i "
+        "LEFT JOIN bars b ON b.symbol=i.symbol "
+        "LEFT JOIN universe_membership u ON u.symbol=i.symbol AND u.tier='research' "
+        "AND u.as_of=(SELECT MAX(as_of) FROM universe_membership WHERE tier='research') "
+        "WHERE i.active=1 GROUP BY i.symbol HAVING n<260 "
+        f"ORDER BY CASE WHEN i.symbol IN ({marks}) THEN 0 ELSE 1 END,"
+        " CASE WHEN MIN(u.rank) IS NULL THEN 1 ELSE 0 END, MIN(u.rank),"
+        " n DESC, i.symbol LIMIT ?", (*mandatory, limit))]
 
 
 def enqueue_job(store, kind: str, payload: dict | None = None,
@@ -1403,7 +1427,7 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
         target = int(cfg.get("universe", "research_size", default=1500))
         floor = int(cfg.get("research", "min_training_universe", default=500))
         missing = _missing_history(store, int(cfg.get(
-            "research", "backfill_batch_size", default=50)))
+            "research", "backfill_batch_size", default=50)), cfg)
         # An issuer counts as covered only when it carries the tags the
         # FEATURES need. Counting issuers with ANY fact row reported 100%
         # coverage while 12 of 14 fundamental features sat at constant zero,
@@ -1482,7 +1506,7 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
             # filings state can never pin repair_due false forever
             store.kv_set("model_repair_turn", repair_turn + 1)
             _stamp(store, "filings", f"point-in-time SEC facts {fact_issuers}/{issuer_target}")
-            result = ingest_filing_facts_batch(store, 25, progress=lambda i, total:
+            result = ingest_filing_facts_batch(store, 25, cfg=cfg, progress=lambda i, total:
                 _stamp(store, "filings", f"SEC facts {fact_issuers + i}/{issuer_target}",
                        progress={"completed": fact_issuers + i, "target": issuer_target,
                                  "batch": total}))
@@ -1555,7 +1579,7 @@ def run_next(cfg, store, max_seconds: int | None = None) -> dict:
         graph_gate = maybe_promote_graph(cfg, store)
         if graph_gate.get("action") not in ("none", "shadow"):
             return {"task": "graph_gate", **graph_gate}
-        missing = _missing_history(store, int(cfg.get("research", "backfill_batch_size", default=50)))
+        missing = _missing_history(store, int(cfg.get("research", "backfill_batch_size", default=50)), cfg)
         if missing:
             _stamp(store, "backfill", f"fetching history for {len(missing)} symbols",
                    progress={"symbols": missing})
