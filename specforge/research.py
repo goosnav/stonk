@@ -170,6 +170,69 @@ def _stamp(store, phase: str, detail: str, **extra) -> dict:
     return state
 
 
+BACKFILL_EXHAUSTED_KEY = "bars_backfill_exhausted"
+BACKFILL_RETRY_DAYS = 30
+
+
+def _backfill_exhausted(store) -> set[str]:
+    """Symbols whose providers have already given us everything they have.
+
+    A young listing has fewer than the 260 sessions `_missing_history` wants and
+    will never have more today, so it stays a candidate forever: the backfill
+    re-fetches the same short-history names every batch and never reaches the
+    rest of the catalog. Observed live — 40-symbol batches spinning on the same
+    ~50 names, five new symbols in two minutes.
+
+    Entries age out, because a recent IPO does accumulate history.
+    """
+    marks = store.kv_get(BACKFILL_EXHAUSTED_KEY, {}) or {}
+    today = datetime.now().astimezone().date()
+    fresh = {}
+    for symbol, marked in marks.items():
+        try:
+            age = (today - datetime.fromisoformat(marked).date()).days
+        except (ValueError, TypeError):
+            continue
+        if age < BACKFILL_RETRY_DAYS:
+            fresh[symbol] = marked
+    return set(fresh)
+
+
+def mark_backfill_exhausted(store, symbols) -> None:
+    """Record that a fetch returned all a provider has and it was still short."""
+    marks = store.kv_get(BACKFILL_EXHAUSTED_KEY, {}) or {}
+    today = datetime.now().astimezone().date().isoformat()
+    for symbol in symbols:
+        marks[symbol] = today
+    store.kv_set(BACKFILL_EXHAUSTED_KEY, marks)
+
+
+def backfill_batch(store, cfg, limit: int = 40, log=print) -> dict:
+    """One backfill batch that cannot spin: short results are marked exhausted."""
+    from . import data
+    symbols = _missing_history(store, limit, cfg)
+    if not symbols:
+        return {"status": "caught_up", "attempted": 0}
+    before = {s: store.db.execute(
+        "SELECT COUNT(*) n FROM bars WHERE symbol=?", (s,)).fetchone()["n"]
+        for s in symbols}
+    data.refresh(store, symbols, log=log)
+    grew, short = 0, []
+    for symbol in symbols:
+        after = store.db.execute(
+            "SELECT COUNT(*) n FROM bars WHERE symbol=?", (symbol,)).fetchone()["n"]
+        if after > before[symbol]:
+            grew += 1
+        if after < 260:
+            # The provider gave us what it has and it is still short. Retrying
+            # tomorrow will return the same rows.
+            short.append(symbol)
+    if short:
+        mark_backfill_exhausted(store, short)
+    return {"status": "completed", "attempted": len(symbols),
+            "grew": grew, "exhausted": len(short)}
+
+
 def _missing_history(store, limit: int, cfg=None) -> list[str]:
     """Symbols needing bar history, most important first.
 
@@ -190,6 +253,7 @@ def _missing_history(store, limit: int, cfg=None) -> list[str]:
             list(cfg.get("universe", "symbols", default=[]))
             + [p["symbol"] for p in store.open_positions(mode=cfg.mode)]))
     rank_of = {sym: i for i, sym in enumerate(mandatory)}
+    exhausted = _backfill_exhausted(store)
     rows = store.db.execute(
         "SELECT i.symbol,COUNT(b.d) n,MIN(u.rank) rank FROM instruments i "
         "LEFT JOIN bars b ON b.symbol=i.symbol "
@@ -212,7 +276,8 @@ def _missing_history(store, limit: int, cfg=None) -> list[str]:
         # the market rather than the first N letters of the alphabet.
         return (2, hashlib.sha256(symbol.encode()).hexdigest(), symbol)
 
-    return [row["symbol"] for row in sorted(rows, key=key)[:limit]]
+    return [row["symbol"] for row in sorted(rows, key=key)
+            if row["symbol"] not in exhausted][:limit]
 
 
 def enqueue_job(store, kind: str, payload: dict | None = None,

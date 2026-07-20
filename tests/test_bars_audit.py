@@ -446,3 +446,40 @@ def test_sec_user_agent_prefers_env_over_tracked_config(cfg, monkeypatch):
     assert universe.sec_user_agent(cfg) == "from-config"
     monkeypatch.setenv(universe.SEC_USER_AGENT_ENV, "from-env me@example.com")
     assert universe.sec_user_agent(cfg) == "from-env me@example.com"
+
+
+def test_backfill_does_not_spin_on_symbols_with_no_more_history(cfg, store):
+    """A young listing has under 260 sessions and will never have more today.
+
+    Observed live: 40-symbol batches re-fetching the same ~50 short-history
+    names every round, five new symbols in two minutes, never reaching the rest
+    of the catalog.
+    """
+    from specforge import research
+    with store.db:
+        for sym in ("YOUNG", "OTHER"):
+            store.db.execute(
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+                "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sym, "n", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+                 "2026-01-01", "test", None, "h"))
+    store.upsert_bars("YOUNG", synth_bars(n_days=100), "test")   # all that exists
+    assert "YOUNG" in research._missing_history(store, 10, cfg)
+
+    result = research.backfill_batch(store, cfg, limit=10,
+                                     log=lambda *_: None)
+    assert result["exhausted"] >= 1
+    # Marked, so the next batch moves on instead of re-fetching the same rows.
+    assert "YOUNG" not in research._missing_history(store, 10, cfg)
+
+
+def test_exhausted_marks_age_out_so_a_new_listing_is_retried(cfg, store):
+    from specforge import research
+    from datetime import datetime, timedelta
+    stale = (datetime.now().astimezone().date()
+             - timedelta(days=research.BACKFILL_RETRY_DAYS + 1)).isoformat()
+    store.kv_set(research.BACKFILL_EXHAUSTED_KEY, {"OLD": stale, "NEW":
+                 datetime.now().astimezone().date().isoformat()})
+    exhausted = research._backfill_exhausted(store)
+    assert "NEW" in exhausted and "OLD" not in exhausted
