@@ -229,10 +229,14 @@ def _fact_candidates(store) -> list:
     per-issuer function, which re-ran both from index 0 on every call: a
     1,500-issuer batch cost roughly 1.1M kv reads for 1,500 fetches.
     """
-    # Issuers with NO facts first, then by research rank. Pure rank order spends
-    # the batch re-refreshing high-rank issuers we already hold — a refresh adds
-    # nothing to COVERAGE, which is what gates training on fundamentals.
-    # Measured: 500 requests in rank order yielded 19 new issuers.
+    # Issuers with NO facts first, then by research rank. A refresh adds nothing
+    # to COVERAGE, which is what gates training on fundamentals, so pure rank
+    # order burns the front of every batch re-refreshing high-rank issuers we
+    # already hold before reaching any new one. Measured on a 500-issuer run:
+    # the first ~100s produced 19 new issuers, the full run 382 — the ordering
+    # does not change the eventual total, it removes that warm-up so short
+    # batches (the research loop runs 25 at a time) are not spent entirely on
+    # refreshes.
     return store.db.execute(
         "SELECT i.symbol,i.cik FROM instruments i "
         "LEFT JOIN universe_membership u ON u.symbol=i.symbol AND u.tier='research' "

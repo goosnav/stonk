@@ -488,9 +488,10 @@ def test_exhausted_marks_age_out_so_a_new_listing_is_retried(cfg, store):
 def test_fact_candidates_put_uningested_issuers_first(cfg, store):
     """A refresh adds nothing to COVERAGE, which is what gates training.
 
-    Measured live: 500 requests in pure rank order yielded 19 new issuers,
-    because the high-rank issuers we already held came due for their weekly
-    refresh before any un-ingested issuer was reached.
+    Pure rank order spends the front of a batch on already-held high-rank
+    issuers coming due for their weekly refresh. That matters most for the
+    research loop, which ingests 25 at a time and could spend an entire tick
+    without adding a single new issuer.
     """
     from specforge import universe
     with store.db:
