@@ -229,12 +229,19 @@ def _fact_candidates(store) -> list:
     per-issuer function, which re-ran both from index 0 on every call: a
     1,500-issuer batch cost roughly 1.1M kv reads for 1,500 fetches.
     """
+    # Issuers with NO facts first, then by research rank. Pure rank order spends
+    # the batch re-refreshing high-rank issuers we already hold — a refresh adds
+    # nothing to COVERAGE, which is what gates training on fundamentals.
+    # Measured: 500 requests in rank order yielded 19 new issuers.
     return store.db.execute(
-        "SELECT i.symbol,i.cik FROM instruments i LEFT JOIN universe_membership u "
-        "ON u.symbol=i.symbol AND u.tier='research' AND u.as_of=(SELECT MAX(as_of) "
-        "FROM universe_membership WHERE tier='research') WHERE i.active=1 AND "
-        "i.cik IS NOT NULL "
-        "ORDER BY CASE WHEN u.rank IS NULL THEN 1 ELSE 0 END,u.rank,i.symbol").fetchall()
+        "SELECT i.symbol,i.cik FROM instruments i "
+        "LEFT JOIN universe_membership u ON u.symbol=i.symbol AND u.tier='research' "
+        "AND u.as_of=(SELECT MAX(as_of) FROM universe_membership WHERE tier='research') "
+        "LEFT JOIN (SELECT cik, COUNT(*) n FROM filing_facts GROUP BY cik) f "
+        "ON f.cik=i.cik "
+        "WHERE i.active=1 AND i.cik IS NOT NULL "
+        "ORDER BY CASE WHEN f.n IS NULL THEN 0 ELSE 1 END,"
+        " CASE WHEN u.rank IS NULL THEN 1 ELSE 0 END,u.rank,i.symbol").fetchall()
 
 
 def _fact_due(store, symbol: str, today: str) -> bool:

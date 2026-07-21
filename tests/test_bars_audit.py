@@ -483,3 +483,29 @@ def test_exhausted_marks_age_out_so_a_new_listing_is_retried(cfg, store):
                  datetime.now().astimezone().date().isoformat()})
     exhausted = research._backfill_exhausted(store)
     assert "NEW" in exhausted and "OLD" not in exhausted
+
+
+def test_fact_candidates_put_uningested_issuers_first(cfg, store):
+    """A refresh adds nothing to COVERAGE, which is what gates training.
+
+    Measured live: 500 requests in pure rank order yielded 19 new issuers,
+    because the high-rank issuers we already held came due for their weekly
+    refresh before any un-ingested issuer was reached.
+    """
+    from specforge import universe
+    with store.db:
+        for sym, cik, rank in (("HAVE", "111", 1), ("MISSING", "222", 500)):
+            store.db.execute(
+                "INSERT INTO instruments(symbol,name,exchange,security_type,is_etf,"
+                "is_adr,active,first_seen,last_seen,source,cik,raw_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sym, "n", "NASDAQ", "common", 0, 0, 1, "2020-01-01",
+                 "2026-01-01", "test", cik, "h"))
+            store.db.execute("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)",
+                             ("2026-07-01", sym, "research", rank, "t", "{}"))
+        # HAVE already has facts and outranks MISSING by a wide margin.
+        store.db.execute("INSERT INTO filing_facts VALUES(?,?,?,?,?,?,?,?)",
+                         ("111", "Assets", "2025-12-31", "2026-02-01", 1.0,
+                          "USD", "10-K", "a"))
+    order = [r["symbol"] for r in universe._fact_candidates(store)]
+    assert order.index("MISSING") < order.index("HAVE")
