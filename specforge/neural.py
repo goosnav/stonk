@@ -1361,10 +1361,25 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     if final_trial and not symbol:
         # Validation chooses the tournament winner. Only this cloned winner is
         # allowed to inspect the sealed test and walk-forward report folds.
-        current_val_pred, _ = _predict_batches(
-            model, X, va.numpy(), ds["target_scale"], device)
+        # SELECT ON THE FAMILY THAT TRADES. This was the last live instance of
+        # the P0 that started the R-series: the tournament picked its winner
+        # from `forward_all` excess-only metrics while the absolute head is what
+        # decides trades. R8 then measured the excess family's PBO at 0.917 —
+        # the in-sample winner lands BELOW the OOS median in 92% of splits — so
+        # selecting on excess is not merely misaligned, it is worse than not
+        # selecting at all. Excess remains a CONSTRAINT in _offline_gate; it is
+        # no longer a selector.
+        val_rows = va.numpy()
+        val_abs_pred, _, val_exc_pred, _ = _predict_structured(
+            model, X, val_rows, ds["target_scale"], ds["target_scale_absolute"],
+            device)
         current_val_metrics = _metrics(
-            current_val_pred, ds["Y"][va.numpy()], ds["horizons"], ds["dates"][va.numpy()])
+            val_abs_pred, ds["Y_absolute"][val_rows], ds["horizons"],
+            ds["dates"][val_rows])
+        current_val_metrics["evaluated_on"] = "structured_absolute_heads"
+        current_val_metrics["excess"] = _metrics(
+            val_exc_pred, ds["Y_excess"][val_rows], ds["horizons"],
+            ds["dates"][val_rows])
         winner_score = _selection_score(current_val_metrics)
         winner_loss = best_loss
         for row in store.db.execute(
@@ -1418,8 +1433,13 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
     metrics["absolute"]["evaluated_on"] = "structured_absolute_heads"
     metrics.update(evaluation_split="sealed_test" if final_trial else "validation",
                    validation_objective=round(best_loss, 6),
+                   # Promotion ranking reads this (lifecycle.rank_key), so it
+                   # scores the ABSOLUTE family for the same reason the
+                   # tournament does.
                    validation_selection_score=round(
-                       winner_score if final_trial and not symbol else _selection_score(metrics), 6),
+                       winner_score if final_trial and not symbol
+                       else _selection_score(metrics["absolute"]), 6),
+                   selection_family="absolute",
                    tournament_key=tournament_key,
                    data_fingerprint=data_fingerprint,
                    device=device, trial_spec=winner_trial_spec,

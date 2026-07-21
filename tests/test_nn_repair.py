@@ -2927,3 +2927,46 @@ def test_uninformative_families_flagged_at_the_measured_threshold():
         flagged = pbo >= 0.5
         assert flagged is expected, pbo
     assert set(bakeoff.FAMILIES) == {"absolute", "excess"}
+
+
+# ── selection happens on the family that TRADES ──────────────────────────────
+
+def test_tournament_selects_on_absolute_not_excess(cfg, store, tmp_path):
+    """The last live instance of the R-series P0.
+
+    The tournament picked its winner from excess-only metrics while the
+    absolute head is what decides trades. R8 then measured excess-family PBO at
+    0.917 — the in-sample winner lands below the OOS median in 92% of splits —
+    so selecting on excess is worse than not selecting.
+    """
+    from conftest import synth_bars
+    for sym in ("AAA", "BBB", "CCC", "SPY"):
+        store.upsert_bars(sym, synth_bars(n_days=700, daily_drift=.001), "test")
+    store.upsert_bars("^VIX", [{**r, "open": 15, "high": 16, "low": 14, "close": 15}
+                               for r in synth_bars(n_days=700)], "test")
+    cfg.data["neural"].update({"input_sessions": 40, "horizons": [5, 21],
+                               "max_epochs": 2, "patience": 1,
+                               "checkpoint": str(tmp_path / "g.pt"),
+                               "max_trials_per_snapshot": 1})
+    out = neural.train_challenger(cfg, store, symbols=["AAA", "BBB", "CCC"],
+                                  max_seconds=3)
+    assert out["status"] == "challenger"
+    row = store.db.execute("SELECT metrics FROM model_runs WHERE id=?",
+                           (out["id"],)).fetchone()
+    metrics = __import__("json").loads(row["metrics"])
+    assert metrics["selection_family"] == "absolute"
+    # The stored score is the ABSOLUTE family's, not the top-level excess one.
+    assert metrics["validation_selection_score"] == pytest.approx(
+        round(neural._selection_score(metrics["absolute"]), 6))
+
+
+def test_a_model_good_on_excess_and_bad_on_absolute_scores_worse():
+    """+excess/-absolute must never outrank +absolute/-excess."""
+    def blob(correlation, alpha):
+        return {str(h): {"correlation": correlation,
+                         "top_decile_alpha_after_cost": alpha,
+                         "coverage": .8, "pinball": .01} for h in (5, 21)}
+
+    trades_well = blob(.01, .012)       # weak rank IC, makes money absolutely
+    ranks_well = blob(.06, -.004)       # great rank IC, loses money absolutely
+    assert neural._selection_score(trades_well) > neural._selection_score(ranks_well)

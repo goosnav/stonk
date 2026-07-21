@@ -657,3 +657,32 @@ Now wired:
 Net effect: beating the controls is no longer sufficient. A model must also be
 distinguishable from the best of the search that produced it, and must not have
 been selected on a family whose backtest ranking carries no information.
+
+## 2026-07-20 - THE P0 IS CLOSED: selection moves to the family that trades
+
+The finding this whole R-series opened with was "the permission system and the
+trading system are measuring different quantities". R1 fixed the GATES. What
+survived, unnoticed, was SELECTION: the tournament chose its winning trial from
+`_predict_batches` excess-only metrics, and `validation_selection_score` — which
+`lifecycle.rank_key` uses to rank promotion candidates — was computed the same
+way. The absolute head decided trades; the excess head decided which model got
+to make them.
+
+R8 then put a number on how bad that is. Excess-family **PBO = 0.917**: the
+in-sample winner lands BELOW the out-of-sample median in 92% of splits. Ranking
+on excess is not merely misaligned with trading, it is worse than not ranking.
+
+Fixed: the tournament now scores `_predict_structured` ABSOLUTE metrics, and
+`validation_selection_score` scores `metrics["absolute"]`, tagged
+`selection_family: "absolute"`. Excess is retained as a CONSTRAINT in
+`_offline_gate` (a model still cannot promote while losing money on excess) but
+is no longer a SELECTOR anywhere.
+
+Verified by mutation rather than assumed: reverting the change makes
+`test_tournament_selects_on_absolute_not_excess` fail. On the synthetic panel
+the old excess-based score was **-0.0095** while the absolute one is positive —
+the tournament had been ranking candidates on a negative-utility quantity.
+
+Note on process: the suite went green immediately after this change, which means
+NO existing test covered the behaviour. Green-on-first-run is a reason to go
+looking for the missing test, not a reason to move on.
