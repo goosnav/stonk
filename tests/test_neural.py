@@ -135,6 +135,12 @@ def test_offline_gate_requires_profitable_folds_and_sealed_test():
     # R6: and the model must have won the policy-return bakeoff.
     metrics["bakeoff"] = {"verdict": True,
                           "basis": "net_oos_policy_return_staggered_cohorts"}
+    # R8: and survive trial adjustment against the registry's search count.
+    metrics["governance"] = {
+        "basis": "trial_adjusted_deflated_sharpe_pbo_block_bootstrap",
+        "absolute": {"verdict": True, "overfitting": {"pbo": 0.1}},
+        "excess": {"verdict": True, "overfitting": {"pbo": 0.2}},
+        "uninformative_families": []}
     assert neural._offline_gate(metrics)
     metrics["absolute"]["21"]["top_decile_alpha_after_cost"] = -.001
     assert not neural._offline_gate(metrics)       # absolute loses → no entry

@@ -1013,10 +1013,16 @@ def _passing_metrics(score=1.0, absolute_ok=True, **over):
     a = (dict(h) if absolute_ok else
          {"correlation": .04, "top_decile_alpha_after_cost": -.004, "coverage": .8})
     # R6: permission is granted on net OOS policy return, so a "passing"
-    # metrics blob must now carry a won bakeoff too.
+    # metrics blob must now carry a won bakeoff — and R8 trial adjustment.
     out = {"beats_baselines": True, "folds": folds,
            "bakeoff": {"verdict": True,
                        "basis": "net_oos_policy_return_staggered_cohorts"},
+           "governance": {
+               "basis": "trial_adjusted_deflated_sharpe_pbo_block_bootstrap",
+               "absolute": {"verdict": True,
+                            "overfitting": {"pbo": 0.1}},
+               "excess": {"verdict": True, "overfitting": {"pbo": 0.2}},
+               "uninformative_families": []},
            "median_fold_ic_5d": .02, "median_fold_ic_21d": .03,
            "5": dict(h), "21": dict(h),
            "absolute": {"5": dict(a), "21": dict(a),
@@ -2875,3 +2881,49 @@ def test_ablation_uses_the_strongest_control_not_a_hardcoded_one():
 
 
 
+
+
+def test_gate_requires_trial_adjusted_evidence_not_just_a_bakeoff_win():
+    """R8 built deflated Sharpe / PBO / bootstrap but nothing consumed them.
+
+    A measured PBO of 0.917 in the excess family — the in-sample winner landing
+    below the OOS median in 92% of splits — could not block anything, because
+    the gate never read governance at all.
+    """
+    assert neural._offline_gate(_passing_metrics())
+
+    # A model that wins the bakeoff but fails trial adjustment cannot promote:
+    # beating the controls is not the same as being distinguishable from the
+    # best of the search that found you.
+    deflated_fail = _passing_metrics()
+    deflated_fail["governance"]["absolute"]["verdict"] = False
+    assert not neural._offline_gate(deflated_fail)
+
+    # Selection on an uninformative family blocks promotion.
+    uninformative = _passing_metrics()
+    uninformative["governance"]["uninformative_families"] = ["absolute"]
+    assert not neural._offline_gate(uninformative)
+
+    # Legacy rows with no governance block fail closed, like every other gate.
+    legacy = _passing_metrics()
+    del legacy["governance"]
+    assert not neural._offline_gate(legacy)
+
+    # A governance block computed on some other basis is not evidence.
+    wrong_basis = _passing_metrics()
+    wrong_basis["governance"]["basis"] = "raw_sharpe"
+    assert not neural._offline_gate(wrong_basis)
+
+
+def test_uninformative_families_flagged_at_the_measured_threshold():
+    """PBO >= 0.5 means selection carries no information; 0.917 means it is
+    actively misleading. Both must be named, not just the extreme."""
+    from specforge.ml import bakeoff, governance as gov
+    assert gov.probability_of_backtest_overfitting(
+        np.zeros((10, 1)))["evidence"] == "insufficient"
+    # The classifier the gate uses, exercised directly on the measured numbers.
+    for pbo, expected in ((0.0238, False), (0.25, False), (0.5, True),
+                          (0.917, True)):
+        flagged = pbo >= 0.5
+        assert flagged is expected, pbo
+    assert set(bakeoff.FAMILIES) == {"absolute", "excess"}

@@ -632,3 +632,28 @@ as an ablation flag; `linear_skip` is gone with the feature.
 Best TCN configuration measured is 0.567 against elastic-net 0.727. No
 champion, learned influence hard-zero. The honest summary of this whole session
 is that the model work was worth about a tenth of the data work.
+
+## 2026-07-20 - R8 moves from report into the GATE
+
+A gap worth naming: R8 built deflated Sharpe, PBO and the block bootstrap, and
+then nothing consumed them. They were computed in a scratch script for the
+measurement writeups; `_offline_gate` never read governance at all. So the
+measured **PBO of 0.917 in the excess family** - the in-sample winner landing
+BELOW the OOS median in 92% of splits, i.e. selecting on that family is worse
+than not selecting - could not block a promotion. The machinery existed and was
+decorative.
+
+Now wired:
+- `neural._governance_metrics` computes, per family, the trial-adjusted summary
+  against the IMMUTABLE registry trial count (`COUNT(*) FROM model_runs`, every
+  run ever recorded - undercounting the search is how a deflated Sharpe
+  flatters itself), and names `uninformative_families` at PBO >= 0.5.
+- `train_challenger` stores it as `metrics["governance"]`.
+- `_offline_gate` now additionally requires: the declared governance basis
+  string, `governance.absolute.verdict is True`, and "absolute" NOT among the
+  uninformative families. Missing or wrong-basis governance fails closed, the
+  same pattern used for the R1 absolute block and the R6 bakeoff block.
+
+Net effect: beating the controls is no longer sufficient. A model must also be
+distinguishable from the best of the search that produced it, and must not have
+been selected on a family whose backtest ranking carries no information.

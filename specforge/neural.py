@@ -1436,10 +1436,17 @@ def train_challenger(cfg, store, symbols: list[str] | None = None,
         seeds = int(cfg.get("neural", "bakeoff_seeds", default=3))
         budget = (None if overall_deadline is None else
                   max(0.0, overall_deadline - time.monotonic()) * .5)
-        metrics["bakeoff"] = ml_bakeoff.compare(
-            ds, eval_idx,
-            seed_predictions(cfg, ds, eval_idx, winner_trial_spec, seeds, budget))
+        tcn_predictions = seed_predictions(
+            cfg, ds, eval_idx, winner_trial_spec, seeds, budget)
+        metrics["bakeoff"] = ml_bakeoff.compare(ds, eval_idx, tcn_predictions)
         metrics["beats_baselines"] = bool(metrics["bakeoff"]["verdict"])
+        # Trial-adjusted uncertainty, in the GATE and not merely in a report.
+        # R8 built deflated Sharpe / PBO / block bootstrap but nothing consumed
+        # them, so a measured PBO of 0.917 in the excess family — the in-sample
+        # winner landing BELOW the OOS median in 92% of splits, i.e. selection
+        # worse than not selecting — could not block anything.
+        metrics["governance"] = _governance_metrics(store, ds, eval_idx,
+                                                    tcn_predictions)
         # Diagnostic, not a gate: which feature families actually carry weight.
         # A family with a ~0 delta is a family to suspect, not to trust.
         metrics["ablations"] = ml_bakeoff.ablate(ds, eval_idx, "absolute")
@@ -1987,6 +1994,39 @@ def shadow_metrics(store, model_id: str) -> dict:
     return out
 
 
+def _governance_metrics(store, ds, eval_idx, tcn_predictions) -> dict:
+    """Deflated Sharpe, PBO and a block bootstrap per return family.
+
+    The trial count is every run ever recorded, not this session's — that is
+    the whole point of an immutable registry. Undercounting the search is how
+    a deflated Sharpe flatters itself.
+    """
+    from .ml import governance as ml_governance
+    trials = int(store.db.execute(
+        "SELECT COUNT(*) n FROM model_runs").fetchone()["n"])
+    out: dict = {"registry_trials": trials,
+                 "basis": "trial_adjusted_deflated_sharpe_pbo_block_bootstrap"}
+    for family in ml_bakeoff.FAMILIES:
+        matrix, names = ml_bakeoff.candidate_cohort_matrix(
+            ds, eval_idx, family, tcn_predictions)
+        if not matrix.size:
+            out[family] = {"verdict": False, "evidence": "insufficient_cohorts"}
+            continue
+        best = int(np.argmax(matrix.mean(0)))
+        summary = ml_governance.trial_adjusted_summary(
+            matrix[:, best], trials + matrix.shape[1], performance=matrix,
+            block_size=4)
+        summary["best_candidate"] = names[best]
+        out[family] = summary
+    # A family whose in-sample winner lands below the OOS median at least half
+    # the time carries no usable selection information. Naming them explicitly
+    # keeps "we selected on this anyway" from being an accident.
+    out["uninformative_families"] = sorted(
+        family for family in ml_bakeoff.FAMILIES
+        if float((out[family].get("overfitting") or {}).get("pbo", 1.0)) >= 0.5)
+    return out
+
+
 def _offline_gate(metrics: dict) -> bool:
     """Stage-one gate shared by promotion and champion integrity checks."""
     folds = metrics.get("folds") or []
@@ -2017,8 +2057,19 @@ def _offline_gate(metrics: dict) -> bool:
     bakeoff = metrics.get("bakeoff") or {}
     bakeoff_gate = (bakeoff.get("verdict") is True and
                     bakeoff.get("basis") == "net_oos_policy_return_staggered_cohorts")
+    # R8 in the gate: the ABSOLUTE family must survive trial adjustment, and no
+    # family the model was selected on may be uninformative. Measured PBO in the
+    # excess family was 0.917 — selecting on it is worse than not selecting — so
+    # this is a live constraint, not a hypothetical one. Missing governance
+    # fails closed, like every other block here.
+    governance = metrics.get("governance") or {}
+    absolute_governance = governance.get("absolute") or {}
+    governance_gate = (
+        governance.get("basis") == "trial_adjusted_deflated_sharpe_pbo_block_bootstrap"
+        and absolute_governance.get("verdict") is True
+        and "absolute" not in (governance.get("uninformative_families") or []))
     return (bool(metrics.get("beats_baselines")) and bakeoff_gate and fold_gate
-            and excess_gate and absolute_gate)
+            and excess_gate and absolute_gate and governance_gate)
 
 
 def maybe_promote(cfg, store) -> dict:
